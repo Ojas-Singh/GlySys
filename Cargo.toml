@@ -1,0 +1,45 @@
+[package]
+name = "glysysbuilder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+authors = ["GlySysBuilder contributors"]
+license = "MIT"
+description = "Pure-Rust Amber/GLYCAM preparation of solvated glycan and glycoprotein systems"
+repository = "https://github.com/Ojas-Singh/GlySysBuilder"
+keywords = ["glycan", "glycoprotein", "amber", "glycam", "gromacs"]
+categories = ["science", "command-line-utilities"]
+include = [
+    "/src/**",
+    "/data/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
+
+[lib]
+name = "glysysbuilder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glysysbuilder"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crabwurcs = { version = "=0.2.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

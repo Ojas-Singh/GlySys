@@ -1,0 +1,5 @@
+source leaprc.GLYCAM_06j-1
+SYSTEM = sequence { 0YB ROH }
+savepdb SYSTEM glycan.pdb
+saveamberparm SYSTEM glycan.prmtop glycan.inpcrd
+quit

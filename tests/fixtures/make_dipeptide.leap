@@ -1,0 +1,5 @@
+source leaprc.protein.ff14SB
+SYSTEM = sequence { NALA CGLY }
+savepdb SYSTEM dipeptide.pdb
+saveamberparm SYSTEM dipeptide.prmtop dipeptide.inpcrd
+quit

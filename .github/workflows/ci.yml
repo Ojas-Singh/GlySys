@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+      - run: cargo package --allow-dirty
+      - run: cd data/amber && sha256sum -c CHECKSUMS.sha256
+
+  consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97"
+      - run: sudo apt-get update && sudo apt-get install -y gromacs
+      - run: python -m pip install "openmm==8.5.*"
+      - run: cargo run -- prepare tests/fixtures/dipeptide.pdb -o consumer-output --salt 0
+      - name: Load Amber output with OpenMM 8.5
+        run: python -c "from openmm.app import AmberPrmtopFile,AmberInpcrdFile,PME; p=AmberPrmtopFile('consumer-output/system.prmtop'); c=AmberInpcrdFile('consumer-output/system.inpcrd'); s=p.createSystem(nonbondedMethod=PME); assert s.getNumParticles()==len(c.positions)"
+      - name: Preprocess portable GROMACS output
+        run: gmx grompp -f tests/fixtures/grompp.mdp -c consumer-output/system.gro -p consumer-output/system.top -o consumer-output/system.tpr -maxwarn 1

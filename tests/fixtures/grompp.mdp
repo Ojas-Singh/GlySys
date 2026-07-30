@@ -1,0 +1,8 @@
+integrator = steep
+nsteps = 0
+cutoff-scheme = Verlet
+coulombtype = PME
+rcoulomb = 1.0
+rvdw = 1.0
+pbc = xyz
+constraints = h-bonds
