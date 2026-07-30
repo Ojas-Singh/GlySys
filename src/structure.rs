@@ -157,6 +157,15 @@ impl Structure {
             .collect()
     }
 
+    /// Explicit bonds declared by the source or added by a structure builder.
+    pub fn bonds(&self) -> Vec<(AtomId, AtomId)> {
+        self.parsed
+            .conect
+            .iter()
+            .map(|(first, second)| (AtomId(*first), AtomId(*second)))
+            .collect()
+    }
+
     pub fn metadata(&self) -> &SystemMetadata {
         &self.metadata
     }
