@@ -213,6 +213,13 @@ impl Structure {
 
     /// Remove named cap or solvent residues while preserving valid connectivity.
     pub fn remove_residues_named(&mut self, names: &[&str]) {
+        let removed_residues = self
+            .parsed
+            .residues
+            .iter()
+            .filter(|residue| names.contains(&residue.reference.name.as_str()))
+            .map(|residue| residue_id(&residue.reference))
+            .collect::<BTreeSet<_>>();
         let removed_serials = self
             .parsed
             .residues
@@ -225,6 +232,28 @@ impl Structure {
             .retain(|residue| !names.contains(&residue.reference.name.as_str()));
         self.parsed.conect.retain(|(first, second)| {
             !removed_serials.contains(first) && !removed_serials.contains(second)
+        });
+        self.parsed.links.retain(|link| {
+            !removed_residues.contains(&ResidueId {
+                chain: link.first.chain.clone(),
+                number: link.first.number,
+                insertion_code: link.first.insertion_code,
+            }) && !removed_residues.contains(&ResidueId {
+                chain: link.second.chain.clone(),
+                number: link.second.number,
+                insertion_code: link.second.insertion_code,
+            })
+        });
+        self.parsed.ssbonds.retain(|(first, second)| {
+            !removed_residues.contains(&ResidueId {
+                chain: first.chain.clone(),
+                number: first.number,
+                insertion_code: first.insertion_code,
+            }) && !removed_residues.contains(&ResidueId {
+                chain: second.chain.clone(),
+                number: second.number,
+                insertion_code: second.insertion_code,
+            })
         });
         self.refresh_chains();
     }
@@ -303,6 +332,53 @@ impl Structure {
             {
                 self.parsed.conect.insert(ordered(first, second));
             }
+        }
+        for link in &other.parsed.links {
+            let first = result
+                .residue(&ResidueId {
+                    chain: link.first.chain.clone(),
+                    number: link.first.number,
+                    insertion_code: link.first.insertion_code,
+                })
+                .ok_or_else(|| {
+                    BuildError::InvalidPdb("LINK references a missing residue".into())
+                })?;
+            let second = result
+                .residue(&ResidueId {
+                    chain: link.second.chain.clone(),
+                    number: link.second.number,
+                    insertion_code: link.second.insertion_code,
+                })
+                .ok_or_else(|| {
+                    BuildError::InvalidPdb("LINK references a missing residue".into())
+                })?;
+            self.parsed.links.push(DeclaredLink {
+                first: first.into(),
+                first_atom: link.first_atom.clone(),
+                second: second.into(),
+                second_atom: link.second_atom.clone(),
+            });
+        }
+        for (first, second) in &other.parsed.ssbonds {
+            let first = result
+                .residue(&ResidueId {
+                    chain: first.chain.clone(),
+                    number: first.number,
+                    insertion_code: first.insertion_code,
+                })
+                .ok_or_else(|| {
+                    BuildError::InvalidPdb("SSBOND references a missing residue".into())
+                })?;
+            let second = result
+                .residue(&ResidueId {
+                    chain: second.chain.clone(),
+                    number: second.number,
+                    insertion_code: second.insertion_code,
+                })
+                .ok_or_else(|| {
+                    BuildError::InvalidPdb("SSBOND references a missing residue".into())
+                })?;
+            self.parsed.ssbonds.push((first.into(), second.into()));
         }
         self.refresh_chains();
         Ok(result)
