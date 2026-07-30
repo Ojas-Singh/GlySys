@@ -141,6 +141,34 @@ impl ParameterizedSystem {
         &self.metadata
     }
 
+    /// Return the current Cartesian coordinates in Å.
+    pub fn coordinates(&self) -> Vec<Vec3> {
+        self.system.atoms.iter().map(|atom| atom.position).collect()
+    }
+
+    /// Replace every Cartesian coordinate while preserving topology.
+    pub fn set_coordinates(&mut self, coordinates: &[Vec3]) -> Result<()> {
+        if coordinates.len() != self.system.atoms.len() {
+            return Err(BuildError::InvalidOption(format!(
+                "expected {} coordinates, received {}",
+                self.system.atoms.len(),
+                coordinates.len()
+            )));
+        }
+        if coordinates
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite())
+        {
+            return Err(BuildError::InvalidOption(
+                "coordinates must contain only finite values".into(),
+            ));
+        }
+        for (atom, position) in self.system.atoms.iter_mut().zip(coordinates) {
+            atom.position = *position;
+        }
+        Ok(())
+    }
+
     /// Write the Amber, GROMACS, and manifest bundle atomically per file.
     pub fn write_bundle(&self, directory: impl AsRef<Path>) -> Result<()> {
         let directory = directory.as_ref();
@@ -236,6 +264,31 @@ impl Atom {
 
     pub fn position(&self) -> Vec3 {
         self.position
+    }
+
+    pub fn gb_radius(&self) -> f64 {
+        match self.element {
+            1 if self.atom_type == "H" => 1.3,
+            1 => 1.2,
+            6 => 1.7,
+            7 => 1.55,
+            8 => 1.5,
+            15 => 1.85,
+            16 => 1.8,
+            _ => 1.5,
+        }
+    }
+
+    pub fn gb_screen(&self) -> f64 {
+        match self.element {
+            1 => 0.85,
+            6 => 0.72,
+            7 => 0.79,
+            8 => 0.85,
+            15 => 0.86,
+            16 => 0.96,
+            _ => 0.8,
+        }
     }
 }
 

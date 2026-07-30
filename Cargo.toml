@@ -43,3 +43,7 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+[workspace]
+members = ["crates/glysys-energy", "crates/glysys-opt"]
+resolver = "3"

@@ -330,13 +330,20 @@ fn parameterizes_an_in_memory_structure_and_preserves_metadata() {
             label: "consumer-owned".into(),
         });
 
-    let system = SystemBuilder::new(options)
+    let mut system = SystemBuilder::new(options)
         .unwrap()
         .prepare_structure(&structure)
         .unwrap();
     assert_eq!(system.atom_count(), 20);
     assert_eq!(system.atoms().len(), 20);
     assert_eq!(system.metadata().residue_annotations[0].residue, residue);
+
+    let mut coordinates = system.coordinates();
+    coordinates[0].x += 0.25;
+    system.set_coordinates(&coordinates).unwrap();
+    structure.update_from_parameterized(&system).unwrap();
+    assert_eq!(structure.atoms()[0].position, coordinates[0]);
+    assert!(system.set_coordinates(&coordinates[..19]).is_err());
 
     let serialized = write_pdb_string(&structure);
     assert!(serialized.contains("ATOM"));

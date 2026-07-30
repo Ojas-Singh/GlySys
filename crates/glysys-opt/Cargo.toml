@@ -1,0 +1,15 @@
+[package]
+name = "glysys-opt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Deterministic generic optimization algorithms for GlySys applications"
+repository = "https://github.com/Ojas-Singh/GlySys"
+
+[dependencies]
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

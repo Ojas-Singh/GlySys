@@ -398,6 +398,25 @@ impl Structure {
         self.metadata.glycosylation_sites.push(site);
     }
 
+    /// Copy coordinates for atoms present in both this structure and a
+    /// parameterized system. Generated force-field atoms are ignored.
+    pub fn update_from_parameterized(&mut self, system: &crate::ParameterizedSystem) -> Result<()> {
+        for residue in system.residues() {
+            let id = ResidueId {
+                chain: residue.chain().to_string(),
+                number: residue.number(),
+                insertion_code: residue.insertion_code(),
+            };
+            for atom_index in residue.atom_range() {
+                let atom = &system.atoms()[atom_index];
+                if let Some(id) = self.find_atom(&id, atom.name()) {
+                    self.set_atom_position(id, atom.position())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_pdb_string(&self) -> String {
         write_pdb_string(self)
     }

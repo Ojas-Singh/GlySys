@@ -14,10 +14,11 @@ jobs:
           toolchain: "1.97"
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo test --doc
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
       - run: cargo package --allow-dirty
+      - run: cargo package -p glysys-opt --allow-dirty --no-verify
       - run: cd data/amber && sha256sum -c CHECKSUMS.sha256
 
   consumers:

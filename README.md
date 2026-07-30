@@ -7,6 +7,13 @@ parameterizes proteins with ff14SB and carbohydrates with GLYCAM06j-1,
 solvates with TIP3P, adds neutralizing ions and 0.15 M NaCl, and writes files
 for OpenMM and GROMACS.
 
+The workspace also contains two reusable MIT-licensed libraries:
+
+- `glysys-energy` evaluates Amber/GLYCAM bonded, nonbonded, restraint, and
+  OBC2 GBSA terms in kcal/mol, with Cartesian gradients in kcal/mol/Å.
+- `glysys-opt` provides deterministic seeded genetic search and L-BFGS
+  minimization independently of any molecular representation.
+
 No AmberTools, acpype, Python, GROMACS, or OpenMM executable is invoked at
 runtime. The exact public-domain AmberTools 23.6 parameter subset is embedded
 in the crate.
@@ -51,8 +58,12 @@ use glysys::{BuildOptions, SystemBuilder};
 let builder = SystemBuilder::new(BuildOptions::default())?;
 let system = builder.prepare_pdb("input.pdb")?;
 system.write_bundle("prepared")?;
-# Ok::<(), glysysbuilder::BuildError>(())
+# Ok::<(), glysys::BuildError>(())
 ```
+
+`ParameterizedSystem::coordinates` and `set_coordinates` provide a checked
+coordinate-update path for energy minimizers. `Structure::update_from_parameterized`
+copies minimized coordinates back without a file-format round trip.
 
 ## Input contract
 

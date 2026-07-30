@@ -1,0 +1,13 @@
+[package]
+name = "glysys-energy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Amber and GLYCAM molecular mechanics energies for GlySys"
+repository = "https://github.com/Ojas-Singh/GlySys"
+
+[dependencies]
+glysys = { version = "0.1.0", path = "../.." }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
