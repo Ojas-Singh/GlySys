@@ -1,12 +1,12 @@
 [package]
-name = "glysysbuilder"
+name = "glysys"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-authors = ["GlySysBuilder contributors"]
+authors = ["GlySys contributors"]
 license = "MIT"
 description = "Pure-Rust Amber/GLYCAM preparation of solvated glycan and glycoprotein systems"
-repository = "https://github.com/Ojas-Singh/GlySysBuilder"
+repository = "https://github.com/Ojas-Singh/GlySys"
 keywords = ["glycan", "glycoprotein", "amber", "glycam", "gromacs"]
 categories = ["science", "command-line-utilities"]
 include = [
@@ -20,7 +20,7 @@ include = [
 ]
 
 [lib]
-name = "glysysbuilder"
+name = "glysys"
 path = "src/lib.rs"
 
 [[bin]]

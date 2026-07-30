@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use glysysbuilder::{BuildOptions, ProtonationOverrides, SystemBuilder};
+use glysys::{BuildOptions, ProtonationOverrides, SystemBuilder};
 
 #[derive(Debug, Parser)]
 #[command(

@@ -4,10 +4,10 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::forcefield::{ParameterSet, Template, TemplateSet};
-use crate::model::{Angle, Atom, Bond, Dihedral, PreparedSystem, Residue, System, Vec3};
+use crate::model::{Angle, Atom, Bond, Dihedral, ParameterizedSystem, Residue, System, Vec3};
 use crate::pdb::{self, PROTEIN_RESIDUES, ParsedPdb, PdbResidue};
 use crate::report::BuildReport;
-use crate::{BuildError, BuildOptions, BuildWarning, Result};
+use crate::{BuildError, BuildOptions, BuildWarning, Result, Structure};
 
 /// Reusable builder containing validated options and immutable force-field data.
 #[derive(Debug)]
@@ -31,7 +31,7 @@ impl SystemBuilder {
         &self.options
     }
 
-    pub fn prepare_pdb(&self, path: impl AsRef<Path>) -> Result<PreparedSystem> {
+    pub fn prepare_pdb(&self, path: impl AsRef<Path>) -> Result<ParameterizedSystem> {
         let path = path.as_ref();
         let contents =
             std::fs::read_to_string(path).map_err(crate::error::read_error(path.to_path_buf()))?;
@@ -96,8 +96,8 @@ impl SystemBuilder {
             output_sha256: BTreeMap::new(),
             options: self.options.clone(),
             selected_model: self.options.model,
-            chains: parsed.chains,
-            glycans: parsed.glycans,
+            chains: parsed.chains.clone(),
+            glycans: parsed.glycans.clone(),
             protonation_decisions,
             unsupported_residues,
             missing_heavy_atoms,
@@ -114,12 +114,30 @@ impl SystemBuilder {
         })
     }
 
-    pub fn prepare_pdb_str(&self, contents: &str) -> Result<PreparedSystem> {
-        let parsed = pdb::parse(contents, &self.options)?;
+    pub fn prepare_pdb_str(&self, contents: &str) -> Result<ParameterizedSystem> {
+        let structure = crate::read_pdb_str(contents, &self.options)?;
         let input_sha256 = format!("{:x}", Sha256::digest(contents.as_bytes()));
+        self.prepare_structure_with_hash(&structure, input_sha256)
+    }
+
+    /// Parameterize an editable structure without serializing and reparsing it.
+    pub fn prepare_structure(&self, structure: &Structure) -> Result<ParameterizedSystem> {
+        let input_sha256 = format!(
+            "{:x}",
+            Sha256::digest(crate::write_pdb_string(structure).as_bytes())
+        );
+        self.prepare_structure_with_hash(structure, input_sha256)
+    }
+
+    fn prepare_structure_with_hash(
+        &self,
+        structure: &Structure,
+        input_sha256: String,
+    ) -> Result<ParameterizedSystem> {
+        let parsed = &structure.parsed;
         let mut warnings = parsed.warnings.clone();
-        let protonation_decisions = self.protonation_decisions(&parsed, &mut warnings);
-        let mut system = self.parameterize(&parsed, &protonation_decisions, &mut warnings)?;
+        let protonation_decisions = self.protonation_decisions(parsed, &mut warnings);
+        let mut system = self.parameterize(parsed, &protonation_decisions, &mut warnings)?;
         let solute_charge = system.charge();
         let rounded_charge = solute_charge.round();
         if (solute_charge - rounded_charge).abs() > 1.0e-3 {
@@ -139,8 +157,8 @@ impl SystemBuilder {
             output_sha256: BTreeMap::new(),
             options: self.options.clone(),
             selected_model: self.options.model,
-            chains: parsed.chains,
-            glycans: parsed.glycans,
+            chains: parsed.chains.clone(),
+            glycans: parsed.glycans.clone(),
             protonation_decisions,
             unsupported_residues: Vec::new(),
             missing_heavy_atoms: Vec::new(),
@@ -155,7 +173,11 @@ impl SystemBuilder {
             total_charge: system.charge(),
             box_angstrom: system.box_angstrom,
         };
-        Ok(PreparedSystem { system, report })
+        Ok(ParameterizedSystem {
+            system,
+            report,
+            metadata: structure.metadata().clone(),
+        })
     }
 
     fn protonation_decisions(

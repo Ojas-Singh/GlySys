@@ -1,6 +1,7 @@
-# GlySysBuilder
+# GlySys
 
-GlySysBuilder is a pure-Rust Amber/GLYCAM system-preparation library and CLI.
+GlySys is a pure-Rust molecular-system and Amber/GLYCAM parameterization
+library. It includes the `glysysbuilder` system-preparation CLI.
 It reads complete-heavy-atom PDB structures, adds force-field hydrogens,
 parameterizes proteins with ff14SB and carbohydrates with GLYCAM06j-1,
 solvates with TIP3P, adds neutralizing ions and 0.15 M NaCl, and writes files
@@ -45,7 +46,7 @@ add_ions = true
 ## Rust API
 
 ```rust,no_run
-use glysysbuilder::{BuildOptions, SystemBuilder};
+use glysys::{BuildOptions, SystemBuilder};
 
 let builder = SystemBuilder::new(BuildOptions::default())?;
 let system = builder.prepare_pdb("input.pdb")?;

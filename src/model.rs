@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::{BuildError, BuildReport, Result};
+use crate::{BuildError, BuildReport, Result, SystemMetadata};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Vec3 {
@@ -19,52 +19,52 @@ impl Vec3 {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Atom {
-    pub name: String,
-    pub atom_type: String,
-    pub element: u8,
-    pub residue: usize,
-    pub charge: f64,
-    pub mass: f64,
-    pub radius: f64,
-    pub epsilon: f64,
-    pub position: Vec3,
+pub struct Atom {
+    pub(crate) name: String,
+    pub(crate) atom_type: String,
+    pub(crate) element: u8,
+    pub(crate) residue: usize,
+    pub(crate) charge: f64,
+    pub(crate) mass: f64,
+    pub(crate) radius: f64,
+    pub(crate) epsilon: f64,
+    pub(crate) position: Vec3,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Residue {
-    pub name: String,
-    pub number: i32,
-    pub insertion_code: Option<char>,
-    pub chain: String,
-    pub first_atom: usize,
-    pub atom_count: usize,
-    pub component: usize,
+pub struct Residue {
+    pub(crate) name: String,
+    pub(crate) number: i32,
+    pub(crate) insertion_code: Option<char>,
+    pub(crate) chain: String,
+    pub(crate) first_atom: usize,
+    pub(crate) atom_count: usize,
+    pub(crate) component: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Bond {
-    pub atoms: [usize; 2],
-    pub force: f64,
-    pub length: f64,
+pub struct Bond {
+    pub(crate) atoms: [usize; 2],
+    pub(crate) force: f64,
+    pub(crate) length: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Angle {
-    pub atoms: [usize; 3],
-    pub force: f64,
-    pub radians: f64,
+pub struct Angle {
+    pub(crate) atoms: [usize; 3],
+    pub(crate) force: f64,
+    pub(crate) radians: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Dihedral {
-    pub atoms: [usize; 4],
-    pub force: f64,
-    pub periodicity: i32,
-    pub phase: f64,
-    pub improper: bool,
-    pub scee: f64,
-    pub scnb: f64,
+pub struct Dihedral {
+    pub(crate) atoms: [usize; 4],
+    pub(crate) force: f64,
+    pub(crate) periodicity: i32,
+    pub(crate) phase: f64,
+    pub(crate) improper: bool,
+    pub(crate) scee: f64,
+    pub(crate) scnb: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -91,18 +91,54 @@ impl System {
 
 /// A fully parameterized and solvated system ready to be written.
 #[derive(Debug, Clone)]
-pub struct PreparedSystem {
+pub struct ParameterizedSystem {
     pub(crate) system: System,
     pub report: BuildReport,
+    pub(crate) metadata: SystemMetadata,
 }
 
-impl PreparedSystem {
+/// Backwards-compatible name for [`ParameterizedSystem`].
+pub type PreparedSystem = ParameterizedSystem;
+
+impl ParameterizedSystem {
     pub fn atom_count(&self) -> usize {
         self.system.atoms.len()
     }
 
     pub fn report(&self) -> &BuildReport {
         &self.report
+    }
+
+    pub fn atoms(&self) -> &[Atom] {
+        &self.system.atoms
+    }
+
+    pub fn residues(&self) -> &[Residue] {
+        &self.system.residues
+    }
+
+    pub fn bonds(&self) -> &[Bond] {
+        &self.system.bonds
+    }
+
+    pub fn angles(&self) -> &[Angle] {
+        &self.system.angles
+    }
+
+    pub fn dihedrals(&self) -> &[Dihedral] {
+        &self.system.dihedrals
+    }
+
+    pub fn exclusions(&self) -> &[BTreeSet<usize>] {
+        &self.system.exclusions
+    }
+
+    pub fn box_angstrom(&self) -> [f64; 3] {
+        self.system.box_angstrom
+    }
+
+    pub fn metadata(&self) -> &SystemMetadata {
+        &self.metadata
     }
 
     /// Write the Amber, GROMACS, and manifest bundle atomically per file.
@@ -162,6 +198,128 @@ impl PreparedSystem {
             atomic_write(directory.join(name), contents.as_bytes())?;
         }
         Ok(())
+    }
+}
+
+impl Atom {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn atom_type(&self) -> &str {
+        &self.atom_type
+    }
+
+    pub fn element(&self) -> u8 {
+        self.element
+    }
+
+    pub fn residue_index(&self) -> usize {
+        self.residue
+    }
+
+    pub fn charge(&self) -> f64 {
+        self.charge
+    }
+
+    pub fn mass(&self) -> f64 {
+        self.mass
+    }
+
+    pub fn lennard_jones_radius(&self) -> f64 {
+        self.radius
+    }
+
+    pub fn lennard_jones_epsilon(&self) -> f64 {
+        self.epsilon
+    }
+
+    pub fn position(&self) -> Vec3 {
+        self.position
+    }
+}
+
+impl Residue {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn number(&self) -> i32 {
+        self.number
+    }
+
+    pub fn insertion_code(&self) -> Option<char> {
+        self.insertion_code
+    }
+
+    pub fn chain(&self) -> &str {
+        &self.chain
+    }
+
+    pub fn atom_range(&self) -> std::ops::Range<usize> {
+        self.first_atom..self.first_atom + self.atom_count
+    }
+
+    pub fn component(&self) -> usize {
+        self.component
+    }
+}
+
+impl Bond {
+    pub fn atoms(&self) -> [usize; 2] {
+        self.atoms
+    }
+
+    pub fn force(&self) -> f64 {
+        self.force
+    }
+
+    pub fn length(&self) -> f64 {
+        self.length
+    }
+}
+
+impl Angle {
+    pub fn atoms(&self) -> [usize; 3] {
+        self.atoms
+    }
+
+    pub fn force(&self) -> f64 {
+        self.force
+    }
+
+    pub fn radians(&self) -> f64 {
+        self.radians
+    }
+}
+
+impl Dihedral {
+    pub fn atoms(&self) -> [usize; 4] {
+        self.atoms
+    }
+
+    pub fn force(&self) -> f64 {
+        self.force
+    }
+
+    pub fn periodicity(&self) -> i32 {
+        self.periodicity
+    }
+
+    pub fn phase(&self) -> f64 {
+        self.phase
+    }
+
+    pub fn is_improper(&self) -> bool {
+        self.improper
+    }
+
+    pub fn electrostatic_14_scale(&self) -> f64 {
+        self.scee
+    }
+
+    pub fn lennard_jones_14_scale(&self) -> f64 {
+        self.scnb
     }
 }
 

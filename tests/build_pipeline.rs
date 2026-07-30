@@ -1,4 +1,7 @@
-use glysysbuilder::{BuildError, BuildOptions, BuildWarning, SystemBuilder};
+use glysys::{
+    BuildError, BuildOptions, BuildWarning, ResidueAnnotation, ResidueId, SystemBuilder,
+    read_pdb_str, write_pdb_string,
+};
 
 const DIPEPTIDE: &str = include_str!("fixtures/dipeptide.pdb");
 const GLYCAN: &str = include_str!("fixtures/glycan.pdb");
@@ -304,6 +307,40 @@ fn loads_json_options() {
     let options = BuildOptions::from_config_file(path).unwrap();
     assert_eq!(options.padding_angstrom, 9.5);
     assert_eq!(options.salt_molar, 0.0);
+}
+
+#[test]
+fn parameterizes_an_in_memory_structure_and_preserves_metadata() {
+    let options = BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    };
+    let mut structure = read_pdb_str(DIPEPTIDE, &options).unwrap();
+    let residue = ResidueId {
+        chain: String::new(),
+        number: 1,
+        insertion_code: None,
+    };
+    structure
+        .metadata_mut()
+        .residue_annotations
+        .push(ResidueAnnotation {
+            residue: residue.clone(),
+            label: "consumer-owned".into(),
+        });
+
+    let system = SystemBuilder::new(options)
+        .unwrap()
+        .prepare_structure(&structure)
+        .unwrap();
+    assert_eq!(system.atom_count(), 20);
+    assert_eq!(system.atoms().len(), 20);
+    assert_eq!(system.metadata().residue_annotations[0].residue, residue);
+
+    let serialized = write_pdb_string(&structure);
+    assert!(serialized.contains("ATOM"));
+    assert!(serialized.ends_with("END\n"));
 }
 
 fn sha256(contents: &str) -> String {
