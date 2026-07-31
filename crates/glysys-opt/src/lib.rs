@@ -30,6 +30,9 @@ pub trait GeneticProblem: Sync {
     fn mutate(&self, state: &mut Self::State, rng: &mut ChaCha8Rng, rate: f64);
     fn repair(&self, _state: &mut Self::State, _rng: &mut ChaCha8Rng) {}
     fn evaluate(&self, state: &Self::State) -> f64;
+    fn is_solution(&self, _state: &Self::State, _score: f64) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -101,6 +104,14 @@ where
             best_score: scored[0].0,
             mean_score: scored.iter().map(|entry| entry.0).sum::<f64>() / scored.len() as f64,
         });
+        if problem.is_solution(&scored[0].1, scored[0].0) {
+            return Ok(GeneticAlgorithmOutcome {
+                best_state: scored[0].1.clone(),
+                best_score: scored[0].0,
+                generations: generation,
+                history,
+            });
+        }
         if generation == config.generations {
             return Ok(GeneticAlgorithmOutcome {
                 best_state: scored[0].1.clone(),

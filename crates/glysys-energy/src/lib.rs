@@ -252,13 +252,29 @@ impl<'a> EnergyEvaluator<'a> {
 
     /// Evaluate energy and Cartesian derivatives.
     ///
-    /// Local bonded and nonbonded derivatives share the same differentiable
-    /// energy expression. OBC2 descreening derivatives use stable symmetric
-    /// differentiation until the vectorized analytic kernel lands.
+    /// Bonds, angles, nonbonded interactions, and restraints use closed-form
+    /// Cartesian derivatives. Periodic torsions and OBC2 descreening use
+    /// forward automatic differentiation.
     pub fn energy_and_gradient(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
         let components = self.components(coordinates)?;
-        let mut work = coordinates.to_vec();
-        let mut gradients = vec![
+        let mut gradients = self.analytic_gradient(coordinates)?;
+        for (gradient, residual) in gradients
+            .iter_mut()
+            .zip(self.residual_gradient(coordinates))
+        {
+            gradient.x += residual.x;
+            gradient.y += residual.y;
+            gradient.z += residual.z;
+        }
+        Ok(EnergyResult {
+            components,
+            gradients: Some(gradients),
+        })
+    }
+
+    fn analytic_gradient(&self, coordinates: &[Vec3]) -> Result<Vec<Vec3>> {
+        validate_coordinates(self.system.atom_count(), coordinates)?;
+        let mut gradient = vec![
             Vec3 {
                 x: 0.0,
                 y: 0.0,
@@ -266,29 +282,137 @@ impl<'a> EnergyEvaluator<'a> {
             };
             coordinates.len()
         ];
-        let step = self.options.gradient_step;
-        for atom in self.selection.indices() {
-            for axis in 0..3 {
-                set_axis(
-                    &mut work[atom],
-                    axis,
-                    axis_value(coordinates[atom], axis) + step,
-                );
-                let plus = self.components(&work)?.total();
-                set_axis(
-                    &mut work[atom],
-                    axis,
-                    axis_value(coordinates[atom], axis) - step,
-                );
-                let minus = self.components(&work)?.total();
-                set_axis(&mut work[atom], axis, axis_value(coordinates[atom], axis));
-                set_axis(&mut gradients[atom], axis, (plus - minus) / (2.0 * step));
+        for bond in self.system.bonds() {
+            let [first, second] = bond.atoms();
+            let vector = subtract(coordinates[first], coordinates[second]);
+            let radius = norm(vector).max(1.0e-12);
+            let derivative = 2.0 * bond.force() * (radius - bond.length()) / radius;
+            add_scaled(&mut gradient[first], vector, derivative);
+            add_scaled(&mut gradient[second], vector, -derivative);
+        }
+        for angle in self.system.angles() {
+            let [first, center, third] = angle.atoms();
+            let left = subtract(coordinates[first], coordinates[center]);
+            let right = subtract(coordinates[third], coordinates[center]);
+            let left_norm = norm(left).max(1.0e-12);
+            let right_norm = norm(right).max(1.0e-12);
+            let cosine = (dot(left, right) / (left_norm * right_norm)).clamp(-1.0, 1.0);
+            let theta = cosine.acos();
+            let sine = (1.0 - cosine * cosine).sqrt().max(1.0e-12);
+            let factor = 2.0 * angle.force() * (theta - angle.radians()) / sine;
+            let first_derivative = subtract(
+                scale(left, cosine / (left_norm * left_norm)),
+                scale(right, 1.0 / (left_norm * right_norm)),
+            );
+            let third_derivative = subtract(
+                scale(right, cosine / (right_norm * right_norm)),
+                scale(left, 1.0 / (left_norm * right_norm)),
+            );
+            add_scaled(&mut gradient[first], first_derivative, factor);
+            add_scaled(&mut gradient[third], third_derivative, factor);
+            add_scaled(&mut gradient[center], first_derivative, -factor);
+            add_scaled(&mut gradient[center], third_derivative, -factor);
+        }
+        let exclusions = self.system.exclusions();
+        for first in 0..self.system.atom_count() {
+            for second in first + 1..self.system.atom_count() {
+                let vector = subtract(coordinates[first], coordinates[second]);
+                let radius = norm(vector).max(1.0e-8);
+                if self.options.cutoff.is_some_and(|cutoff| radius > cutoff) {
+                    continue;
+                }
+                let pair = ordered(first, second);
+                let scale_14 = self.one_four.get(&pair).copied();
+                if exclusions[first].contains(&second) && scale_14.is_none() {
+                    continue;
+                }
+                let (scee, scnb) = scale_14.unwrap_or((1.0, 1.0));
+                let first_atom = &self.system.atoms()[first];
+                let second_atom = &self.system.atoms()[second];
+                let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+                let epsilon = (first_atom.lennard_jones_epsilon()
+                    * second_atom.lennard_jones_epsilon())
+                .sqrt();
+                let ratio6 = (sigma / radius).powi(6);
+                let coulomb = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
+                    / (self.options.dielectric * scee * radius);
+                let derivative = 12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius)
+                    - coulomb / radius;
+                add_scaled(&mut gradient[first], vector, derivative / radius);
+                add_scaled(&mut gradient[second], vector, -derivative / radius);
             }
         }
-        Ok(EnergyResult {
-            components,
-            gradients: Some(gradients),
-        })
+        for restraint in &self.options.restraints {
+            if let Some(position) = coordinates.get(restraint.atom) {
+                let vector = subtract(*position, restraint.reference);
+                add_scaled(&mut gradient[restraint.atom], vector, 2.0 * restraint.force);
+            }
+        }
+        for (index, value) in gradient.iter_mut().enumerate() {
+            if !self.selection.is_movable(index) {
+                *value = Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                };
+            }
+        }
+        Ok(gradient)
+    }
+
+    fn residual_gradient(&self, coordinates: &[Vec3]) -> Vec<Vec3> {
+        let selected = self.selection.indices().collect::<Vec<_>>();
+        let dimension = selected.len() * 3;
+        let offsets = selected
+            .iter()
+            .enumerate()
+            .map(|(offset, atom)| (*atom, offset * 3))
+            .collect::<HashMap<_, _>>();
+        let points = coordinates
+            .iter()
+            .enumerate()
+            .map(|(atom, point)| {
+                let offset = offsets.get(&atom).copied();
+                DualVec3 {
+                    x: Dual::coordinate(point.x, dimension, offset),
+                    y: Dual::coordinate(point.y, dimension, offset.map(|value| value + 1)),
+                    z: Dual::coordinate(point.z, dimension, offset.map(|value| value + 2)),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut total = Dual::constant(0.0, dimension);
+        for torsion in self.system.dihedrals() {
+            let atoms = torsion.atoms();
+            let phi = dual_dihedral(
+                &points[atoms[0]],
+                &points[atoms[1]],
+                &points[atoms[2]],
+                &points[atoms[3]],
+            );
+            let argument = phi
+                .scale(torsion.periodicity() as f64)
+                .add_constant(-torsion.phase());
+            total = total.add(argument.cos().add_constant(1.0).scale(torsion.force()));
+        }
+        if let Some(options) = &self.options.obc2 {
+            total = total.add(dual_obc2(self.system.atoms(), &points, options, dimension));
+        }
+        let mut gradients = vec![
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            };
+            coordinates.len()
+        ];
+        for (offset, atom) in selected.iter().enumerate() {
+            gradients[*atom] = Vec3 {
+                x: total.gradient[offset * 3],
+                y: total.gradient[offset * 3 + 1],
+                z: total.gradient[offset * 3 + 2],
+            };
+        }
+        gradients
     }
 
     pub fn components(&self, coordinates: &[Vec3]) -> Result<EnergyComponents> {
@@ -359,6 +483,376 @@ impl<'a> EnergyEvaluator<'a> {
         }
         Ok(result)
     }
+}
+
+#[derive(Clone)]
+struct Dual {
+    value: f64,
+    gradient: Vec<f64>,
+}
+
+impl Dual {
+    fn constant(value: f64, dimension: usize) -> Self {
+        Self {
+            value,
+            gradient: vec![0.0; dimension],
+        }
+    }
+
+    fn coordinate(value: f64, dimension: usize, offset: Option<usize>) -> Self {
+        let mut result = Self::constant(value, dimension);
+        if let Some(offset) = offset {
+            result.gradient[offset] = 1.0;
+        }
+        result
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            value: self.value + other.value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .zip(other.gradient)
+                .map(|(first, second)| first + second)
+                .collect(),
+        }
+    }
+
+    fn sub(self, other: Self) -> Self {
+        self.add(other.scale(-1.0))
+    }
+
+    fn add_constant(mut self, value: f64) -> Self {
+        self.value += value;
+        self
+    }
+
+    fn scale(mut self, factor: f64) -> Self {
+        self.value *= factor;
+        for value in &mut self.gradient {
+            *value *= factor;
+        }
+        self
+    }
+
+    fn mul(self, other: Self) -> Self {
+        let first_value = self.value;
+        let second_value = other.value;
+        Self {
+            value: first_value * second_value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .zip(other.gradient)
+                .map(|(first, second)| first * second_value + second * first_value)
+                .collect(),
+        }
+    }
+
+    fn reciprocal(self) -> Self {
+        let value = 1.0 / self.value;
+        let factor = -value * value;
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn div(self, other: Self) -> Self {
+        self.mul(other.reciprocal())
+    }
+
+    fn sqrt(self) -> Self {
+        let value = self.value.sqrt();
+        let factor = 0.5 / value.max(1.0e-30);
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn exp(self) -> Self {
+        let value = self.value.exp();
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * value)
+                .collect(),
+        }
+    }
+
+    fn ln(self) -> Self {
+        let value = self.value.ln();
+        let factor = 1.0 / self.value;
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn tanh(self) -> Self {
+        let value = self.value.tanh();
+        let factor = 1.0 - value * value;
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn cos(self) -> Self {
+        let factor = -self.value.sin();
+        Self {
+            value: self.value.cos(),
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn atan2(self, x: Self) -> Self {
+        let denominator = self.value * self.value + x.value * x.value;
+        let y_value = self.value;
+        let x_value = x.value;
+        Self {
+            value: y_value.atan2(x_value),
+            gradient: self
+                .gradient
+                .into_iter()
+                .zip(x.gradient)
+                .map(|(dy, dx)| (x_value * dy - y_value * dx) / denominator.max(1.0e-30))
+                .collect(),
+        }
+    }
+
+    fn powi(self, exponent: usize) -> Self {
+        if exponent == 0 {
+            return Self::constant(1.0, self.gradient.len());
+        }
+        let value = self.value.powi(exponent as i32);
+        let factor = exponent as f64 * self.value.powi(exponent as i32 - 1);
+        Self {
+            value,
+            gradient: self
+                .gradient
+                .into_iter()
+                .map(|gradient| gradient * factor)
+                .collect(),
+        }
+    }
+
+    fn abs(self) -> Self {
+        if self.value < 0.0 {
+            self.scale(-1.0)
+        } else {
+            self
+        }
+    }
+
+    fn floor(self, minimum: f64) -> Self {
+        if self.value < minimum {
+            Self::constant(minimum, self.gradient.len())
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DualVec3 {
+    x: Dual,
+    y: Dual,
+    z: Dual,
+}
+
+fn dual_subtract(first: &DualVec3, second: &DualVec3) -> DualVec3 {
+    DualVec3 {
+        x: first.x.clone().sub(second.x.clone()),
+        y: first.y.clone().sub(second.y.clone()),
+        z: first.z.clone().sub(second.z.clone()),
+    }
+}
+
+fn dual_scale(vector: &DualVec3, factor: Dual) -> DualVec3 {
+    DualVec3 {
+        x: vector.x.clone().mul(factor.clone()),
+        y: vector.y.clone().mul(factor.clone()),
+        z: vector.z.clone().mul(factor),
+    }
+}
+
+fn dual_dot(first: &DualVec3, second: &DualVec3) -> Dual {
+    first
+        .x
+        .clone()
+        .mul(second.x.clone())
+        .add(first.y.clone().mul(second.y.clone()))
+        .add(first.z.clone().mul(second.z.clone()))
+}
+
+fn dual_cross(first: &DualVec3, second: &DualVec3) -> DualVec3 {
+    DualVec3 {
+        x: first
+            .y
+            .clone()
+            .mul(second.z.clone())
+            .sub(first.z.clone().mul(second.y.clone())),
+        y: first
+            .z
+            .clone()
+            .mul(second.x.clone())
+            .sub(first.x.clone().mul(second.z.clone())),
+        z: first
+            .x
+            .clone()
+            .mul(second.y.clone())
+            .sub(first.y.clone().mul(second.x.clone())),
+    }
+}
+
+fn dual_dihedral(first: &DualVec3, second: &DualVec3, third: &DualVec3, fourth: &DualVec3) -> Dual {
+    let b0 = dual_subtract(second, first);
+    let b1 = dual_subtract(third, second);
+    let b2 = dual_subtract(fourth, third);
+    let inverse_norm = dual_dot(&b1, &b1).sqrt().floor(1.0e-30).reciprocal();
+    let normalized = dual_scale(&b1, inverse_norm);
+    let v = dual_subtract(&b0, &dual_scale(&normalized, dual_dot(&b0, &normalized)));
+    let w = dual_subtract(&b2, &dual_scale(&normalized, dual_dot(&b2, &normalized)));
+    dual_dot(&dual_cross(&normalized, &v), &w).atan2(dual_dot(&v, &w))
+}
+
+fn dual_squared_distance(first: &DualVec3, second: &DualVec3) -> Dual {
+    let difference = dual_subtract(first, second);
+    dual_dot(&difference, &difference)
+}
+
+fn dual_obc2(
+    atoms: &[Atom],
+    coordinates: &[DualVec3],
+    options: &Obc2Options,
+    dimension: usize,
+) -> Dual {
+    const OFFSET: f64 = 0.09;
+    const ALPHA: f64 = 1.0;
+    const BETA: f64 = 0.8;
+    const GAMMA: f64 = 4.85;
+    let mut born = Vec::with_capacity(atoms.len());
+    for first in 0..atoms.len() {
+        let radius = (atoms[first].gb_radius() - OFFSET).max(0.1);
+        let mut integral = Dual::constant(0.0, dimension);
+        for second in 0..atoms.len() {
+            if first == second {
+                continue;
+            }
+            let distance = dual_squared_distance(&coordinates[first], &coordinates[second])
+                .sqrt()
+                .floor(1.0e-8);
+            let scaled = atoms[second].gb_radius() * atoms[second].gb_screen();
+            if distance.value + scaled <= radius {
+                continue;
+            }
+            let candidate = distance.clone().add_constant(-scaled).abs();
+            let lower = if candidate.value < radius {
+                Dual::constant(radius, dimension)
+            } else {
+                candidate
+            };
+            let upper = distance.clone().add_constant(scaled);
+            if lower.value >= upper.value {
+                continue;
+            }
+            let inverse_lower = lower.clone().reciprocal();
+            let inverse_upper = upper.clone().reciprocal();
+            let distance_term = distance
+                .clone()
+                .sub(Dual::constant(scaled * scaled, dimension).div(distance.clone()));
+            let inverse_square_delta = inverse_upper
+                .clone()
+                .powi(2)
+                .sub(inverse_lower.clone().powi(2));
+            let logarithm = lower.clone().div(upper).ln();
+            let term = inverse_lower
+                .sub(inverse_upper)
+                .add(distance_term.mul(inverse_square_delta).scale(0.25))
+                .add(logarithm.div(distance).scale(0.5))
+                .scale(0.5);
+            integral = integral.add(term);
+        }
+        let psi = integral.scale(radius);
+        let transformed = psi
+            .clone()
+            .scale(ALPHA)
+            .sub(psi.clone().powi(2).scale(BETA))
+            .add(psi.powi(3).scale(GAMMA))
+            .tanh();
+        let denominator = Dual::constant(1.0 / radius, dimension)
+            .sub(transformed.scale(1.0 / atoms[first].gb_radius()))
+            .floor(1.0e-6);
+        born.push(denominator.reciprocal());
+    }
+
+    let dielectric = 1.0 / options.solute_dielectric - 1.0 / options.solvent_dielectric;
+    let mut total = Dual::constant(0.0, dimension);
+    for first in 0..atoms.len() {
+        for second in first..atoms.len() {
+            let distance2 = if first == second {
+                Dual::constant(0.0, dimension)
+            } else {
+                dual_squared_distance(&coordinates[first], &coordinates[second])
+            };
+            let born_product = born[first].clone().mul(born[second].clone());
+            let exponential = distance2
+                .clone()
+                .scale(-0.25)
+                .div(born_product.clone())
+                .exp();
+            let denominator = distance2
+                .add(born_product.mul(exponential))
+                .sqrt()
+                .floor(1.0e-8);
+            let factor = if first == second { 0.5 } else { 1.0 };
+            let coefficient = -factor
+                * COULOMB_KCAL_ANGSTROM
+                * dielectric
+                * atoms[first].charge()
+                * atoms[second].charge();
+            total = total.add(denominator.reciprocal().scale(coefficient));
+        }
+    }
+    for (atom, born) in atoms.iter().zip(&born) {
+        let radius = atom.gb_radius();
+        let coefficient = 4.0
+            * std::f64::consts::PI
+            * options.surface_tension
+            * (radius + options.probe_radius).powi(2);
+        total = total.add(
+            Dual::constant(radius, dimension)
+                .div(born.clone())
+                .powi(6)
+                .scale(coefficient),
+        );
+    }
+    total
 }
 
 /// Simple Verlet-style pair list for downstream high-throughput evaluators.
@@ -508,6 +1002,12 @@ fn scale(vector: Vec3, factor: f64) -> Vec3 {
     }
 }
 
+fn add_scaled(target: &mut Vec3, vector: Vec3, factor: f64) {
+    target.x += vector.x * factor;
+    target.y += vector.y * factor;
+    target.z += vector.z * factor;
+}
+
 fn dot(first: Vec3, second: Vec3) -> f64 {
     first.x * second.x + first.y * second.y + first.z * second.z
 }
@@ -522,22 +1022,6 @@ fn cross(first: Vec3, second: Vec3) -> Vec3 {
 
 fn norm(vector: Vec3) -> f64 {
     dot(vector, vector).sqrt()
-}
-
-fn axis_value(vector: Vec3, axis: usize) -> f64 {
-    match axis {
-        0 => vector.x,
-        1 => vector.y,
-        _ => vector.z,
-    }
-}
-
-fn set_axis(vector: &mut Vec3, axis: usize, value: f64) {
-    match axis {
-        0 => vector.x = value,
-        1 => vector.y = value,
-        _ => vector.z = value,
-    }
 }
 
 #[cfg(test)]
@@ -587,6 +1071,38 @@ mod tests {
         let gradient = result.gradients.unwrap()[0].x;
         assert!(gradient.is_finite());
         assert!(gradient.abs() > 1.0e-8);
+        let mut plus = coordinates.clone();
+        let mut minus = coordinates;
+        plus[0].x += 2.0e-5;
+        minus[0].x -= 2.0e-5;
+        let expected = (evaluator.energy(&plus).unwrap().total()
+            - evaluator.energy(&minus).unwrap().total())
+            / 4.0e-5;
+        assert!((gradient - expected).abs() < 2.0e-3);
+    }
+
+    #[test]
+    fn obc2_gradient_matches_an_independent_finite_difference() {
+        let system = system();
+        let evaluator = EnergyEvaluator::new(&system, EnergyOptions::default())
+            .unwrap()
+            .with_selection(AtomSelection::from_indices(system.atom_count(), [0]))
+            .unwrap();
+        let coordinates = system.coordinates();
+        let gradient = evaluator
+            .energy_and_gradient(&coordinates)
+            .unwrap()
+            .gradients
+            .unwrap()[0]
+            .x;
+        let mut plus = coordinates.clone();
+        let mut minus = coordinates;
+        plus[0].x += 2.0e-5;
+        minus[0].x -= 2.0e-5;
+        let expected = (evaluator.energy(&plus).unwrap().total()
+            - evaluator.energy(&minus).unwrap().total())
+            / 4.0e-5;
+        assert!((gradient - expected).abs() < 5.0e-3);
     }
 
     #[test]

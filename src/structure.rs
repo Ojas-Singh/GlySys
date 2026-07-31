@@ -114,10 +114,64 @@ impl AppendMap {
 impl Structure {
     pub(crate) fn from_parsed(parsed: ParsedPdb) -> Self {
         let protein_chains = parsed.chains.clone();
+        let glycosylation_sites = parsed
+            .links
+            .iter()
+            .filter_map(|link| {
+                let first = parsed.residues.iter().find(|residue| {
+                    residue.reference.chain == link.first.chain
+                        && residue.reference.number == link.first.number
+                        && residue.reference.insertion_code == link.first.insertion_code
+                })?;
+                let second = parsed.residues.iter().find(|residue| {
+                    residue.reference.chain == link.second.chain
+                        && residue.reference.number == link.second.number
+                        && residue.reference.insertion_code == link.second.insertion_code
+                })?;
+                let first_is_protein =
+                    crate::pdb::PROTEIN_RESIDUES.contains(&first.reference.name.as_str());
+                let second_is_protein =
+                    crate::pdb::PROTEIN_RESIDUES.contains(&second.reference.name.as_str());
+                match (first_is_protein, second_is_protein) {
+                    (true, false) => Some(GlycosylationSite {
+                        protein_residue: residue_id(&first.reference),
+                        protein_atom: link.first_atom.clone(),
+                        glycan_residue: residue_id(&second.reference),
+                        glycan_atom: link.second_atom.clone(),
+                    }),
+                    (false, true) => Some(GlycosylationSite {
+                        protein_residue: residue_id(&second.reference),
+                        protein_atom: link.second_atom.clone(),
+                        glycan_residue: residue_id(&first.reference),
+                        glycan_atom: link.first_atom.clone(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let glycan_trees = glycosylation_sites
+            .iter()
+            .map(|site| GlycanTree {
+                chain: site.glycan_residue.chain.clone(),
+                residue_ids: parsed
+                    .residues
+                    .iter()
+                    .filter(|residue| {
+                        residue.reference.chain == site.glycan_residue.chain
+                            && !crate::pdb::PROTEIN_RESIDUES
+                                .contains(&residue.reference.name.as_str())
+                    })
+                    .map(|residue| residue_id(&residue.reference))
+                    .collect(),
+                attachment_site: Some(site.protein_residue.clone()),
+            })
+            .collect();
         Self {
             parsed,
             metadata: SystemMetadata {
                 protein_chains,
+                glycan_trees,
+                glycosylation_sites,
                 ..SystemMetadata::default()
             },
         }
@@ -395,6 +449,20 @@ impl Structure {
     }
 
     pub fn add_glycosylation_site(&mut self, site: GlycosylationSite) {
+        let declared = DeclaredLink {
+            first: (&site.protein_residue).into(),
+            first_atom: site.protein_atom.clone(),
+            second: (&site.glycan_residue).into(),
+            second_atom: site.glycan_atom.clone(),
+        };
+        if !self.parsed.links.iter().any(|link| {
+            link.first == declared.first
+                && link.first_atom == declared.first_atom
+                && link.second == declared.second
+                && link.second_atom == declared.second_atom
+        }) {
+            self.parsed.links.push(declared);
+        }
         self.metadata.glycosylation_sites.push(site);
     }
 
@@ -472,7 +540,7 @@ pub fn write_pdb(structure: &Structure, path: impl AsRef<Path>) -> Result<()> {
 /// Serialize an unparameterized structure as PDB text.
 pub fn write_pdb_string(structure: &Structure) -> String {
     let mut output = String::new();
-    for residue in &structure.parsed.residues {
+    for (index, residue) in structure.parsed.residues.iter().enumerate() {
         let record = if crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str()) {
             "ATOM  "
         } else {
@@ -495,13 +563,20 @@ pub fn write_pdb_string(structure: &Structure) -> String {
                 0.0,
             ));
         }
-        output.push_str("TER\n");
+        let chain_ends = structure
+            .parsed
+            .residues
+            .get(index + 1)
+            .is_none_or(|next| next.reference.chain != residue.reference.chain);
+        if chain_ends {
+            output.push_str("TER\n");
+        }
     }
     for (first, second) in &structure.parsed.conect {
         output.push_str(&format!("CONECT{first:>5}{second:>5}\n"));
     }
     for link in &structure.parsed.links {
-        output.push_str(&format_link(link));
+        output.push_str(&format_link(structure, link));
     }
     output.push_str("END\n");
     output
@@ -523,18 +598,68 @@ fn ordered(first: u32, second: u32) -> (u32, u32) {
     }
 }
 
-fn format_link(link: &DeclaredLink) -> String {
+fn format_link(structure: &Structure, link: &DeclaredLink) -> String {
+    let first = structure.parsed.residues.iter().find(|residue| {
+        residue.reference.chain == link.first.chain
+            && residue.reference.number == link.first.number
+            && residue.reference.insertion_code == link.first.insertion_code
+    });
+    let second = structure.parsed.residues.iter().find(|residue| {
+        residue.reference.chain == link.second.chain
+            && residue.reference.number == link.second.number
+            && residue.reference.insertion_code == link.second.insertion_code
+    });
+    let first_name = first.map_or("", |residue| residue.reference.name.as_str());
+    let second_name = second.map_or("", |residue| residue.reference.name.as_str());
+    let distance = first
+        .and_then(|residue| {
+            residue
+                .atoms
+                .iter()
+                .find(|atom| atom.name == link.first_atom)
+        })
+        .zip(second.and_then(|residue| {
+            residue
+                .atoms
+                .iter()
+                .find(|atom| atom.name == link.second_atom)
+        }))
+        .map(|(first, second)| {
+            let dx = first.position.x - second.position.x;
+            let dy = first.position.y - second.position.y;
+            let dz = first.position.z - second.position.z;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        });
+
+    let mut record = vec![b' '; 80];
+    put_field(&mut record, 0, "LINK");
+    put_field(&mut record, 12, &format!("{:>4}", link.first_atom));
+    put_field(&mut record, 17, &format!("{first_name:>3}"));
+    put_field(&mut record, 21, &link.first.chain);
+    put_field(&mut record, 22, &format!("{:>4}", link.first.number));
+    if let Some(code) = link.first.insertion_code {
+        put_field(&mut record, 26, &code.to_string());
+    }
+    put_field(&mut record, 42, &format!("{:>4}", link.second_atom));
+    put_field(&mut record, 47, &format!("{second_name:>3}"));
+    put_field(&mut record, 51, &link.second.chain);
+    put_field(&mut record, 52, &format!("{:>4}", link.second.number));
+    if let Some(code) = link.second.insertion_code {
+        put_field(&mut record, 56, &code.to_string());
+    }
+    if let Some(distance) = distance {
+        put_field(&mut record, 73, &format!("{distance:>5.2}"));
+    }
     format!(
-        "LINK        {:<4} {:>3} {:1}{:>4}                {:<4} {:>3} {:1}{:>4}\n",
-        link.first_atom,
-        "",
-        link.first.chain,
-        link.first.number,
-        link.second_atom,
-        "",
-        link.second.chain,
-        link.second.number,
+        "{}\n",
+        String::from_utf8(record).expect("PDB LINK fields are ASCII")
     )
+}
+
+fn put_field(record: &mut [u8], offset: usize, value: &str) {
+    for (destination, source) in record[offset..].iter_mut().zip(value.bytes()) {
+        *destination = source;
+    }
 }
 
 impl From<&ResidueId> for ResidueKey {
@@ -544,5 +669,60 @@ impl From<&ResidueId> for ResidueKey {
             number: value.number,
             insertion_code: value.insertion_code,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GLYCOPROTEIN: &str = "\
+ATOM      1  N   ASN A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  ND2 ASN A   1       1.000   0.000   0.000  1.00  0.00           N
+ATOM      3  N   ALA A   2       2.000   0.000   0.000  1.00  0.00           N
+HETATM    4  C1  NAG B   1       2.450   0.000   0.000  1.00  0.00           C
+END
+";
+
+    #[test]
+    fn pdb_writer_terminates_chains_and_writes_complete_links() {
+        let mut structure =
+            read_pdb_str(GLYCOPROTEIN, &BuildOptions::default()).expect("parse fixture");
+        structure
+            .add_bond(AtomId(2), AtomId(4))
+            .expect("add attachment bond");
+        structure.add_glycosylation_site(GlycosylationSite {
+            protein_residue: ResidueId {
+                chain: "A".into(),
+                number: 1,
+                insertion_code: None,
+            },
+            protein_atom: "ND2".into(),
+            glycan_residue: ResidueId {
+                chain: "B".into(),
+                number: 1,
+                insertion_code: None,
+            },
+            glycan_atom: "C1".into(),
+        });
+
+        let output = write_pdb_string(&structure);
+        assert_eq!(output.lines().filter(|line| *line == "TER").count(), 2);
+        assert!(!output.contains("ND2 ASN A   1\nTER\nATOM"));
+        let link = output
+            .lines()
+            .find(|line| line.starts_with("LINK"))
+            .expect("LINK record");
+        assert_eq!(&link[12..16], " ND2");
+        assert_eq!(&link[17..20], "ASN");
+        assert_eq!(&link[42..46], "  C1");
+        assert_eq!(&link[47..50], "NAG");
+        assert!(output.contains("CONECT    2    4"));
+
+        let reparsed =
+            read_pdb_str(&output, &BuildOptions::default()).expect("reparse written PDB");
+        assert_eq!(reparsed.metadata().glycosylation_sites.len(), 1);
+        assert_eq!(reparsed.metadata().glycan_trees.len(), 1);
+        assert_eq!(reparsed.metadata().glycan_trees[0].residue_ids.len(), 1);
     }
 }
