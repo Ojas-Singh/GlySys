@@ -9,5 +9,6 @@ repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
 glysys = { version = "0.1.0", path = "../.." }
+pulp = "=0.22.3"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

@@ -1,8 +1,9 @@
 //! Molecular-mechanics energies and gradients for parameterized GlySys systems.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use glysys::{Atom, ParameterizedSystem, Vec3};
+use pulp::{Arch, Simd, WithSimd};
 
 const COULOMB_KCAL_ANGSTROM: f64 = 332.063_713_299;
 
@@ -84,6 +85,10 @@ impl AtomGroupMask {
 
     pub fn len(&self) -> usize {
         self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.members.iter().any(|member| *member)
     }
 
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
@@ -262,6 +267,56 @@ pub struct EnergyEvaluator<'a> {
     options: EnergyOptions,
     selection: AtomSelection,
     one_four: HashMap<(usize, usize), (f64, f64)>,
+    active_terms_only: bool,
+}
+
+struct InteractionKernel<'a> {
+    radii2: &'a [f64],
+    sigmas: &'a [f64],
+    epsilons: &'a [f64],
+    charges: &'a [f64],
+}
+
+impl WithSimd for InteractionKernel<'_> {
+    type Output = InteractionEnergyComponents;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let (radii, radii_tail) = S::as_simd_f64s(self.radii2);
+        let (sigmas, sigmas_tail) = S::as_simd_f64s(self.sigmas);
+        let (epsilons, epsilons_tail) = S::as_simd_f64s(self.epsilons);
+        let (charges, charges_tail) = S::as_simd_f64s(self.charges);
+        let mut vdw = simd.splat_f64s(0.0);
+        let mut coulomb = simd.splat_f64s(0.0);
+        let two = simd.splat_f64s(2.0);
+        for (((radius2, sigma), epsilon), charge) in
+            radii.iter().zip(sigmas).zip(epsilons).zip(charges)
+        {
+            let radius = simd.sqrt_f64s(*radius2);
+            let ratio = simd.div_f64s(*sigma, radius);
+            let ratio2 = simd.mul_f64s(ratio, ratio);
+            let ratio6 = simd.mul_f64s(simd.mul_f64s(ratio2, ratio2), ratio2);
+            let shape = simd.sub_f64s(simd.mul_f64s(ratio6, ratio6), simd.mul_f64s(two, ratio6));
+            vdw = simd.add_f64s(vdw, simd.mul_f64s(*epsilon, shape));
+            coulomb = simd.add_f64s(coulomb, simd.div_f64s(*charge, radius));
+        }
+        let mut result = InteractionEnergyComponents {
+            van_der_waals: simd.reduce_sum_f64s(vdw),
+            electrostatics: simd.reduce_sum_f64s(coulomb),
+        };
+        for (((radius2, sigma), epsilon), charge) in radii_tail
+            .iter()
+            .zip(sigmas_tail)
+            .zip(epsilons_tail)
+            .zip(charges_tail)
+        {
+            let radius = radius2.sqrt();
+            let ratio6 = (sigma / radius).powi(6);
+            result.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6);
+            result.electrostatics += charge / radius;
+        }
+        result
+    }
 }
 
 impl<'a> EnergyEvaluator<'a> {
@@ -288,6 +343,7 @@ impl<'a> EnergyEvaluator<'a> {
             options,
             selection: AtomSelection::all(system.atom_count()),
             one_four,
+            active_terms_only: false,
         })
     }
 
@@ -302,8 +358,25 @@ impl<'a> EnergyEvaluator<'a> {
         Ok(self)
     }
 
+    /// Restrict both values and gradients to terms touching selected atoms.
+    /// Fixed-only contributions are constant during local minimization and
+    /// can be omitted without changing its trajectory.
+    pub fn with_active_terms(mut self, selection: AtomSelection) -> Result<Self> {
+        self = self.with_selection(selection)?;
+        self.active_terms_only = true;
+        Ok(self)
+    }
+
     pub fn selection(&self) -> &AtomSelection {
         &self.selection
+    }
+
+    fn nonbonded_pairs(&self, coordinates: &[Vec3]) -> Vec<(usize, usize)> {
+        if self.active_terms_only {
+            selected_nonbonded_pairs(coordinates, self.options.cutoff, &self.selection)
+        } else {
+            nonbonded_pairs(coordinates, self.options.cutoff)
+        }
     }
 
     /// Calculate only cross nonbonded interactions between two disjoint atom
@@ -328,33 +401,38 @@ impl<'a> EnergyEvaluator<'a> {
             ));
         }
         let exclusions = self.system.exclusions();
-        let mut result = InteractionEnergyComponents::default();
-        for first in first_group.indices() {
-            for second in second_group.indices() {
-                let radius = distance(coordinates[first], coordinates[second]).max(1.0e-8);
-                if self.options.cutoff.is_some_and(|cutoff| radius > cutoff) {
-                    continue;
-                }
-                let pair = ordered(first, second);
-                let scale = self.one_four.get(&pair).copied();
-                if exclusions[first].contains(&second) && scale.is_none() {
-                    continue;
-                }
-                let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
-                let first_atom = &self.system.atoms()[first];
-                let second_atom = &self.system.atoms()[second];
-                let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
-                let epsilon = (first_atom.lennard_jones_epsilon()
-                    * second_atom.lennard_jones_epsilon())
-                .sqrt();
-                let ratio6 = (sigma / radius).powi(6);
-                result.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
-                result.electrostatics +=
-                    COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
-                        / (self.options.dielectric * radius * scee);
+        let mut radii2 = Vec::new();
+        let mut sigmas = Vec::new();
+        let mut epsilons = Vec::new();
+        let mut charges = Vec::new();
+        for (first, second) in
+            cross_nonbonded_pairs(coordinates, self.options.cutoff, first_group, second_group)
+        {
+            let pair = ordered(first, second);
+            let scale = self.one_four.get(&pair).copied();
+            if exclusions[first].contains(&second) && scale.is_none() {
+                continue;
             }
+            let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+            let first_atom = &self.system.atoms()[first];
+            let second_atom = &self.system.atoms()[second];
+            let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+            let epsilon =
+                (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
+            radii2.push(squared_distance(coordinates[first], coordinates[second]).max(1.0e-16));
+            sigmas.push(sigma);
+            epsilons.push(epsilon / scnb);
+            charges.push(
+                COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
+                    / (self.options.dielectric * scee),
+            );
         }
-        Ok(result)
+        Ok(Arch::new().dispatch(InteractionKernel {
+            radii2: &radii2,
+            sigmas: &sigmas,
+            epsilons: &epsilons,
+            charges: &charges,
+        }))
     }
 
     pub fn energy(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
@@ -398,6 +476,12 @@ impl<'a> EnergyEvaluator<'a> {
         ];
         for bond in self.system.bonds() {
             let [first, second] = bond.atoms();
+            if self.active_terms_only
+                && !self.selection.is_movable(first)
+                && !self.selection.is_movable(second)
+            {
+                continue;
+            }
             let vector = subtract(coordinates[first], coordinates[second]);
             let radius = norm(vector).max(1.0e-12);
             let derivative = 2.0 * bond.force() * (radius - bond.length()) / radius;
@@ -406,6 +490,13 @@ impl<'a> EnergyEvaluator<'a> {
         }
         for angle in self.system.angles() {
             let [first, center, third] = angle.atoms();
+            if self.active_terms_only
+                && ![first, center, third]
+                    .into_iter()
+                    .any(|atom| self.selection.is_movable(atom))
+            {
+                continue;
+            }
             let left = subtract(coordinates[first], coordinates[center]);
             let right = subtract(coordinates[third], coordinates[center]);
             let left_norm = norm(left).max(1.0e-12);
@@ -428,33 +519,27 @@ impl<'a> EnergyEvaluator<'a> {
             add_scaled(&mut gradient[center], third_derivative, -factor);
         }
         let exclusions = self.system.exclusions();
-        for first in 0..self.system.atom_count() {
-            for second in first + 1..self.system.atom_count() {
-                let vector = subtract(coordinates[first], coordinates[second]);
-                let radius = norm(vector).max(1.0e-8);
-                if self.options.cutoff.is_some_and(|cutoff| radius > cutoff) {
-                    continue;
-                }
-                let pair = ordered(first, second);
-                let scale_14 = self.one_four.get(&pair).copied();
-                if exclusions[first].contains(&second) && scale_14.is_none() {
-                    continue;
-                }
-                let (scee, scnb) = scale_14.unwrap_or((1.0, 1.0));
-                let first_atom = &self.system.atoms()[first];
-                let second_atom = &self.system.atoms()[second];
-                let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
-                let epsilon = (first_atom.lennard_jones_epsilon()
-                    * second_atom.lennard_jones_epsilon())
-                .sqrt();
-                let ratio6 = (sigma / radius).powi(6);
-                let coulomb = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
-                    / (self.options.dielectric * scee * radius);
-                let derivative = 12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius)
-                    - coulomb / radius;
-                add_scaled(&mut gradient[first], vector, derivative / radius);
-                add_scaled(&mut gradient[second], vector, -derivative / radius);
+        for (first, second) in self.nonbonded_pairs(coordinates) {
+            let vector = subtract(coordinates[first], coordinates[second]);
+            let radius = norm(vector).max(1.0e-8);
+            let pair = ordered(first, second);
+            let scale_14 = self.one_four.get(&pair).copied();
+            if exclusions[first].contains(&second) && scale_14.is_none() {
+                continue;
             }
+            let (scee, scnb) = scale_14.unwrap_or((1.0, 1.0));
+            let first_atom = &self.system.atoms()[first];
+            let second_atom = &self.system.atoms()[second];
+            let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+            let epsilon =
+                (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
+            let ratio6 = (sigma / radius).powi(6);
+            let coulomb = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
+                / (self.options.dielectric * scee * radius);
+            let derivative =
+                12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - coulomb / radius;
+            add_scaled(&mut gradient[first], vector, derivative / radius);
+            add_scaled(&mut gradient[second], vector, -derivative / radius);
         }
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
@@ -476,55 +561,76 @@ impl<'a> EnergyEvaluator<'a> {
 
     fn residual_gradient(&self, coordinates: &[Vec3]) -> Vec<Vec3> {
         let selected = self.selection.indices().collect::<Vec<_>>();
-        let dimension = selected.len() * 3;
-        let offsets = selected
-            .iter()
-            .enumerate()
-            .map(|(offset, atom)| (*atom, offset * 3))
-            .collect::<HashMap<_, _>>();
-        let points = coordinates
-            .iter()
-            .enumerate()
-            .map(|(atom, point)| {
-                let offset = offsets.get(&atom).copied();
-                DualVec3 {
-                    x: Dual::coordinate(point.x, dimension, offset),
-                    y: Dual::coordinate(point.y, dimension, offset.map(|value| value + 1)),
-                    z: Dual::coordinate(point.z, dimension, offset.map(|value| value + 2)),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut total = Dual::constant(0.0, dimension);
-        for torsion in self.system.dihedrals() {
-            let atoms = torsion.atoms();
-            let phi = dual_dihedral(
-                &points[atoms[0]],
-                &points[atoms[1]],
-                &points[atoms[2]],
-                &points[atoms[3]],
-            );
-            let argument = phi
-                .scale(torsion.periodicity() as f64)
-                .add_constant(-torsion.phase());
-            total = total.add(argument.cos().add_constant(1.0).scale(torsion.force()));
-        }
-        if let Some(options) = &self.options.obc2 {
-            total = total.add(dual_obc2(self.system.atoms(), &points, options, dimension));
-        }
         let mut gradients = vec![
             Vec3 {
                 x: 0.0,
                 y: 0.0,
-                z: 0.0,
+                z: 0.0
             };
             coordinates.len()
         ];
-        for (offset, atom) in selected.iter().enumerate() {
-            gradients[*atom] = Vec3 {
-                x: total.gradient[offset * 3],
-                y: total.gradient[offset * 3 + 1],
-                z: total.gradient[offset * 3 + 2],
-            };
+        // Torsions are local four-atom terms. Differentiate each in its own
+        // fixed 12-dimensional space instead of allocating 3*N derivatives
+        // for every operation in every torsion.
+        for torsion in self.system.dihedrals() {
+            let atoms = torsion.atoms();
+            if self.active_terms_only
+                && !atoms
+                    .into_iter()
+                    .any(|atom| self.selection.is_movable(atom))
+            {
+                continue;
+            }
+            let points = atoms.map(|atom| {
+                let point = coordinates[atom];
+                let local = atoms
+                    .iter()
+                    .position(|candidate| *candidate == atom)
+                    .unwrap();
+                DualVec3 {
+                    x: Dual::coordinate(point.x, 12, Some(local * 3)),
+                    y: Dual::coordinate(point.y, 12, Some(local * 3 + 1)),
+                    z: Dual::coordinate(point.z, 12, Some(local * 3 + 2)),
+                }
+            });
+            let phi = dual_dihedral(&points[0], &points[1], &points[2], &points[3]);
+            let argument = phi
+                .scale(torsion.periodicity() as f64)
+                .add_constant(-torsion.phase());
+            let term = argument.cos().add_constant(1.0).scale(torsion.force());
+            for (local, atom) in atoms.iter().enumerate() {
+                if self.selection.is_movable(*atom) {
+                    gradients[*atom].x += term.gradient[local * 3];
+                    gradients[*atom].y += term.gradient[local * 3 + 1];
+                    gradients[*atom].z += term.gradient[local * 3 + 2];
+                }
+            }
+        }
+        if let Some(options) = &self.options.obc2 {
+            let dimension = selected.len() * 3;
+            let offsets = selected
+                .iter()
+                .enumerate()
+                .map(|(offset, atom)| (*atom, offset * 3))
+                .collect::<HashMap<_, _>>();
+            let points = coordinates
+                .iter()
+                .enumerate()
+                .map(|(atom, point)| {
+                    let offset = offsets.get(&atom).copied();
+                    DualVec3 {
+                        x: Dual::coordinate(point.x, dimension, offset),
+                        y: Dual::coordinate(point.y, dimension, offset.map(|value| value + 1)),
+                        z: Dual::coordinate(point.z, dimension, offset.map(|value| value + 2)),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let total = dual_obc2(self.system.atoms(), &points, options, dimension);
+            for (offset, atom) in selected.iter().enumerate() {
+                gradients[*atom].x += total.gradient[offset * 3];
+                gradients[*atom].y += total.gradient[offset * 3 + 1];
+                gradients[*atom].z += total.gradient[offset * 3 + 2];
+            }
         }
         gradients
     }
@@ -534,17 +640,37 @@ impl<'a> EnergyEvaluator<'a> {
         let mut result = EnergyComponents::default();
         for bond in self.system.bonds() {
             let [first, second] = bond.atoms();
+            if self.active_terms_only
+                && !self.selection.is_movable(first)
+                && !self.selection.is_movable(second)
+            {
+                continue;
+            }
             let delta = distance(coordinates[first], coordinates[second]) - bond.length();
             result.bonds += bond.force() * delta * delta;
         }
         for angle in self.system.angles() {
             let [first, center, third] = angle.atoms();
+            if self.active_terms_only
+                && ![first, center, third]
+                    .into_iter()
+                    .any(|atom| self.selection.is_movable(atom))
+            {
+                continue;
+            }
             let delta = angle_value(coordinates[first], coordinates[center], coordinates[third])
                 - angle.radians();
             result.angles += angle.force() * delta * delta;
         }
         for torsion in self.system.dihedrals() {
             let atoms = torsion.atoms();
+            if self.active_terms_only
+                && !atoms
+                    .into_iter()
+                    .any(|atom| self.selection.is_movable(atom))
+            {
+                continue;
+            }
             let phi = dihedral(
                 coordinates[atoms[0]],
                 coordinates[atoms[1]],
@@ -560,30 +686,24 @@ impl<'a> EnergyEvaluator<'a> {
             }
         }
         let exclusions = self.system.exclusions();
-        for first in 0..self.system.atom_count() {
-            for second in first + 1..self.system.atom_count() {
-                let r = distance(coordinates[first], coordinates[second]).max(1.0e-8);
-                if self.options.cutoff.is_some_and(|cutoff| r > cutoff) {
-                    continue;
-                }
-                let pair = ordered(first, second);
-                let scale = self.one_four.get(&pair).copied();
-                if exclusions[first].contains(&second) && scale.is_none() {
-                    continue;
-                }
-                let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
-                let first_atom = &self.system.atoms()[first];
-                let second_atom = &self.system.atoms()[second];
-                let radius = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
-                let epsilon = (first_atom.lennard_jones_epsilon()
-                    * second_atom.lennard_jones_epsilon())
-                .sqrt();
-                let ratio6 = (radius / r).powi(6);
-                result.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
-                result.electrostatics +=
-                    COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
-                        / (self.options.dielectric * r * scee);
+        for (first, second) in self.nonbonded_pairs(coordinates) {
+            let r = distance(coordinates[first], coordinates[second]).max(1.0e-8);
+            let pair = ordered(first, second);
+            let scale = self.one_four.get(&pair).copied();
+            if exclusions[first].contains(&second) && scale.is_none() {
+                continue;
             }
+            let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+            let first_atom = &self.system.atoms()[first];
+            let second_atom = &self.system.atoms()[second];
+            let radius = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+            let epsilon =
+                (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
+            let ratio6 = (radius / r).powi(6);
+            result.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
+            result.electrostatics +=
+                COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
+                    / (self.options.dielectric * r * scee);
         }
         if let Some(solvent) = &self.options.obc2 {
             (result.generalized_born, result.surface_area) =
@@ -1082,6 +1202,152 @@ fn squared_distance(first: Vec3, second: Vec3) -> f64 {
     (first.x - second.x).powi(2) + (first.y - second.y).powi(2) + (first.z - second.z).powi(2)
 }
 
+/// Produce deterministic nonbonded candidate pairs. With no cutoff this is
+/// the complete upper triangle. With a cutoff, atoms are binned in cubic
+/// cells so large fixed proteins are not rescanned for every glycan pose.
+fn nonbonded_pairs(coordinates: &[Vec3], cutoff: Option<f64>) -> Vec<(usize, usize)> {
+    let Some(cutoff) = cutoff else {
+        return (0..coordinates.len())
+            .flat_map(|first| (first + 1..coordinates.len()).map(move |second| (first, second)))
+            .collect();
+    };
+    let key = |point: Vec3| {
+        (
+            (point.x / cutoff).floor() as i32,
+            (point.y / cutoff).floor() as i32,
+            (point.z / cutoff).floor() as i32,
+        )
+    };
+    let mut cells = BTreeMap::<(i32, i32, i32), Vec<usize>>::new();
+    for (atom, point) in coordinates.iter().copied().enumerate() {
+        cells.entry(key(point)).or_default().push(atom);
+    }
+    let cutoff2 = cutoff * cutoff;
+    let mut pairs = Vec::new();
+    for (first, point) in coordinates.iter().copied().enumerate() {
+        let (cx, cy, cz) = key(point);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(atoms) = cells.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &second in atoms {
+                            if second > first
+                                && squared_distance(point, coordinates[second]) <= cutoff2
+                            {
+                                pairs.push((first, second));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+fn selected_nonbonded_pairs(
+    coordinates: &[Vec3],
+    cutoff: Option<f64>,
+    selection: &AtomSelection,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    if let Some(cutoff) = cutoff {
+        let (cells, key) = spatial_cells(coordinates, cutoff);
+        let cutoff2 = cutoff * cutoff;
+        for first in selection.indices() {
+            let (cx, cy, cz) = key(coordinates[first]);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(atoms) = cells.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &second in atoms {
+                                if first != second
+                                    && squared_distance(coordinates[first], coordinates[second])
+                                        <= cutoff2
+                                {
+                                    pairs.push(ordered(first, second));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for first in selection.indices() {
+            for second in 0..coordinates.len() {
+                if first != second {
+                    pairs.push(ordered(first, second));
+                }
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+fn cross_nonbonded_pairs(
+    coordinates: &[Vec3],
+    cutoff: Option<f64>,
+    first_group: &AtomGroupMask,
+    second_group: &AtomGroupMask,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    if let Some(cutoff) = cutoff {
+        let (cells, key) = spatial_cells(coordinates, cutoff);
+        let cutoff2 = cutoff * cutoff;
+        for first in first_group.indices() {
+            let (cx, cy, cz) = key(coordinates[first]);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(atoms) = cells.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &second in atoms {
+                                if second_group.contains(second)
+                                    && squared_distance(coordinates[first], coordinates[second])
+                                        <= cutoff2
+                                {
+                                    pairs.push(ordered(first, second));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for first in first_group.indices() {
+            for second in second_group.indices() {
+                pairs.push(ordered(first, second));
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+type CellKey = (i32, i32, i32);
+fn spatial_cells(
+    coordinates: &[Vec3],
+    cutoff: f64,
+) -> (BTreeMap<CellKey, Vec<usize>>, impl Fn(Vec3) -> CellKey) {
+    let key = move |point: Vec3| {
+        (
+            (point.x / cutoff).floor() as i32,
+            (point.y / cutoff).floor() as i32,
+            (point.z / cutoff).floor() as i32,
+        )
+    };
+    let mut cells = BTreeMap::<CellKey, Vec<usize>>::new();
+    for (atom, point) in coordinates.iter().copied().enumerate() {
+        cells.entry(key(point)).or_default().push(atom);
+    }
+    (cells, key)
+}
+
 fn angle_value(first: Vec3, center: Vec3, third: Vec3) -> f64 {
     let left = subtract(first, center);
     let right = subtract(third, center);
@@ -1225,5 +1491,49 @@ mod tests {
         let list = NeighborList::build(&coordinates, 8.0, 1.0).unwrap();
         coordinates[0].x += 0.6;
         assert!(list.needs_rebuild(&coordinates));
+    }
+
+    #[test]
+    fn simd_interaction_matches_scalar_pair_sum() {
+        let system = system();
+        let midpoint = system.atom_count() / 2;
+        let first = AtomGroupMask::from_indices(system.atom_count(), 0..midpoint);
+        let second =
+            AtomGroupMask::from_indices(system.atom_count(), midpoint..system.atom_count());
+        let options = EnergyOptions {
+            cutoff: Some(10.0),
+            obc2: None,
+            ..EnergyOptions::default()
+        };
+        let evaluator = EnergyEvaluator::new(&system, options).unwrap();
+        let coordinates = system.coordinates();
+        let simd = evaluator
+            .interaction_energy(&coordinates, &first, &second)
+            .unwrap();
+        let mut scalar = InteractionEnergyComponents::default();
+        for left in first.indices() {
+            for right in second.indices() {
+                let radius = distance(coordinates[left], coordinates[right]);
+                if radius > 10.0 {
+                    continue;
+                }
+                let pair = ordered(left, right);
+                let scale = evaluator.one_four.get(&pair).copied();
+                if system.exclusions()[left].contains(&right) && scale.is_none() {
+                    continue;
+                }
+                let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+                let a = &system.atoms()[left];
+                let b = &system.atoms()[right];
+                let sigma = a.lennard_jones_radius() + b.lennard_jones_radius();
+                let epsilon = (a.lennard_jones_epsilon() * b.lennard_jones_epsilon()).sqrt();
+                let ratio6 = (sigma / radius).powi(6);
+                scalar.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
+                scalar.electrostatics +=
+                    COULOMB_KCAL_ANGSTROM * a.charge() * b.charge() / (radius * scee);
+            }
+        }
+        assert!((simd.van_der_waals - scalar.van_der_waals).abs() < 1.0e-10);
+        assert!((simd.electrostatics - scalar.electrostatics).abs() < 1.0e-10);
     }
 }

@@ -81,6 +81,20 @@ pub fn genetic_optimize<P>(
 where
     P: GeneticProblem,
 {
+    genetic_optimize_with_progress(problem, config, |_| {})
+}
+
+/// Run the deterministic genetic algorithm and report each completed
+/// generation from the coordinating thread.
+pub fn genetic_optimize_with_progress<P, F>(
+    problem: &P,
+    config: &GeneticAlgorithmConfig,
+    mut progress: F,
+) -> Result<GeneticAlgorithmOutcome<P::State>>
+where
+    P: GeneticProblem,
+    F: FnMut(&GenerationRecord),
+{
     validate_genetic_config(config)?;
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let mut population = (0..config.population_size)
@@ -99,11 +113,13 @@ where
             return Err(OptimizationError::NonFiniteObjective);
         }
         scored.sort_by(|left, right| left.0.total_cmp(&right.0));
-        history.push(GenerationRecord {
+        let record = GenerationRecord {
             generation,
             best_score: scored[0].0,
             mean_score: scored.iter().map(|entry| entry.0).sum::<f64>() / scored.len() as f64,
-        });
+        };
+        progress(&record);
+        history.push(record);
         if problem.is_solution(&scored[0].1, scored[0].0) {
             return Ok(GeneticAlgorithmOutcome {
                 best_state: scored[0].1.clone(),
