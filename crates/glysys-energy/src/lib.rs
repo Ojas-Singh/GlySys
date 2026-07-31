@@ -31,6 +31,69 @@ pub struct EnergyComponents {
     pub restraints: f64,
 }
 
+/// The energy quantity used by a structure-selection workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnergyScoringMode {
+    /// All bonded, nonbonded, restraint, and optional implicit-solvent terms.
+    Full,
+    /// Protein--glycan cross Lennard-Jones and Coulomb terms only.
+    ProteinGlycanInteraction,
+}
+
+/// Cross nonbonded terms between two disjoint atom groups, in kcal/mol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InteractionEnergyComponents {
+    pub van_der_waals: f64,
+    pub electrostatics: f64,
+}
+
+impl InteractionEnergyComponents {
+    pub fn total(self) -> f64 {
+        self.van_der_waals + self.electrostatics
+    }
+}
+
+/// A reusable atom-group mask for energy decomposition and fixed/movable
+/// selections. Masks are deliberately topology-bound and cannot be resized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomGroupMask {
+    members: Vec<bool>,
+}
+
+impl AtomGroupMask {
+    pub fn none(atom_count: usize) -> Self {
+        Self {
+            members: vec![false; atom_count],
+        }
+    }
+
+    pub fn from_indices(atom_count: usize, indices: impl IntoIterator<Item = usize>) -> Self {
+        let mut result = Self::none(atom_count);
+        for index in indices {
+            if let Some(member) = result.members.get_mut(index) {
+                *member = true;
+            }
+        }
+        result
+    }
+
+    pub fn contains(&self, atom: usize) -> bool {
+        self.members.get(atom).copied().unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.members
+            .iter()
+            .enumerate()
+            .filter_map(|(index, member)| member.then_some(index))
+    }
+}
+
 impl EnergyComponents {
     pub fn total(self) -> f64 {
         self.bonds
@@ -241,6 +304,57 @@ impl<'a> EnergyEvaluator<'a> {
 
     pub fn selection(&self) -> &AtomSelection {
         &self.selection
+    }
+
+    /// Calculate only cross nonbonded interactions between two disjoint atom
+    /// groups. This mirrors the Cookbook interaction objective: bonded,
+    /// internal, restraint, and implicit-solvent terms are intentionally not
+    /// part of the result.
+    pub fn interaction_energy(
+        &self,
+        coordinates: &[Vec3],
+        first_group: &AtomGroupMask,
+        second_group: &AtomGroupMask,
+    ) -> Result<InteractionEnergyComponents> {
+        validate_coordinates(self.system.atom_count(), coordinates)?;
+        if first_group.len() != self.system.atom_count()
+            || second_group.len() != self.system.atom_count()
+            || first_group
+                .indices()
+                .any(|index| second_group.contains(index))
+        {
+            return Err(EnergyError::InvalidConfiguration(
+                "interaction groups must be disjoint masks matching the system atom count".into(),
+            ));
+        }
+        let exclusions = self.system.exclusions();
+        let mut result = InteractionEnergyComponents::default();
+        for first in first_group.indices() {
+            for second in second_group.indices() {
+                let radius = distance(coordinates[first], coordinates[second]).max(1.0e-8);
+                if self.options.cutoff.is_some_and(|cutoff| radius > cutoff) {
+                    continue;
+                }
+                let pair = ordered(first, second);
+                let scale = self.one_four.get(&pair).copied();
+                if exclusions[first].contains(&second) && scale.is_none() {
+                    continue;
+                }
+                let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+                let first_atom = &self.system.atoms()[first];
+                let second_atom = &self.system.atoms()[second];
+                let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+                let epsilon = (first_atom.lennard_jones_epsilon()
+                    * second_atom.lennard_jones_epsilon())
+                .sqrt();
+                let ratio6 = (sigma / radius).powi(6);
+                result.van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
+                result.electrostatics +=
+                    COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
+                        / (self.options.dielectric * radius * scee);
+            }
+        }
+        Ok(result)
     }
 
     pub fn energy(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
