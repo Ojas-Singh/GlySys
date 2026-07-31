@@ -540,6 +540,9 @@ pub fn write_pdb(structure: &Structure, path: impl AsRef<Path>) -> Result<()> {
 /// Serialize an unparameterized structure as PDB text.
 pub fn write_pdb_string(structure: &Structure) -> String {
     let mut output = String::new();
+    for link in &structure.parsed.links {
+        output.push_str(&format_link(structure, link));
+    }
     for (index, residue) in structure.parsed.residues.iter().enumerate() {
         let record = if crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str()) {
             "ATOM  "
@@ -574,9 +577,6 @@ pub fn write_pdb_string(structure: &Structure) -> String {
     }
     for (first, second) in &structure.parsed.conect {
         output.push_str(&format!("CONECT{first:>5}{second:>5}\n"));
-    }
-    for link in &structure.parsed.links {
-        output.push_str(&format_link(structure, link));
     }
     output.push_str("END\n");
     output
