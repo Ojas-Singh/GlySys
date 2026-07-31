@@ -389,6 +389,18 @@ impl<'a> EnergyEvaluator<'a> {
         first_group: &AtomGroupMask,
         second_group: &AtomGroupMask,
     ) -> Result<InteractionEnergyComponents> {
+        self.interaction_energy_with_pair_count(coordinates, first_group, second_group)
+            .map(|(energy, _)| energy)
+    }
+
+    /// Cross interaction energy together with the number of force-field
+    /// pairs that survived cutoff and exclusions.
+    pub fn interaction_energy_with_pair_count(
+        &self,
+        coordinates: &[Vec3],
+        first_group: &AtomGroupMask,
+        second_group: &AtomGroupMask,
+    ) -> Result<(InteractionEnergyComponents, usize)> {
         validate_coordinates(self.system.atom_count(), coordinates)?;
         if first_group.len() != self.system.atom_count()
             || second_group.len() != self.system.atom_count()
@@ -427,12 +439,16 @@ impl<'a> EnergyEvaluator<'a> {
                     / (self.options.dielectric * scee),
             );
         }
-        Ok(Arch::new().dispatch(InteractionKernel {
-            radii2: &radii2,
-            sigmas: &sigmas,
-            epsilons: &epsilons,
-            charges: &charges,
-        }))
+        let pair_count = radii2.len();
+        Ok((
+            Arch::new().dispatch(InteractionKernel {
+                radii2: &radii2,
+                sigmas: &sigmas,
+                epsilons: &epsilons,
+                charges: &charges,
+            }),
+            pair_count,
+        ))
     }
 
     pub fn energy(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
