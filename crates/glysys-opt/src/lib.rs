@@ -217,11 +217,40 @@ pub struct LbfgsOutcome {
     pub history: Vec<f64>,
 }
 
+/// A completed L-BFGS evaluation made available to callers that want to show
+/// progress without coupling the optimizer to a user interface.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LbfgsProgress {
+    /// Zero denotes the initial objective evaluation.
+    pub iteration: usize,
+    pub value: f64,
+    pub rms_gradient: f64,
+    pub max_gradient: f64,
+    pub accepted_steps: usize,
+}
+
 pub fn lbfgs_minimize<O: DifferentiableObjective>(
     objective: &mut O,
     initial: &[f64],
     config: &LbfgsConfig,
 ) -> Result<LbfgsOutcome> {
+    lbfgs_minimize_with_progress(objective, initial, config, |_| {})
+}
+
+/// Minimize a differentiable objective while reporting the initial point and
+/// every accepted step. The callback is deliberately synchronous so command
+/// line clients can write timely progress messages and applications can
+/// capture deterministic diagnostics.
+pub fn lbfgs_minimize_with_progress<O, F>(
+    objective: &mut O,
+    initial: &[f64],
+    config: &LbfgsConfig,
+    mut progress: F,
+) -> Result<LbfgsOutcome>
+where
+    O: DifferentiableObjective,
+    F: FnMut(LbfgsProgress),
+{
     if initial.len() != objective.dimension() {
         return Err(OptimizationError::DimensionMismatch {
             expected: objective.dimension(),
@@ -241,6 +270,13 @@ pub fn lbfgs_minimize<O: DifferentiableObjective>(
     let mut gradient = vec![0.0; point.len()];
     let mut value = objective.value_gradient(&point, &mut gradient)?;
     let mut values = vec![value];
+    progress(LbfgsProgress {
+        iteration: 0,
+        value,
+        rms_gradient: rms_norm(&gradient),
+        max_gradient: infinity_norm(&gradient),
+        accepted_steps: 0,
+    });
     let mut s_history: Vec<Vec<f64>> = Vec::new();
     let mut y_history: Vec<Vec<f64>> = Vec::new();
     let mut rho_history: Vec<f64> = Vec::new();
@@ -304,6 +340,13 @@ pub fn lbfgs_minimize<O: DifferentiableObjective>(
         gradient = candidate_gradient;
         value = candidate_value;
         values.push(value);
+        progress(LbfgsProgress {
+            iteration: iteration + 1,
+            value,
+            rms_gradient: rms_norm(&gradient),
+            max_gradient: infinity_norm(&gradient),
+            accepted_steps: values.len().saturating_sub(1),
+        });
     }
     Ok(LbfgsOutcome {
         point,
@@ -353,6 +396,10 @@ fn infinity_norm(values: &[f64]) -> f64 {
     values.iter().map(|value| value.abs()).fold(0.0, f64::max)
 }
 
+fn rms_norm(values: &[f64]) -> f64 {
+    (values.iter().map(|value| value * value).sum::<f64>() / values.len().max(1) as f64).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +426,21 @@ mod tests {
         assert!((outcome.point[0] - 2.0).abs() < 1.0e-4);
         assert!((outcome.point[1] + 1.0).abs() < 1.0e-4);
         assert!(outcome.history.last().unwrap() < outcome.history.first().unwrap());
+    }
+
+    #[test]
+    fn lbfgs_reports_initial_and_accepted_steps() {
+        let mut progress = Vec::new();
+        let outcome = lbfgs_minimize_with_progress(
+            &mut Quadratic,
+            &[8.0, 3.0],
+            &LbfgsConfig::default(),
+            |record| progress.push(record),
+        )
+        .unwrap();
+        assert_eq!(progress.first().unwrap().iteration, 0);
+        assert_eq!(progress.len(), outcome.history.len());
+        assert!(progress.iter().all(|record| record.value.is_finite()));
     }
 
     struct IntegerTarget;
