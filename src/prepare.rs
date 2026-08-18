@@ -43,7 +43,12 @@ impl SystemBuilder {
         let path = path.as_ref();
         let contents =
             std::fs::read_to_string(path).map_err(crate::error::read_error(path.to_path_buf()))?;
-        let parsed = pdb::parse(&contents, &self.options)?;
+        self.inspect_pdb_str(&contents)
+    }
+
+    /// Inspect in-memory PDB text without solvating or writing files.
+    pub fn inspect_pdb_str(&self, contents: &str) -> Result<BuildReport> {
+        let parsed = pdb::parse(contents, &self.options)?;
         let mut warnings = parsed.warnings.clone();
         let protonation_decisions = self.protonation_decisions(&parsed, &mut warnings);
         let unsupported_residues = parsed
@@ -140,7 +145,17 @@ impl SystemBuilder {
         let mut system = self.parameterize(parsed, &protonation_decisions, &mut warnings)?;
         let solute_charge = system.charge();
         let rounded_charge = solute_charge.round();
-        if (solute_charge - rounded_charge).abs() > 1.0e-3 {
+        // GLYCAM sulfated-GAG templates retain small RESP charge residuals.
+        // A short heparin fragment can therefore sum to e.g. -8.124 despite
+        // having an unambiguous formal -8 charge. Keep the normal strict
+        // check for every other system, while accepting that documented
+        // GLYCAM residual only when a sulfated GAG residue is present.
+        let has_sulfated_gag = parsed.residues.iter().any(|residue| {
+            let name = residue.reference.name.as_bytes();
+            name.len() == 3 && matches!(name[1], b'Y' | b'y') && matches!(name[2], b'S' | b's')
+        });
+        let charge_tolerance = if has_sulfated_gag { 0.15 } else { 1.0e-3 };
+        if (solute_charge - rounded_charge).abs() > charge_tolerance {
             return Err(BuildError::NonIntegralCharge(solute_charge));
         }
         if self.options.add_water {
@@ -302,11 +317,43 @@ impl SystemBuilder {
                 .filter(|atom| atom.element != 1 && !actual.contains_key(atom.name.as_str()))
                 .map(|atom| atom.name.clone())
                 .collect::<Vec<_>>();
-            if !missing.is_empty() {
+            // Experimental PDB models often omit a side-chain while retaining
+            // a chemically usable backbone (5KZC contains exactly this case
+            // for VAL H:211).  Rebuild side-chain heavy atoms and a terminal
+            // OXT from the template frame.  Missing peptide backbone N/CA/C/O
+            // atoms remain hard errors because inventing peptide connectivity
+            // would hide a genuinely incomplete model.
+            let protein_heavy_transform = if !missing.is_empty()
+                && PROTEIN_RESIDUES.contains(&name)
+                && missing
+                    .iter()
+                    .all(|atom| !matches!(atom.as_str(), "N" | "CA" | "C" | "O"))
+            {
+                let anchors = template
+                    .atoms
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, atom)| {
+                        atom.element != 1 && actual.contains_key(atom.name.as_str())
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                ResidueTransform::from_atom_indices(template, residue, &anchors).ok()
+            } else {
+                None
+            };
+            if !missing.is_empty() && protein_heavy_transform.is_none() {
                 return Err(BuildError::MissingHeavyAtoms {
                     residue: residue.reference.to_string(),
                     atoms: missing.join(", "),
                 });
+            }
+            if protein_heavy_transform.is_some() {
+                warnings.push(BuildWarning::ProteinHeavyAtomsReconstructed(format!(
+                    "{}: {}",
+                    residue.reference,
+                    missing.join(", ")
+                )));
             }
             for actual_atom in &residue.atoms {
                 if actual_atom.element != "H"
@@ -337,6 +384,7 @@ impl SystemBuilder {
                     position
                 } else {
                     hydrogen_transform(template, residue, template_atom_index)
+                        .or(protein_heavy_transform)
                         .ok_or_else(|| {
                             BuildError::InvalidPdb(format!(
                                 "cannot construct local geometry for hydrogen {} in {}",
@@ -415,7 +463,12 @@ impl SystemBuilder {
                 bonds.push([first, second]);
             }
         }
-        infer_cross_residue_bonds(&kept, &residue_atom, &atoms, &mut bonds);
+        // Explicit connectivity is authoritative.  GLYCAM/GMML GAG exports
+        // provide it for glycosidic and sulfate bonds; adding distance-based
+        // contacts on top of that can create false O...O bonds.
+        if parsed.conect.is_empty() && parsed.links.is_empty() {
+            infer_cross_residue_bonds(&kept, &residue_atom, &atoms, &mut bonds);
+        }
         for (first, second) in &parsed.ssbonds {
             if let (Some(first_residue), Some(second_residue)) = (
                 find_residue_index(&kept, first),
@@ -437,9 +490,7 @@ impl SystemBuilder {
 
         let (component_count, component_by_residue) =
             molecular_components(kept.len(), &bonds, &atoms);
-        for (residue, component) in residues.iter_mut().zip(component_by_residue) {
-            residue.component = component;
-        }
+        order_molecular_components(&mut atoms, &mut residues, &mut bonds, &component_by_residue);
         let (bonds, angles, dihedrals, exclusions) =
             enumerate_parameters(&atoms, &bonds, &self.parameters)?;
         let atom_count = atoms.len();
@@ -611,6 +662,28 @@ fn normalize_special_residues(
                 residue.reference
             )));
             residue.reference.name = renamed.into();
+        }
+        // wwPDB carbohydrate records use the conventional NAG/NDG atom
+        // names C7/O7/C8 for the acetamide carbonyl and methyl group.  The
+        // GLYCAM templates call the same atoms C2N/O2N/CME.  Normalize this
+        // representation before template inference while retaining the
+        // original residue name and serials in the input Structure.
+        if matches!(residue.reference.name.as_str(), "NAG" | "NDG") {
+            for atom in &mut residue.atoms {
+                let normalized = match atom.name.as_str() {
+                    "C7" => Some("C2N"),
+                    "O7" => Some("O2N"),
+                    "C8" => Some("CME"),
+                    _ => None,
+                };
+                if let Some(normalized) = normalized {
+                    warnings.push(BuildWarning::GlycanNameNormalized(format!(
+                        "{} atom {} -> {normalized}",
+                        residue.reference, atom.name,
+                    )));
+                    atom.name = normalized.into();
+                }
+            }
         }
     }
 }
@@ -1411,6 +1484,60 @@ fn molecular_components(
     (remap.len(), components)
 }
 
+/// Amber topology files require every covalent molecule to occupy one
+/// contiguous atom span. Deposited GLYCAM GAG PDBs can interleave sulfate and
+/// terminal-cap residues with the carbohydrate chain, so normalize the
+/// internal ordering after connectivity has been resolved. All atom-indexed
+/// data is remapped together; coordinates and molecular connectivity remain
+/// unchanged.
+fn order_molecular_components(
+    atoms: &mut Vec<Atom>,
+    residues: &mut Vec<Residue>,
+    bonds: &mut Vec<[usize; 2]>,
+    component_by_residue: &[usize],
+) {
+    let mut residue_order = (0..residues.len()).collect::<Vec<_>>();
+    residue_order.sort_by_key(|&residue| (component_by_residue[residue], residue));
+
+    let mut residue_remap = vec![0usize; residues.len()];
+    let mut atom_remap = vec![0usize; atoms.len()];
+    let old_atoms = std::mem::take(atoms);
+    let old_residues = std::mem::take(residues);
+    let mut grouped_atoms = Vec::with_capacity(old_atoms.len());
+    let mut grouped_residues = Vec::with_capacity(old_residues.len());
+
+    for old_residue_index in residue_order {
+        let new_residue_index = grouped_residues.len();
+        residue_remap[old_residue_index] = new_residue_index;
+        let old_residue = &old_residues[old_residue_index];
+        let first_atom = grouped_atoms.len();
+        for old_atom_index in
+            old_residue.first_atom..old_residue.first_atom + old_residue.atom_count
+        {
+            atom_remap[old_atom_index] = grouped_atoms.len();
+            let mut atom = old_atoms[old_atom_index].clone();
+            atom.residue = new_residue_index;
+            grouped_atoms.push(atom);
+        }
+        let mut residue = old_residue.clone();
+        residue.first_atom = first_atom;
+        residue.component = component_by_residue[old_residue_index];
+        grouped_residues.push(residue);
+    }
+
+    for bond in &mut *bonds {
+        bond[0] = atom_remap[bond[0]];
+        bond[1] = atom_remap[bond[1]];
+        if bond[0] > bond[1] {
+            bond.swap(0, 1);
+        }
+    }
+    bonds.sort_unstable();
+    bonds.dedup();
+    *atoms = grouped_atoms;
+    *residues = grouped_residues;
+}
+
 type Enumerated = (Vec<Bond>, Vec<Angle>, Vec<Dihedral>, Vec<BTreeSet<usize>>);
 
 fn enumerate_parameters(
@@ -1588,6 +1715,8 @@ mod tests {
                     residue_number: 1,
                     insertion_code: None,
                     element: "C".into(),
+                    occupancy: 1.0,
+                    b_factor: 0.0,
                     position: atom.position,
                 })
                 .collect(),

@@ -3,6 +3,7 @@
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
+use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, OptimizationError>;
 
@@ -210,6 +211,12 @@ pub struct LbfgsConfig {
     pub gradient_tolerance: f64,
     pub initial_step: f64,
     pub armijo: f64,
+    /// Optional wall-clock ceiling for one L-BFGS invocation.  The check is
+    /// made between objective evaluations/iterations so callers can reserve
+    /// time for later phases without making the objective implementation
+    /// aware of a deadline.
+    #[serde(default)]
+    pub time_limit_seconds: Option<f64>,
 }
 
 impl Default for LbfgsConfig {
@@ -220,6 +227,7 @@ impl Default for LbfgsConfig {
             gradient_tolerance: 1.0e-4,
             initial_step: 0.1,
             armijo: 1.0e-4,
+            time_limit_seconds: None,
         }
     }
 }
@@ -277,11 +285,15 @@ where
         || config.history_size == 0
         || config.gradient_tolerance <= 0.0
         || config.initial_step <= 0.0
+        || config
+            .time_limit_seconds
+            .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
     {
         return Err(OptimizationError::InvalidConfiguration(
             "positive iteration, history, tolerance, and step values are required".into(),
         ));
     }
+    let started = Instant::now();
     let mut point = initial.to_vec();
     let mut gradient = vec![0.0; point.len()];
     let mut value = objective.value_gradient(&point, &mut gradient)?;
@@ -298,6 +310,18 @@ where
     let mut rho_history: Vec<f64> = Vec::new();
 
     for iteration in 0..config.max_iterations {
+        if config
+            .time_limit_seconds
+            .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
+        {
+            return Ok(LbfgsOutcome {
+                point,
+                value,
+                iterations: iteration,
+                converged: false,
+                history: values,
+            });
+        }
         if infinity_norm(&gradient) <= config.gradient_tolerance {
             return Ok(LbfgsOutcome {
                 point,
@@ -318,7 +342,15 @@ where
         let mut step = config.initial_step;
         let mut candidate = vec![0.0; point.len()];
         let mut candidate_gradient = vec![0.0; point.len()];
+        let mut line_search_stalled = false;
         let candidate_value = loop {
+            if config
+                .time_limit_seconds
+                .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
+            {
+                line_search_stalled = true;
+                break value;
+            }
             for index in 0..point.len() {
                 candidate[index] = point[index] + step * direction[index];
             }
@@ -328,9 +360,23 @@ where
             }
             step *= 0.5;
             if step < 1.0e-12 {
-                break trial;
+                line_search_stalled = true;
+                break value;
             }
         };
+        // A failed Armijo search cannot produce a new point.  Continuing to
+        // iterate the same coordinates only repeats expensive force-field
+        // evaluations (particularly visible in large glycoproteins), so stop
+        // and return the best point found so far.
+        if line_search_stalled {
+            return Ok(LbfgsOutcome {
+                point,
+                value,
+                iterations: iteration,
+                converged: false,
+                history: values,
+            });
+        }
         let s = candidate
             .iter()
             .zip(&point)
@@ -371,6 +417,487 @@ where
         converged: false,
         history: values,
     })
+}
+
+/// A particle seed with immutable application context.
+///
+/// Density fitting uses the context to retain the GlycoShape conformer
+/// template while the particle position contains only periodic torsion
+/// coordinates. Keeping this context outside the numeric vector avoids
+/// treating a categorical conformer identifier as a continuous variable.
+#[derive(Debug, Clone)]
+pub struct ParticleSeed<C> {
+    pub context: C,
+    pub position: Vec<f64>,
+}
+
+/// Operations required by the deterministic particle-swarm optimizer.
+pub trait ParticleSwarmProblem: Sync {
+    type Context: Clone + Send + Sync;
+
+    /// Evaluate a particle. Larger finite values are better.
+    fn evaluate(&self, context: &Self::Context, position: &[f64]) -> f64;
+
+    /// Repair a position and velocity after the PSO update. The default
+    /// implementation leaves both vectors unchanged; callers use this hook
+    /// for angular wrapping and application-specific bounds.
+    fn repair(&self, _context: &Self::Context, _position: &mut [f64], _velocity: &mut [f64]) {}
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ParticleSwarmConfig {
+    pub swarms: usize,
+    pub particles_per_swarm: usize,
+    pub generations: usize,
+    pub inertia_start: f64,
+    pub inertia_end: f64,
+    pub cognitive: f64,
+    pub social: f64,
+    pub migration_interval: usize,
+    pub migration_count: usize,
+    pub stall_generations: usize,
+    pub tolerance: f64,
+    pub seed: u64,
+    pub max_evaluations: Option<usize>,
+    /// Inclusive numeric bounds for each dimension. Periodic dimensions are
+    /// wrapped into this interval after every update.
+    pub bounds: Vec<(f64, f64)>,
+    pub periodic_dimensions: Vec<bool>,
+    /// Optional wall-clock ceiling for this phase.  The optimizer checks at
+    /// generation boundaries so a complete synchronous generation remains
+    /// deterministic while a caller can reserve time for later phases.
+    #[serde(default)]
+    pub time_limit_seconds: Option<f64>,
+}
+
+impl Default for ParticleSwarmConfig {
+    fn default() -> Self {
+        Self {
+            swarms: 1,
+            particles_per_swarm: 32,
+            generations: 24,
+            inertia_start: 0.8,
+            inertia_end: 0.4,
+            cognitive: 1.6,
+            social: 1.6,
+            migration_interval: 4,
+            migration_count: 2,
+            stall_generations: 6,
+            tolerance: 0.002,
+            seed: 0,
+            max_evaluations: None,
+            bounds: Vec::new(),
+            periodic_dimensions: Vec::new(),
+            time_limit_seconds: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ParticleSwarmGeneration {
+    pub generation: usize,
+    pub best_score: f64,
+    pub mean_score: f64,
+    pub evaluations: usize,
+    pub migrations: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParticleSwarmOutcome<C> {
+    pub best_context: C,
+    pub best_position: Vec<f64>,
+    pub best_score: f64,
+    pub generations: usize,
+    pub evaluations: usize,
+    pub converged: bool,
+    pub history: Vec<ParticleSwarmGeneration>,
+    pub particles: Vec<ParticleSeed<C>>,
+    pub particle_scores: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct SwarmParticle<C> {
+    context: C,
+    position: Vec<f64>,
+    velocity: Vec<f64>,
+    best_context: C,
+    best_position: Vec<f64>,
+    best_score: f64,
+    score: f64,
+}
+
+/// Run deterministic, synchronous particle-swarm optimization.
+///
+/// Particles are evaluated in parallel, but all updates happen in stable
+/// index order after the complete generation has been scored. Random values
+/// are generated from per-particle ChaCha streams, so Rayon thread count does
+/// not change the result. The objective is maximized.
+pub fn particle_swarm_optimize<P>(
+    problem: &P,
+    seeds: Vec<ParticleSeed<P::Context>>,
+    config: &ParticleSwarmConfig,
+) -> Result<ParticleSwarmOutcome<P::Context>>
+where
+    P: ParticleSwarmProblem,
+{
+    particle_swarm_optimize_with_progress(problem, seeds, config, |_| {})
+}
+
+/// Progress-reporting variant of [`particle_swarm_optimize`].
+pub fn particle_swarm_optimize_with_progress<P, F>(
+    problem: &P,
+    seeds: Vec<ParticleSeed<P::Context>>,
+    config: &ParticleSwarmConfig,
+    mut progress: F,
+) -> Result<ParticleSwarmOutcome<P::Context>>
+where
+    P: ParticleSwarmProblem,
+    F: FnMut(&ParticleSwarmGeneration),
+{
+    validate_particle_swarm_config(config, &seeds)?;
+    let dimension = config.bounds.len();
+    let total_particles = config.swarms * config.particles_per_swarm;
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let started = Instant::now();
+    let pending = seeds
+        .into_iter()
+        .enumerate()
+        .map(|(_index, seed)| {
+            let mut position = seed.position;
+            let mut velocity = vec![0.0; dimension];
+            for (axis, ((lower, upper), velocity_axis)) in
+                config.bounds.iter().zip(velocity.iter_mut()).enumerate()
+            {
+                let width = (upper - lower).abs().max(1.0e-12);
+                *velocity_axis = (rng.random::<f64>() * 2.0 - 1.0) * width * 0.1;
+                if config.periodic_dimensions[axis] {
+                    position[axis] = wrap_swarm_value(position[axis], *lower, *upper);
+                } else {
+                    position[axis] = position[axis].clamp(*lower, *upper);
+                }
+            }
+            let context = seed.context;
+            problem.repair(&context, &mut position, &mut velocity);
+            (context, position, velocity)
+        })
+        .collect::<Vec<_>>();
+    // Initial conformer coverage is part of the deterministic contract, but
+    // it must not serialize all templates behind one objective call.  Keep
+    // the pending vector in stable index order and evaluate it synchronously
+    // through Rayon; the resulting particle order is therefore identical for
+    // one or many worker threads.
+    let initial_scores = pending
+        .par_iter()
+        .map(|(context, position, _)| problem.evaluate(context, position))
+        .collect::<Vec<_>>();
+    if initial_scores.iter().any(|score| !score.is_finite()) {
+        return Err(OptimizationError::NonFiniteObjective);
+    }
+    let mut particles = pending
+        .into_iter()
+        .zip(initial_scores)
+        .map(|((context, position, velocity), score)| SwarmParticle {
+            context: context.clone(),
+            position: position.clone(),
+            velocity,
+            best_context: context,
+            best_position: position,
+            best_score: score,
+            score,
+        })
+        .collect::<Vec<_>>();
+    while particles.len() < total_particles {
+        let source = particles[particles.len() % particles.len()].clone();
+        let mut position = source.best_position;
+        let mut velocity = source.velocity;
+        for (axis, ((lower, upper), velocity_axis)) in
+            config.bounds.iter().zip(velocity.iter_mut()).enumerate()
+        {
+            let width = (upper - lower).abs().max(1.0e-12);
+            position[axis] += (rng.random::<f64>() * 2.0 - 1.0) * width * 0.05;
+            *velocity_axis = (rng.random::<f64>() * 2.0 - 1.0) * width * 0.05;
+        }
+        problem.repair(&source.context, &mut position, &mut velocity);
+        let score = problem.evaluate(&source.context, &position);
+        if !score.is_finite() {
+            return Err(OptimizationError::NonFiniteObjective);
+        }
+        particles.push(SwarmParticle {
+            context: source.context.clone(),
+            position: position.clone(),
+            velocity,
+            best_context: source.context,
+            best_position: position,
+            best_score: score,
+            score,
+        });
+    }
+
+    let mut evaluations = particles.len();
+    let mut history = Vec::with_capacity(config.generations + 1);
+    let mut best_index = best_particle_index(&particles);
+    let mut global_best_score = particles[best_index].best_score;
+    let mut stagnant = 0usize;
+    let mut migrations = 0usize;
+    let mut completed_generations = 0usize;
+    let mut converged = false;
+
+    for generation in 0..=config.generations {
+        let mean_score =
+            particles.iter().map(|particle| particle.score).sum::<f64>() / particles.len() as f64;
+        best_index = best_particle_index(&particles);
+        let generation_best = particles[best_index].best_score;
+        if generation_best > global_best_score + config.tolerance {
+            global_best_score = generation_best;
+            stagnant = 0;
+        } else if generation > 0 {
+            stagnant += 1;
+        }
+        let record = ParticleSwarmGeneration {
+            generation,
+            best_score: global_best_score,
+            mean_score,
+            evaluations,
+            migrations,
+        };
+        progress(&record);
+        history.push(record);
+        completed_generations = generation;
+        if stagnant >= config.stall_generations || generation == config.generations {
+            converged = stagnant >= config.stall_generations;
+            break;
+        }
+        if config.time_limit_seconds.is_some_and(|limit| {
+            limit.is_finite() && limit > 0.0 && started.elapsed().as_secs_f64() >= limit
+        }) {
+            break;
+        }
+        if config
+            .max_evaluations
+            .is_some_and(|limit| evaluations + particles.len() > limit)
+        {
+            break;
+        }
+
+        let inertia = if config.generations == 0 {
+            config.inertia_end
+        } else {
+            let fraction = generation as f64 / config.generations as f64;
+            config.inertia_start + (config.inertia_end - config.inertia_start) * fraction
+        };
+        let swarm_bests = (0..config.swarms)
+            .map(|swarm| {
+                let start = swarm * config.particles_per_swarm;
+                let end = start + config.particles_per_swarm;
+                (start..end)
+                    .max_by(|left, right| {
+                        particles[*left]
+                            .best_score
+                            .total_cmp(&particles[*right].best_score)
+                            .then_with(|| right.cmp(left))
+                    })
+                    .unwrap_or(start)
+            })
+            .collect::<Vec<_>>();
+        let generation_seed = splitmix64(config.seed ^ (generation as u64 + 1));
+        for index in 0..particles.len() {
+            let swarm = (index / config.particles_per_swarm).min(config.swarms - 1);
+            let local_best = swarm_bests[swarm];
+            let global_best = best_particle_index(&particles);
+            let mut local_rng =
+                ChaCha8Rng::seed_from_u64(splitmix64(generation_seed ^ index as u64));
+            for axis in 0..dimension {
+                let r1 = local_rng.random::<f64>();
+                let r2 = local_rng.random::<f64>();
+                particles[index].velocity[axis] = inertia * particles[index].velocity[axis]
+                    + config.cognitive
+                        * r1
+                        * (particles[index].best_position[axis] - particles[index].position[axis])
+                    + config.social
+                        * r2
+                        * (particles[local_best].best_position[axis]
+                            - particles[index].position[axis]);
+                // A small global attraction is useful after swarm migration,
+                // while retaining local exploration between migrations.
+                if generation > 0 && generation % config.migration_interval.max(1) == 0 {
+                    particles[index].velocity[axis] += 0.25
+                        * r2
+                        * (particles[global_best].best_position[axis]
+                            - particles[index].position[axis]);
+                }
+                let width = (config.bounds[axis].1 - config.bounds[axis].0).abs();
+                particles[index].velocity[axis] =
+                    particles[index].velocity[axis].clamp(-width * 0.25, width * 0.25);
+                particles[index].position[axis] += particles[index].velocity[axis];
+                if config.periodic_dimensions[axis] {
+                    particles[index].position[axis] = wrap_swarm_value(
+                        particles[index].position[axis],
+                        config.bounds[axis].0,
+                        config.bounds[axis].1,
+                    );
+                } else {
+                    particles[index].position[axis] = particles[index].position[axis]
+                        .clamp(config.bounds[axis].0, config.bounds[axis].1);
+                }
+            }
+            let context = particles[index].context.clone();
+            let particle = &mut particles[index];
+            problem.repair(&context, &mut particle.position, &mut particle.velocity);
+        }
+        let scored = particles
+            .par_iter()
+            .map(|particle| {
+                let score = problem.evaluate(&particle.context, &particle.position);
+                (score, score.is_finite())
+            })
+            .collect::<Vec<_>>();
+        for (particle, (score, finite)) in particles.iter_mut().zip(scored) {
+            if !finite {
+                return Err(OptimizationError::NonFiniteObjective);
+            }
+            particle.score = score;
+            if score > particle.best_score {
+                particle.best_score = score;
+                particle.best_position = particle.position.clone();
+                particle.best_context = particle.context.clone();
+            }
+        }
+        evaluations += particles.len();
+
+        if config.time_limit_seconds.is_some_and(|limit| {
+            limit.is_finite() && limit > 0.0 && started.elapsed().as_secs_f64() >= limit
+        }) {
+            break;
+        }
+
+        if config.migration_interval > 0
+            && (generation + 1) % config.migration_interval == 0
+            && config.swarms > 1
+        {
+            let bests = (0..config.swarms)
+                .map(|swarm| {
+                    let start = swarm * config.particles_per_swarm;
+                    let end = start + config.particles_per_swarm;
+                    (start..end)
+                        .max_by(|left, right| {
+                            particles[*left]
+                                .best_score
+                                .total_cmp(&particles[*right].best_score)
+                                .then_with(|| right.cmp(left))
+                        })
+                        .unwrap_or(start)
+                })
+                .collect::<Vec<_>>();
+            for swarm in 0..config.swarms {
+                let destination = (swarm + 1) % config.swarms;
+                let start = destination * config.particles_per_swarm;
+                let source = bests[swarm];
+                for offset in 0..config.migration_count.min(config.particles_per_swarm) {
+                    let index = start + config.particles_per_swarm - 1 - offset;
+                    particles[index].context = particles[source].best_context.clone();
+                    particles[index].position = particles[source].best_position.clone();
+                    particles[index].best_context = particles[source].best_context.clone();
+                    particles[index].best_position = particles[source].best_position.clone();
+                    particles[index].best_score = particles[source].best_score;
+                    particles[index].score = particles[source].best_score;
+                    particles[index].velocity.fill(0.0);
+                }
+            }
+            migrations += config.swarms * config.migration_count.min(config.particles_per_swarm);
+        }
+    }
+
+    best_index = best_particle_index(&particles);
+    let best_context = particles[best_index].best_context.clone();
+    let best_position = particles[best_index].best_position.clone();
+    let best_score = particles[best_index].best_score;
+    let particle_scores = particles.iter().map(|particle| particle.score).collect();
+    let particle_seeds = particles
+        .into_iter()
+        .map(|particle| ParticleSeed {
+            context: particle.best_context,
+            position: particle.best_position,
+        })
+        .collect();
+    Ok(ParticleSwarmOutcome {
+        best_context,
+        best_position,
+        best_score,
+        generations: completed_generations,
+        evaluations,
+        converged,
+        history,
+        particles: particle_seeds,
+        particle_scores,
+    })
+}
+
+fn validate_particle_swarm_config<C>(
+    config: &ParticleSwarmConfig,
+    seeds: &[ParticleSeed<C>],
+) -> Result<()> {
+    if config.swarms == 0
+        || config.particles_per_swarm == 0
+        || config.generations == 0
+        || config.inertia_start.is_nan()
+        || config.inertia_end.is_nan()
+        || config.cognitive < 0.0
+        || config.social < 0.0
+        || config.stall_generations == 0
+        || config.tolerance < 0.0
+        || config
+            .time_limit_seconds
+            .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+        || config.bounds.is_empty()
+        || config.periodic_dimensions.len() != config.bounds.len()
+        || seeds.is_empty()
+        || seeds.len() > config.swarms * config.particles_per_swarm
+    {
+        return Err(OptimizationError::InvalidConfiguration(
+            "valid swarm count, population, generations, coefficients, bounds, and seeds are required"
+                .into(),
+        ));
+    }
+    if config
+        .bounds
+        .iter()
+        .any(|(lower, upper)| !lower.is_finite() || !upper.is_finite() || upper <= lower)
+    {
+        return Err(OptimizationError::InvalidConfiguration(
+            "swarm bounds must be finite and increasing".into(),
+        ));
+    }
+    if seeds
+        .iter()
+        .any(|seed| seed.position.len() != config.bounds.len())
+    {
+        return Err(OptimizationError::DimensionMismatch {
+            expected: config.bounds.len(),
+            received: seeds
+                .iter()
+                .find(|seed| seed.position.len() != config.bounds.len())
+                .map_or(0, |seed| seed.position.len()),
+        });
+    }
+    Ok(())
+}
+
+fn best_particle_index<C>(particles: &[SwarmParticle<C>]) -> usize {
+    particles
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.best_score
+                .total_cmp(&right.best_score)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map_or(0, |(index, _)| index)
+}
+
+fn wrap_swarm_value(value: f64, lower: f64, upper: f64) -> f64 {
+    let width = upper - lower;
+    lower + (value - lower).rem_euclid(width)
 }
 
 fn lbfgs_direction(
@@ -513,5 +1040,56 @@ mod tests {
             assert_eq!(left.best_score, right.best_score);
             assert_eq!(left.mean_score, right.mean_score);
         }
+    }
+
+    #[derive(Debug)]
+    struct SwarmTarget;
+
+    impl ParticleSwarmProblem for SwarmTarget {
+        type Context = usize;
+
+        fn evaluate(&self, context: &Self::Context, position: &[f64]) -> f64 {
+            // The categorical context participates in the objective but is
+            // immutable while particles move, which catches accidental
+            // context interpolation or migration aliasing.
+            -((position[0] - (*context as f64) * 0.1).powi(2) + position[1].sin().powi(2))
+        }
+    }
+
+    #[test]
+    fn particle_swarm_is_periodic_and_thread_deterministic() {
+        let seeds = (0..8)
+            .map(|context| ParticleSeed {
+                context,
+                position: vec![170.0 - context as f64, 2.0],
+            })
+            .collect::<Vec<_>>();
+        let config = ParticleSwarmConfig {
+            swarms: 2,
+            particles_per_swarm: 4,
+            generations: 12,
+            seed: 91,
+            bounds: vec![(-180.0, 180.0), (-180.0, 180.0)],
+            periodic_dimensions: vec![true, true],
+            ..ParticleSwarmConfig::default()
+        };
+        let run = |threads| {
+            ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| particle_swarm_optimize(&SwarmTarget, seeds.clone(), &config).unwrap())
+        };
+        let serial = run(1);
+        let parallel = run(4);
+        assert_eq!(serial.best_context, parallel.best_context);
+        assert_eq!(serial.best_position, parallel.best_position);
+        assert_eq!(serial.history.len(), parallel.history.len());
+        assert!(
+            serial
+                .best_position
+                .iter()
+                .all(|value| (-180.0..180.0).contains(value))
+        );
     }
 }

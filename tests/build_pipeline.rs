@@ -6,6 +6,8 @@ use glysys::{
 const DIPEPTIDE: &str = include_str!("fixtures/dipeptide.pdb");
 const GLYCAN: &str = include_str!("fixtures/glycan.pdb");
 const DIPEPTIDE_TLEAP_PRMTOP: &str = include_str!("fixtures/dipeptide.prmtop");
+const SULFATED_GAG: &str = include_str!("../reference/gmml2/tests/correct_outputs/028/00036.pdb");
+const SULFATED_GAG_WITH_CAP: &str = include_str!("fixtures/sulfated_gag_with_cap.pdb");
 
 #[test]
 fn prepares_deterministic_solvated_protein_bundle() {
@@ -31,6 +33,7 @@ fn prepares_deterministic_solvated_protein_bundle() {
     let directory = tempfile::tempdir().unwrap();
     first.write_bundle(directory.path()).unwrap();
     for name in [
+        "system.pdb",
         "system.prmtop",
         "system.inpcrd",
         "system.top",
@@ -39,6 +42,11 @@ fn prepares_deterministic_solvated_protein_bundle() {
     ] {
         assert!(directory.path().join(name).is_file(), "{name}");
     }
+    assert!(
+        std::fs::read_to_string(directory.path().join("system.pdb"))
+            .unwrap()
+            .contains("END")
+    );
     let topology = std::fs::read_to_string(directory.path().join("system.top")).unwrap();
     assert!(topology.contains("[ atomtypes ]"));
     assert!(topology.contains("[ settles ]"));
@@ -93,6 +101,49 @@ fn recognizes_and_prepares_standalone_glycam_glycan() {
         Some("DGlcpNAc")
     );
     assert!(system.report().solute_charge.abs() < 1.0e-3);
+}
+
+#[test]
+fn prepares_connected_sulfated_gag_chain() {
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(SULFATED_GAG)
+    .unwrap();
+    let report = system.report();
+    assert_eq!(report.glycans.len(), 1);
+    assert_eq!(report.glycans[0].residue_count, 7);
+    assert!(
+        report.glycans[0].glycam.as_deref().is_some_and(|value| {
+            value.contains("GlcpNS[3S6S]") && value.contains("GlcpNS[6S]")
+        })
+    );
+    assert_eq!(report.glycans[0].attachment_site, None);
+    assert!(report.solute_charge < -11.0);
+    assert!(report.solute_charge > -12.0);
+}
+
+#[test]
+fn solvates_interleaved_sulfated_gag_components() {
+    let system = SystemBuilder::new(BuildOptions {
+        padding_angstrom: 8.0,
+        salt_molar: 0.0,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(SULFATED_GAG_WITH_CAP)
+    .unwrap();
+    let report = system.report();
+    assert_eq!(report.glycans.len(), 1);
+    assert_eq!(report.glycans[0].residue_count, 5);
+    assert!(report.waters > 0);
+    assert_eq!(report.sodium_ions, 8);
+    let bundle = system.bundle_strings().unwrap();
+    assert!(bundle["system.prmtop"].contains("%FLAG ATOMS_PER_MOLECULE"));
+    assert!(bundle["system.pdb"].contains("WAT"));
 }
 
 #[test]
@@ -270,7 +321,7 @@ fn supports_water_without_ions_and_fully_dry_outputs() {
 #[test]
 fn rejects_missing_heavy_atoms() {
     let incomplete = DIPEPTIDE.replace(
-        "ATOM     20  OXT GLY     2       9.380   5.481  -0.000  1.00  0.00\n",
+        "ATOM     19  O   GLY     2       7.395   6.219   0.000  1.00  0.00\n",
         "",
     );
     let error = SystemBuilder::new(BuildOptions::default())
@@ -287,6 +338,60 @@ fn rejects_missing_heavy_atoms() {
         .inspect_pdb(path)
         .unwrap();
     assert_eq!(report.missing_heavy_atoms.len(), 1);
+}
+
+#[test]
+fn reconstructs_missing_protein_sidechain_heavy_atoms() {
+    // Keep a complete second residue so the first VAL uses the ordinary
+    // N-terminal template rather than the ambiguous single-residue path.
+    let incomplete_val = DIPEPTIDE.replace("ALA", "VAL").replace(
+        "ATOM     20  OXT GLY     2       9.380   5.481  -0.000  1.00  0.00\n",
+        "",
+    );
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(&incomplete_val)
+    .unwrap();
+    assert!(
+        system.report().warnings.iter().any(|warning| matches!(
+        warning,
+        BuildWarning::ProteinHeavyAtomsReconstructed(message)
+            if message.contains("/VAL/1") && message.contains("CG1")
+        )),
+        "warnings: {:?}",
+        system.report().warnings
+    );
+    assert!(system.report().warnings.iter().any(|warning| matches!(
+        warning,
+        BuildWarning::ProteinHeavyAtomsReconstructed(message)
+            if message.contains("/GLY/2") && message.contains("OXT")
+    )));
+}
+
+#[test]
+fn normalizes_wwpdb_nag_atom_names_for_glycam() {
+    let pdb = GLYCAN
+        .replace("0YB", "NAG")
+        .replace("C2N", "C7")
+        .replace("O2N", "O7")
+        .replace("CME", "C8");
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(&pdb)
+    .unwrap();
+    assert!(system.report().warnings.iter().any(|warning| matches!(
+        warning,
+        BuildWarning::GlycanNameNormalized(message)
+            if message.contains("atom C7 -> C2N")
+    )));
 }
 
 #[test]

@@ -40,7 +40,15 @@ pub struct StructureAtom {
     pub residue: ResidueId,
     pub residue_name: String,
     pub element: String,
+    #[serde(default = "default_occupancy")]
+    pub occupancy: f64,
+    #[serde(default)]
+    pub b_factor: f64,
     pub position: Vec3,
+}
+
+fn default_occupancy() -> f64 {
+    1.0
 }
 
 /// Public, format-independent residue record.
@@ -151,19 +159,35 @@ impl Structure {
             .collect::<Vec<_>>();
         let glycan_trees = glycosylation_sites
             .iter()
-            .map(|site| GlycanTree {
-                chain: site.glycan_residue.chain.clone(),
-                residue_ids: parsed
-                    .residues
-                    .iter()
-                    .filter(|residue| {
-                        residue.reference.chain == site.glycan_residue.chain
-                            && !crate::pdb::PROTEIN_RESIDUES
-                                .contains(&residue.reference.name.as_str())
-                    })
-                    .map(|residue| residue_id(&residue.reference))
-                    .collect(),
-                attachment_site: Some(site.protein_residue.clone()),
+            .map(|site| {
+                let mut residue_ids = linked_glycan_residues(&parsed, &site.glycan_residue);
+                // Older PDBs sometimes omit internal LINK records and retain
+                // only CONECT records. Preserve the historical chain-based
+                // fallback for those files while using exact connectivity
+                // whenever it is available. Never use that fallback when
+                // multiple attachment roots share the chain: doing so would
+                // merge otherwise independent glycans.
+                let has_other_attachment_root = glycosylation_sites.iter().any(|other| {
+                    other.glycan_residue.chain == site.glycan_residue.chain
+                        && other.glycan_residue != site.glycan_residue
+                });
+                if residue_ids.len() <= 1 && !has_other_attachment_root {
+                    residue_ids = parsed
+                        .residues
+                        .iter()
+                        .filter(|residue| {
+                            residue.reference.chain == site.glycan_residue.chain
+                                && !crate::pdb::PROTEIN_RESIDUES
+                                    .contains(&residue.reference.name.as_str())
+                        })
+                        .map(|residue| residue_id(&residue.reference))
+                        .collect();
+                }
+                GlycanTree {
+                    chain: site.glycan_residue.chain.clone(),
+                    residue_ids: residue_ids.into_iter().collect(),
+                    attachment_site: Some(site.protein_residue.clone()),
+                }
             })
             .collect();
         Self {
@@ -189,9 +213,46 @@ impl Structure {
                     residue: residue_id.clone(),
                     residue_name: residue.reference.name.clone(),
                     element: atom.element.clone(),
+                    occupancy: atom.occupancy,
+                    b_factor: atom.b_factor,
                     position: atom.position,
                 })
             })
+            .collect()
+    }
+
+    /// Return coordinates for a selected set of atom identifiers without
+    /// constructing `StructureAtom` records or cloning atom names/residue
+    /// strings. This is intended for high-throughput geometry objectives
+    /// such as density fitting.
+    pub fn atom_positions(&self, ids: &[AtomId]) -> BTreeMap<AtomId, Vec3> {
+        if ids.is_empty() {
+            return BTreeMap::new();
+        }
+        let wanted = ids.iter().map(|id| id.0).collect::<BTreeSet<_>>();
+        self.parsed
+            .residues
+            .iter()
+            .flat_map(|residue| residue.atoms.iter())
+            .filter(|atom| wanted.contains(&atom.serial))
+            .map(|atom| (AtomId(atom.serial), atom.position))
+            .collect()
+    }
+
+    /// Return heavy-atom coordinates for selected residues without allocating
+    /// public atom records. Atom identifiers are stable across coordinate
+    /// updates, so callers can compare two poses directly by key.
+    pub fn heavy_atom_positions_for_residues(
+        &self,
+        residues: &BTreeSet<ResidueId>,
+    ) -> BTreeMap<AtomId, Vec3> {
+        self.parsed
+            .residues
+            .iter()
+            .filter(|residue| residues.contains(&residue_id(&residue.reference)))
+            .flat_map(|residue| residue.atoms.iter())
+            .filter(|atom| !atom.element.eq_ignore_ascii_case("H"))
+            .map(|atom| (AtomId(atom.serial), atom.position))
             .collect()
     }
 
@@ -213,11 +274,38 @@ impl Structure {
 
     /// Explicit bonds declared by the source or added by a structure builder.
     pub fn bonds(&self) -> Vec<(AtomId, AtomId)> {
-        self.parsed
+        let mut bonds = self
+            .parsed
             .conect
             .iter()
             .map(|(first, second)| (AtomId(*first), AtomId(*second)))
-            .collect()
+            .collect::<BTreeSet<_>>();
+        for link in &self.parsed.links {
+            let first = self.find_atom(
+                &ResidueId {
+                    chain: link.first.chain.clone(),
+                    number: link.first.number,
+                    insertion_code: link.first.insertion_code,
+                },
+                &link.first_atom,
+            );
+            let second = self.find_atom(
+                &ResidueId {
+                    chain: link.second.chain.clone(),
+                    number: link.second.number,
+                    insertion_code: link.second.insertion_code,
+                },
+                &link.second_atom,
+            );
+            if let (Some(first), Some(second)) = (first, second) {
+                bonds.insert(if first <= second {
+                    (first, second)
+                } else {
+                    (second, first)
+                });
+            }
+        }
+        bonds.into_iter().collect()
     }
 
     pub fn metadata(&self) -> &SystemMetadata {
@@ -253,6 +341,37 @@ impl Structure {
         Ok(())
     }
 
+    /// Update several atom coordinates in one pass through the parsed
+    /// structure.  Repeated calls to [`set_atom_position`](Self::set_atom_position)
+    /// are convenient for interactive edits, but become quadratic when a
+    /// rigid branch contains many atoms (as it does during density fitting).
+    pub fn set_atom_positions<I>(&mut self, updates: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (AtomId, Vec3)>,
+    {
+        let updates = updates.into_iter().collect::<BTreeMap<_, _>>();
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut remaining = updates.keys().copied().collect::<BTreeSet<_>>();
+        for residue in &mut self.parsed.residues {
+            for atom in &mut residue.atoms {
+                let id = AtomId(atom.serial);
+                if let Some(position) = updates.get(&id) {
+                    atom.position = *position;
+                    remaining.remove(&id);
+                }
+            }
+        }
+        if let Some(id) = remaining.into_iter().next() {
+            return Err(BuildError::InvalidPdb(format!(
+                "atom {} does not exist",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+
     pub fn rename_residue(&mut self, id: &ResidueId, name: impl Into<String>) -> Result<()> {
         let residue = self
             .find_residue_mut(id)
@@ -274,16 +393,22 @@ impl Structure {
             .filter(|residue| names.contains(&residue.reference.name.as_str()))
             .map(|residue| residue_id(&residue.reference))
             .collect::<BTreeSet<_>>();
+        self.remove_residues(&removed_residues);
+    }
+
+    /// Remove exactly the supplied residues while preserving all remaining
+    /// coordinates, bonds, LINK records, and disulfides.
+    pub fn remove_residues(&mut self, removed_residues: &BTreeSet<ResidueId>) {
         let removed_serials = self
             .parsed
             .residues
             .iter()
-            .filter(|residue| names.contains(&residue.reference.name.as_str()))
+            .filter(|residue| removed_residues.contains(&residue_id(&residue.reference)))
             .flat_map(|residue| residue.atoms.iter().map(|atom| atom.serial))
             .collect::<BTreeSet<_>>();
         self.parsed
             .residues
-            .retain(|residue| !names.contains(&residue.reference.name.as_str()));
+            .retain(|residue| !removed_residues.contains(&residue_id(&residue.reference)));
         self.parsed.conect.retain(|(first, second)| {
             !removed_serials.contains(first) && !removed_serials.contains(second)
         });
@@ -308,6 +433,16 @@ impl Structure {
                 number: second.number,
                 insertion_code: second.insertion_code,
             })
+        });
+        self.metadata.glycosylation_sites.retain(|site| {
+            !removed_residues.contains(&site.glycan_residue)
+                && !removed_residues.contains(&site.protein_residue)
+        });
+        self.metadata.glycan_trees.retain(|tree| {
+            !tree
+                .residue_ids
+                .iter()
+                .any(|residue| removed_residues.contains(residue))
         });
         self.refresh_chains();
     }
@@ -368,6 +503,8 @@ impl Structure {
                     residue_number: destination_id.number,
                     insertion_code: None,
                     element: source_atom.element.clone(),
+                    occupancy: source_atom.occupancy,
+                    b_factor: source_atom.b_factor,
                     position: source_atom.position,
                 });
             }
@@ -517,6 +654,100 @@ impl Structure {
     }
 }
 
+fn linked_glycan_residues(parsed: &ParsedPdb, root: &ResidueId) -> BTreeSet<ResidueId> {
+    let mut adjacency = BTreeMap::<ResidueId, BTreeSet<ResidueId>>::new();
+    for link in &parsed.links {
+        let first = key_to_residue_id(&link.first);
+        let second = key_to_residue_id(&link.second);
+        let first_glycan = parsed
+            .residues
+            .iter()
+            .find(|residue| {
+                residue.reference.chain == link.first.chain
+                    && residue.reference.number == link.first.number
+                    && residue.reference.insertion_code == link.first.insertion_code
+            })
+            .is_some_and(|residue| {
+                !crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str())
+            });
+        let second_glycan = parsed
+            .residues
+            .iter()
+            .find(|residue| {
+                residue.reference.chain == link.second.chain
+                    && residue.reference.number == link.second.number
+                    && residue.reference.insertion_code == link.second.insertion_code
+            })
+            .is_some_and(|residue| {
+                !crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str())
+            });
+        if first_glycan && second_glycan {
+            adjacency
+                .entry(first.clone())
+                .or_default()
+                .insert(second.clone());
+            adjacency.entry(second).or_default().insert(first);
+        }
+    }
+    // Some deposited PDB files omit internal LINK records but retain atom-level
+    // CONECT records.  Promote those records to residue connectivity before
+    // traversing, while keeping protein contacts out of the carbohydrate tree.
+    let atom_residues = parsed
+        .residues
+        .iter()
+        .flat_map(|residue| {
+            let id = ResidueId {
+                chain: residue.reference.chain.clone(),
+                number: residue.reference.number,
+                insertion_code: residue.reference.insertion_code,
+            };
+            let is_glycan =
+                !crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str());
+            residue
+                .atoms
+                .iter()
+                .map(move |atom| (atom.serial, (id.clone(), is_glycan)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (first, second) in &parsed.conect {
+        let Some((first_residue, first_glycan)) = atom_residues.get(first) else {
+            continue;
+        };
+        let Some((second_residue, second_glycan)) = atom_residues.get(second) else {
+            continue;
+        };
+        if *first_glycan && *second_glycan && first_residue != second_residue {
+            adjacency
+                .entry(first_residue.clone())
+                .or_default()
+                .insert(second_residue.clone());
+            adjacency
+                .entry(second_residue.clone())
+                .or_default()
+                .insert(first_residue.clone());
+        }
+    }
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![root.clone()];
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(&current) {
+            pending.extend(neighbors.iter().cloned());
+        }
+    }
+    visited
+}
+
+fn key_to_residue_id(key: &ResidueKey) -> ResidueId {
+    ResidueId {
+        chain: key.chain.clone(),
+        number: key.number,
+        insertion_code: key.insertion_code,
+    }
+}
+
 /// Parse a PDB file into an editable in-memory structure.
 pub fn read_pdb(path: impl AsRef<Path>, options: &BuildOptions) -> Result<Structure> {
     let path = path.as_ref();
@@ -562,8 +793,8 @@ pub fn write_pdb_string(structure: &Structure) -> String {
                 atom.position.x,
                 atom.position.y,
                 atom.position.z,
-                1.0,
-                0.0,
+                atom.occupancy,
+                atom.b_factor,
             ));
         }
         let chain_ends = structure
@@ -724,5 +955,22 @@ END
         assert_eq!(reparsed.metadata().glycosylation_sites.len(), 1);
         assert_eq!(reparsed.metadata().glycan_trees.len(), 1);
         assert_eq!(reparsed.metadata().glycan_trees[0].residue_ids.len(), 1);
+    }
+
+    #[test]
+    fn global_connectivity_before_model_is_retained() {
+        let input = format!(
+            "LINK         ND2 ASN A   1                 C1  NAG B   1     1555   1555  1.44  \nMODEL        1                                                                  \n{GLYCOPROTEIN}ENDMDL                                                                          \nEND                                                                             \n"
+        );
+        let structure = read_pdb_str(&input, &BuildOptions::default()).expect("parse fixture");
+        assert_eq!(structure.metadata().glycosylation_sites.len(), 1);
+        assert_eq!(
+            structure.metadata().glycosylation_sites[0].protein_residue,
+            ResidueId {
+                chain: "A".into(),
+                number: 1,
+                insertion_code: None,
+            }
+        );
     }
 }

@@ -173,6 +173,7 @@ impl ParameterizedSystem {
     pub fn write_bundle(&self, directory: impl AsRef<Path>) -> Result<()> {
         let directory = directory.as_ref();
         let targets = [
+            "system.pdb",
             "system.prmtop",
             "system.inpcrd",
             "system.top",
@@ -189,6 +190,7 @@ impl ParameterizedSystem {
             .map_err(crate::error::write_error(directory.to_path_buf()))?;
 
         let mut outputs = vec![
+            ("system.pdb", crate::writers::write_pdb_system(&self.system)),
             (
                 "system.prmtop",
                 crate::writers::amber::write_prmtop(&self.system)?,
@@ -226,6 +228,50 @@ impl ParameterizedSystem {
             atomic_write(directory.join(name), contents.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// Serialize the full output bundle as in-memory strings (for WASM/embedded
+    /// consumers) without touching the filesystem.
+    pub fn bundle_strings(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut outputs = vec![
+            (
+                "system.pdb".to_string(),
+                crate::writers::write_pdb_system(&self.system),
+            ),
+            (
+                "system.prmtop".to_string(),
+                crate::writers::amber::write_prmtop(&self.system)?,
+            ),
+            (
+                "system.inpcrd".to_string(),
+                crate::writers::amber::write_inpcrd(&self.system),
+            ),
+            (
+                "system.top".to_string(),
+                crate::writers::gromacs::write_topology(&self.system),
+            ),
+            (
+                "system.gro".to_string(),
+                crate::writers::gromacs::write_gro(&self.system),
+            ),
+        ];
+        let mut manifest = self.report.clone();
+        manifest.output_sha256 = outputs
+            .iter()
+            .map(|(name, contents)| {
+                (
+                    name.clone(),
+                    format!("{:x}", Sha256::digest(contents.as_bytes())),
+                )
+            })
+            .collect();
+        outputs.push((
+            "manifest.json".to_string(),
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|error| BuildError::Serialization(error.to_string()))?
+                + "\n",
+        ));
+        Ok(outputs.into_iter().collect())
     }
 }
 

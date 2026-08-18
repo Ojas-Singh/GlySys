@@ -47,7 +47,22 @@ impl TemplateSet {
         n_terminal.extend(parse_off(amber_data::GLYCAM_AMINO_N)?);
         let mut c_terminal = parse_off(amber_data::AMINO_C)?;
         c_terminal.extend(parse_off(amber_data::GLYCAM_AMINO_C)?);
-        let glycans = parse_prep(amber_data::GLYCAM_PREP)?;
+        let mut glycans = parse_prep(amber_data::GLYCAM_PREP)?;
+        let gag_names = parse_prep(amber_data::GLYCAM_GAG_PREP)?;
+        let gag_templates = parse_off(amber_data::GLYCAM_GAG_LIB)?;
+        // The GAG PREP extension uses an unusual internal-coordinate order
+        // for several sulfate forms. The matching Amber OFF library is the
+        // authoritative atom graph and Cartesian reference frame. Only add
+        // residue types that are not in the regular GLYCAM set so the GAG
+        // extension cannot replace an established non-GAG template.
+        for name in gag_names.into_keys() {
+            if glycans.contains_key(&name) {
+                continue;
+            }
+            if let Some(template) = gag_templates.get(&name) {
+                glycans.insert(name, template.clone());
+            }
+        }
         let ions = parse_off(amber_data::ATOMIC_IONS)?;
         let box_templates = parse_off(amber_data::TIP3P_BOX)?;
         let tip3p_box = box_templates
@@ -337,6 +352,8 @@ fn parse_prep(contents: &str) -> Result<HashMap<String, Template>> {
         let original_to_real = atoms
             .iter()
             .enumerate()
+            // PREP references are one-based, while `original` is a
+            // zero-based index into the complete table including DUMM atoms.
             .map(|(real, (_, original))| (*original + 1, real))
             .collect::<HashMap<_, _>>();
         let mut bonds = Vec::new();
@@ -480,6 +497,8 @@ mod tests {
                 .any(|bond| bond.contains(&c1) && bond.contains(&c2)),
             "GLYCAM PREP LOOP bond C1-C2 was not parsed"
         );
+        assert!(templates.glycan("QYS").is_some());
+        assert!(templates.glycan("VYS").is_some());
         assert!(templates.ion("Na+").is_some());
         assert!(!templates.tip3p_box().atoms.is_empty());
     }

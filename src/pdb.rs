@@ -13,6 +13,8 @@ pub(crate) struct PdbAtom {
     pub residue_number: i32,
     pub insertion_code: Option<char>,
     pub element: String,
+    pub occupancy: f64,
+    pub b_factor: f64,
     pub position: Vec3,
 }
 
@@ -85,6 +87,43 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
             current_model = 0;
             continue;
         }
+        // LINK, SSBOND, and CONECT records are commonly written once in the
+        // global pre-MODEL section of an NMR/assembly PDB.  They describe the
+        // selected coordinates and must not be discarded merely because the
+        // parser is currently outside the requested MODEL block.
+        if line.starts_with("CONECT") {
+            if current_model == 0 || current_model == options.model {
+                let serials = line
+                    .as_bytes()
+                    .get(6..)
+                    .into_iter()
+                    .flat_map(|rest| rest.chunks(5))
+                    .filter_map(|chunk| std::str::from_utf8(chunk).ok()?.trim().parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                if let Some(&first) = serials.first() {
+                    for &second in &serials[1..] {
+                        conect.insert(ordered(first, second));
+                    }
+                }
+            }
+            continue;
+        }
+        if line.starts_with("LINK  ") {
+            if (current_model == 0 || current_model == options.model)
+                && let Some(link) = parse_link(line)
+            {
+                links.push(link);
+            }
+            continue;
+        }
+        if line.starts_with("SSBOND") {
+            if (current_model == 0 || current_model == options.model)
+                && let Some(pair) = parse_ssbond(line)
+            {
+                ssbonds.push(pair);
+            }
+            continue;
+        }
         if current_model != options.model {
             continue;
         }
@@ -110,27 +149,6 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
                 altloc,
                 occupancy,
             });
-        } else if line.starts_with("CONECT") {
-            let serials = line
-                .as_bytes()
-                .get(6..)
-                .into_iter()
-                .flat_map(|rest| rest.chunks(5))
-                .filter_map(|chunk| std::str::from_utf8(chunk).ok()?.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>();
-            if let Some(&first) = serials.first() {
-                for &second in &serials[1..] {
-                    conect.insert(ordered(first, second));
-                }
-            }
-        } else if line.starts_with("LINK  ") {
-            if let Some(link) = parse_link(line) {
-                links.push(link);
-            }
-        } else if line.starts_with("SSBOND")
-            && let Some(pair) = parse_ssbond(line)
-        {
-            ssbonds.push(pair);
         }
     }
 
@@ -236,8 +254,16 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
                     .unwrap_or_else(|_| "unavailable".into());
                 let glycam =
                     crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Glycam).ok();
+                // GLYCAM GAG files may represent sulfate as a separate SO3
+                // residue joined by CONECT, and free glycans can be capped
+                // with ROH. Neither is an external attachment site.
+                let attachment_site = glycan
+                    .attachment_site
+                    .as_deref()
+                    .filter(|site| !matches!(site.split('/').nth(1), Some("SO3" | "ROH")))
+                    .map(str::to_owned);
                 GlycanReport {
-                    attachment_site: glycan.attachment_site,
+                    attachment_site,
                     residue_count: glycan.graph.node_count(),
                     wurcs,
                     glycam,
@@ -278,7 +304,35 @@ fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
         if (line.starts_with("ATOM  ") || line.starts_with("HETATM"))
             && current_model == selected_model
         {
-            coordinate_records.push(format!("{line:<80}"));
+            // crabWURCS 0.3.1 deliberately limits its loose GLYCAM-code
+            // heuristic to HETATM records: otherwise protein names such as
+            // VAL can be mistaken for a three-character GLYCAM code.  A few
+            // deposited standalone GLYCAM files nevertheless encode their
+            // sugar records as ATOM (the common 0YB/0GL-style codes).  Mark
+            // only the unambiguous numeric-prefix GLYCAM spelling as HETATM
+            // in the compatibility view; ordinary protein ATOM records are
+            // left untouched and therefore cannot become glycan residues.
+            //
+            // Sulfated glycosaminoglycan residues are another unambiguous
+            // case.  GLYCAM encodes glucosamine sulfate forms as `?YS` or
+            // `?YN` (for example 6YS, QYS, and VYS).  They are often emitted
+            // as ATOM records by GLYCAM-Web/GMML, but their second/third
+            // characters cannot collide with a standard amino-acid name.
+            // Preserving them as HETATM lets crabWURCS retain one connected
+            // GAG chain rather than splitting it at every sulfated residue.
+            let mut record = format!("{line:<80}");
+            if record.starts_with("ATOM  ") {
+                let residue_name = record.get(17..20).unwrap_or_default().trim();
+                let bytes = residue_name.as_bytes();
+                let numeric_glycam = bytes.first().is_some_and(|byte| byte.is_ascii_digit());
+                let sulfated_glucosamine = bytes.len() == 3
+                    && matches!(bytes[1], b'Y' | b'y')
+                    && matches!(bytes[2], b'N' | b'n' | b'S' | b's');
+                if numeric_glycam || sulfated_glucosamine {
+                    record.replace_range(0..6, "HETATM");
+                }
+            }
+            coordinate_records.push(record);
         } else if line.starts_with("CONECT")
             || line.starts_with("LINK  ")
             || line.starts_with("SSBOND")
@@ -346,6 +400,10 @@ fn parse_atom(line: &str, line_number: usize) -> Result<PdbAtom> {
                 declared.to_string()
             }
         },
+        occupancy: parse_number(54, 60, "occupancy")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+        b_factor: parse_number(60, 66, "B factor").unwrap_or(0.0).max(0.0),
         position: Vec3 {
             x: parse_number(30, 38, "x coordinate")?,
             y: parse_number(38, 46, "y coordinate")?,

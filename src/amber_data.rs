@@ -9,6 +9,11 @@ pub(crate) const GLYCAM_AMINO_C: &str =
 pub(crate) const ATOMIC_IONS: &str = include_str!("../data/amber/lib/atomic_ions.lib");
 pub(crate) const TIP3P_BOX: &str = include_str!("../data/amber/lib/tip3pbox.off");
 pub(crate) const GLYCAM_PREP: &str = include_str!("../data/amber/prep/GLYCAM_06j-1.prep");
+// The base GLYCAM distribution omits the GAG extension residue table.  Keep
+// it separate so the standard carbohydrate data remains easy to audit while
+// sulfated glycosaminoglycans (for example QYS and VYS) are fully supported.
+pub(crate) const GLYCAM_GAG_PREP: &str = include_str!("../data/amber/prep/GLYCAM_06j-1_GAGS.prep");
+pub(crate) const GLYCAM_GAG_LIB: &str = include_str!("../data/amber/lib/GLYCAM_06k_GAGS.lib");
 
 pub(crate) const PARM10: &str = include_str!("../data/amber/parm/parm10.dat");
 pub(crate) const FF14SB: &str = include_str!("../data/amber/parm/frcmod.ff14SB");

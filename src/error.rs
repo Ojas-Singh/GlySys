@@ -51,6 +51,10 @@ pub enum BuildWarning {
     HistidineStateInferred(String),
     ExistingSolventRemoved(String),
     GlycanNameNormalized(String),
+    /// A standard protein side-chain or terminal OXT was absent from the
+    /// deposited model and was rebuilt from the force-field template frame.
+    /// Peptide backbone N/CA/C/O atoms are never synthesized by this fallback.
+    ProteinHeavyAtomsReconstructed(String),
     InputHydrogensRebuilt(String),
     InputGlycanHydrogensPreserved(String),
 }
