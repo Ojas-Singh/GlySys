@@ -23,6 +23,6 @@ pub use prepare::SystemBuilder;
 pub use report::{BuildReport, GlycanReport, ResidueRef};
 pub use structure::{
     AppendMap, AtomId, GlycanTree, GlycosylationSite, ResidueAnnotation, ResidueId, Structure,
-    StructureAtom, StructureResidue, SystemMetadata, read_pdb, read_pdb_str, write_pdb,
-    write_pdb_string,
+    StructureAtom, StructureAtomRef, StructureResidue, SystemMetadata, read_pdb, read_pdb_str,
+    write_pdb, write_pdb_string,
 };

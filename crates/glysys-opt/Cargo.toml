@@ -13,3 +13,6 @@ rand_chacha = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"

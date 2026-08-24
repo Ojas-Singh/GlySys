@@ -47,6 +47,19 @@ pub struct StructureAtom {
     pub position: Vec3,
 }
 
+/// Borrowed atom view used by high-throughput read-only geometry code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructureAtomRef<'a> {
+    pub id: AtomId,
+    pub name: &'a str,
+    pub residue: ResidueId,
+    pub residue_name: &'a str,
+    pub element: &'a str,
+    pub occupancy: f64,
+    pub b_factor: f64,
+    pub position: Vec3,
+}
+
 fn default_occupancy() -> f64 {
     1.0
 }
@@ -221,6 +234,25 @@ impl Structure {
             .collect()
     }
 
+    /// Iterate over atom records without allocating a new vector of public
+    /// records. This is intended for read-only geometry kernels that inspect
+    /// a structure many times.
+    pub fn iter_atoms(&self) -> impl Iterator<Item = StructureAtomRef<'_>> {
+        self.parsed.residues.iter().flat_map(|residue| {
+            let residue_id = residue_id(&residue.reference);
+            residue.atoms.iter().map(move |atom| StructureAtomRef {
+                id: AtomId(atom.serial),
+                name: &atom.name,
+                residue: residue_id.clone(),
+                residue_name: &residue.reference.name,
+                element: &atom.element,
+                occupancy: atom.occupancy,
+                b_factor: atom.b_factor,
+                position: atom.position,
+            })
+        })
+    }
+
     /// Return coordinates for a selected set of atom identifiers without
     /// constructing `StructureAtom` records or cloning atom names/residue
     /// strings. This is intended for high-throughput geometry objectives
@@ -318,6 +350,29 @@ impl Structure {
 
     pub fn atom(&self, id: AtomId) -> Option<StructureAtom> {
         self.atoms().into_iter().find(|atom| atom.id == id)
+    }
+
+    /// Return the position of an atom without cloning its complete public
+    /// record or scanning all atom records.
+    pub fn atom_position(&self, id: AtomId) -> Option<Vec3> {
+        self.parsed
+            .residues
+            .iter()
+            .flat_map(|residue| residue.atoms.iter())
+            .find(|atom| atom.serial == id.0)
+            .map(|atom| atom.position)
+    }
+
+    /// Return the residue containing an atom without constructing a public
+    /// atom record.
+    pub fn atom_residue(&self, id: AtomId) -> Option<ResidueId> {
+        self.parsed.residues.iter().find_map(|residue| {
+            residue
+                .atoms
+                .iter()
+                .any(|atom| atom.serial == id.0)
+                .then(|| residue_id(&residue.reference))
+        })
     }
 
     pub fn find_atom(&self, residue_id: &ResidueId, atom_name: &str) -> Option<AtomId> {
