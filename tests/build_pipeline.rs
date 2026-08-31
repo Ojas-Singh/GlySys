@@ -87,6 +87,22 @@ fn prepares_deterministic_solvated_protein_bundle() {
 }
 
 #[test]
+fn exposes_pdb_string_without_changing_bundle_output() {
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(DIPEPTIDE)
+    .unwrap();
+    let bundle = system.bundle_strings().unwrap();
+
+    assert_eq!(system.pdb_string(), bundle["system.pdb"]);
+    assert!(system.pdb_string().ends_with("END\n"));
+}
+
+#[test]
 fn recognizes_and_prepares_standalone_glycam_glycan() {
     let builder = SystemBuilder::new(BuildOptions {
         salt_molar: 0.0,

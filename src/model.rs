@@ -109,6 +109,15 @@ impl ParameterizedSystem {
         &self.report
     }
 
+    /// Serialize the current parameterized system as PDB text.
+    ///
+    /// This is intentionally separate from [`Self::bundle_strings`] so
+    /// browser clients that only need a repaired structure do not have to
+    /// generate Amber and GROMACS topology files as well.
+    pub fn pdb_string(&self) -> String {
+        crate::writers::write_pdb_system(&self.system)
+    }
+
     pub fn atoms(&self) -> &[Atom] {
         &self.system.atoms
     }
@@ -190,7 +199,7 @@ impl ParameterizedSystem {
             .map_err(crate::error::write_error(directory.to_path_buf()))?;
 
         let mut outputs = vec![
-            ("system.pdb", crate::writers::write_pdb_system(&self.system)),
+            ("system.pdb", self.pdb_string()),
             (
                 "system.prmtop",
                 crate::writers::amber::write_prmtop(&self.system)?,
@@ -234,10 +243,7 @@ impl ParameterizedSystem {
     /// consumers) without touching the filesystem.
     pub fn bundle_strings(&self) -> Result<std::collections::BTreeMap<String, String>> {
         let mut outputs = vec![
-            (
-                "system.pdb".to_string(),
-                crate::writers::write_pdb_system(&self.system),
-            ),
+            ("system.pdb".to_string(), self.pdb_string()),
             (
                 "system.prmtop".to_string(),
                 crate::writers::amber::write_prmtop(&self.system)?,

@@ -12,6 +12,8 @@ pub type Result<T> = std::result::Result<T, OptimizationError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizationError {
+    #[error("optimization was cancelled")]
+    Cancelled,
     #[error("invalid optimizer configuration: {0}")]
     InvalidConfiguration(String),
     #[error("objective returned a non-finite value")]
@@ -93,11 +95,31 @@ where
 pub fn genetic_optimize_with_progress<P, F>(
     problem: &P,
     config: &GeneticAlgorithmConfig,
-    mut progress: F,
+    progress: F,
 ) -> Result<GeneticAlgorithmOutcome<P::State>>
 where
     P: GeneticProblem,
     F: FnMut(&GenerationRecord),
+{
+    genetic_optimize_with_progress_cancelled(problem, config, progress, || false)
+}
+
+/// Run the deterministic genetic algorithm with a cooperative cancellation
+/// callback.  The callback is checked between generations and before child
+/// generation; objective evaluation remains parallel, so a cancellation
+/// request that arrives during one batch is observed as soon as that batch
+/// completes.  The original `genetic_optimize_with_progress` API delegates to
+/// this function with a callback that never cancels.
+pub fn genetic_optimize_with_progress_cancelled<P, F, C>(
+    problem: &P,
+    config: &GeneticAlgorithmConfig,
+    mut progress: F,
+    mut cancelled: C,
+) -> Result<GeneticAlgorithmOutcome<P::State>>
+where
+    P: GeneticProblem,
+    F: FnMut(&GenerationRecord),
+    C: FnMut() -> bool,
 {
     validate_genetic_config(config)?;
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
@@ -109,10 +131,16 @@ where
         .clamp(1, config.population_size);
 
     for generation in 0..=config.generations {
+        if cancelled() {
+            return Err(OptimizationError::Cancelled);
+        }
         let mut scored = population
             .par_iter()
             .map(|state| (problem.evaluate(state), state.clone()))
             .collect::<Vec<_>>();
+        if cancelled() {
+            return Err(OptimizationError::Cancelled);
+        }
         if scored.iter().any(|(score, _)| !score.is_finite()) {
             return Err(OptimizationError::NonFiniteObjective);
         }
@@ -139,6 +167,10 @@ where
                 generations: generation,
                 history,
             });
+        }
+
+        if cancelled() {
+            return Err(OptimizationError::Cancelled);
         }
 
         let generation_seed = splitmix64(config.seed ^ generation as u64);
