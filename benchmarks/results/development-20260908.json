@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-08",
+  "modelVersion": "amber-glycam-v2",
+  "samplerVersion": "model-mh-v2",
+  "executionEnvironment": {
+    "nativeGpu": "software Vulkan",
+    "physicalGpuPerformanceEvidence": false
+  },
+  "checks": [
+    {
+      "name": "glysys-energy unit tests",
+      "passed": 17
+    },
+    {
+      "name": "Cartesian and pose derivatives; generated hydrogen export",
+      "passed": 3
+    },
+    {
+      "name": "GPU named scoring and resident energy parity",
+      "passed": 3
+    },
+    {
+      "name": "ReGlyco ensemble native tests including GPU",
+      "passed": 21
+    },
+    {
+      "name": "ReGlyco workflow native tests",
+      "passed": 21
+    },
+    {
+      "name": "independent-chain CPU/GPU emitted structures",
+      "passed": 1,
+      "seeds": 5
+    },
+    {
+      "name": "CE UI/profile tests",
+      "passed": 6
+    },
+    {
+      "name": "minimized collection preserves prepared chemistry, hydrogens and CPU energy",
+      "passed": 1
+    }
+  ],
+  "openmmReference": [
+    {
+      "fixture": "dipeptide",
+      "obc2": false,
+      "energyErrorKcalMol": -5.733382621997407e-07,
+      "maxGradientErrorKcalMolAngstrom": 1.2572335386096256e-06
+    },
+    {
+      "fixture": "dipeptide",
+      "obc2": true,
+      "energyErrorKcalMol": -5.73397102243689e-07,
+      "maxGradientErrorKcalMolAngstrom": 1.2572222418683054e-06
+    },
+    {
+      "fixture": "glycan",
+      "obc2": false,
+      "energyErrorKcalMol": -6.547855093685939e-07,
+      "maxGradientErrorKcalMolAngstrom": 8.29915526412428e-07
+    },
+    {
+      "fixture": "glycan",
+      "obc2": true,
+      "energyErrorKcalMol": -6.548039550580143e-07,
+      "maxGradientErrorKcalMolAngstrom": 8.299149730252309e-07
+    }
+  ],
+  "performance": {
+    "cold": null,
+    "warm": null,
+    "threadedWasmBaseline": null,
+    "appleSilicon": null,
+    "integratedGpu": null,
+    "discreteGpu": null
+  },
+  "deployment": {
+    "site": "https://dev.glycoshape.io/reglyco",
+    "port": 6969,
+    "manifestVersion": "0.1.0-foundation-20260908",
+    "manifestEntriesVerified": 7,
+    "releaseUnchanged": true,
+    "browserGpu": "unavailable; CPU fallback verified",
+    "browserJobs": [
+      "build",
+      "sampled ensemble",
+      "minimized collection",
+      "post-relaxed collection"
+    ]
+  }
+}

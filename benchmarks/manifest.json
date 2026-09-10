@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "modelVersion": "amber-glycam-v2",
+  "coordinateUnit": "angstrom",
+  "energyUnit": "kcal/mol",
+  "gradientUnit": "kcal/mol/angstrom",
+  "reference": {
+    "engine": "OpenMM",
+    "version": "8.1.1",
+    "platform": "Reference",
+    "boundary": "nonperiodic",
+    "nonbonded": "NoCutoff",
+    "constraints": false,
+    "parameterSource": "GlySys exported Amber topology; independent evaluator, shared parameter assignment"
+  },
+  "tolerances": {
+    "energyAtol": 0.001,
+    "energyRtol": 0.0001,
+    "gradientAtol": 0.001,
+    "gradientRtol": 0.001
+  },
+  "fixtures": [
+    {
+      "id": "dipeptide",
+      "category": "energy_reference",
+      "sources": [
+        {
+          "path": "tests/fixtures/dipeptide.pdb",
+          "sha256": "fa93aa6937b67552577b1b23e8c3d02f186a03180a5c692735e4bfda818fb3f7"
+        },
+        {
+          "path": "benchmarks/reference/dipeptide.json",
+          "sha256": "a412ecc36a35fe9e7338dbaa74d652b0901b71aebc84010654037b6bae173c0c"
+        },
+        {
+          "path": "benchmarks/reference/dipeptide-openmm.json",
+          "sha256": "6de615c8b5a5d335e30c5bf24c1ed95bbccad5007d29b5154ed5ec9ea6755432"
+        }
+      ],
+      "labels": {
+        "poseRanking": null,
+        "affinity": null,
+        "nonbindingEvidence": null
+      },
+      "splitGroup": "dipeptide",
+      "receptorFamily": null,
+      "glycanSimilarityGroup": null
+    },
+    {
+      "id": "glycan",
+      "category": "energy_reference",
+      "sources": [
+        {
+          "path": "tests/fixtures/glycan.pdb",
+          "sha256": "b9d5a317f01b15140e599e026b1d7ea04b6dbf7d4bccfc1ed521a61c91c464c0"
+        },
+        {
+          "path": "benchmarks/reference/glycan.json",
+          "sha256": "dcc9d5d5a1159d09963b370bed723b0c7694dcf2f985d1556dd59aa1f4447d59"
+        },
+        {
+          "path": "benchmarks/reference/glycan-openmm.json",
+          "sha256": "8c6d647414ecd980d0e13e04629037a9b76946224e76fee50cf66c8e09ca74b0"
+        }
+      ],
+      "labels": {
+        "poseRanking": null,
+        "affinity": null,
+        "nonbindingEvidence": null
+      },
+      "splitGroup": "glycan",
+      "receptorFamily": null,
+      "glycanSimilarityGroup": null
+    }
+  ]
+}

@@ -48,5 +48,6 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = ["crates/glysys-energy", "crates/glysys-opt"]
+members = ["crates/glysys-energy", "crates/glysys-opt", "crates/glysys-gpu", "crates/glysys-dynamics"]
+default-members = [".", "crates/glysys-energy", "crates/glysys-opt"]
 resolver = "3"

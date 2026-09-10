@@ -1611,8 +1611,8 @@ fn enumerate_parameters(
                         periodicity: parameter.periodicity,
                         phase: parameter.phase_degrees.to_radians(),
                         improper: false,
-                        scee: 1.2,
-                        scnb: 2.0,
+                        scee: parameter.scee,
+                        scnb: parameter.scnb,
                     });
                 }
             }
@@ -1643,8 +1643,8 @@ fn enumerate_parameters(
                                 periodicity: parameter.periodicity,
                                 phase: parameter.phase_degrees.to_radians(),
                                 improper: true,
-                                scee: 1.2,
-                                scnb: 2.0,
+                                scee: parameter.scee,
+                                scnb: parameter.scnb,
                             });
                         }
                     }

@@ -1,5 +1,8 @@
 //! Deterministic, application-independent optimization algorithms.
 
+pub mod genetic_state;
+pub mod resumable;
+
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -121,82 +124,21 @@ where
     F: FnMut(&GenerationRecord),
     C: FnMut() -> bool,
 {
-    validate_genetic_config(config)?;
-    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
-    let mut population = (0..config.population_size)
-        .map(|_| problem.generate(&mut rng))
-        .collect::<Vec<_>>();
-    let mut history = Vec::with_capacity(config.generations + 1);
-    let elite_count = ((config.population_size as f64 * config.elite_fraction).round() as usize)
-        .clamp(1, config.population_size);
-
-    for generation in 0..=config.generations {
+    let mut state = genetic_state::GeneticState::new(problem, config)?;
+    loop {
         if cancelled() {
             return Err(OptimizationError::Cancelled);
         }
-        let mut scored = population
+        let scores = state
+            .population()
             .par_iter()
-            .map(|state| (problem.evaluate(state), state.clone()))
-            .collect::<Vec<_>>();
-        if cancelled() {
-            return Err(OptimizationError::Cancelled);
+            .map(|s| problem.evaluate(s))
+            .collect();
+        state.submit(problem, scores, &mut progress, &mut cancelled)?;
+        if let Some(outcome) = state.outcome() {
+            return Ok(outcome.clone());
         }
-        if scored.iter().any(|(score, _)| !score.is_finite()) {
-            return Err(OptimizationError::NonFiniteObjective);
-        }
-        scored.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let record = GenerationRecord {
-            generation,
-            best_score: scored[0].0,
-            mean_score: scored.iter().map(|entry| entry.0).sum::<f64>() / scored.len() as f64,
-        };
-        progress(&record);
-        history.push(record);
-        if problem.is_solution(&scored[0].1, scored[0].0) {
-            return Ok(GeneticAlgorithmOutcome {
-                best_state: scored[0].1.clone(),
-                best_score: scored[0].0,
-                generations: generation,
-                history,
-            });
-        }
-        if generation == config.generations {
-            return Ok(GeneticAlgorithmOutcome {
-                best_state: scored[0].1.clone(),
-                best_score: scored[0].0,
-                generations: generation,
-                history,
-            });
-        }
-
-        if cancelled() {
-            return Err(OptimizationError::Cancelled);
-        }
-
-        let generation_seed = splitmix64(config.seed ^ generation as u64);
-        let mut next = scored
-            .iter()
-            .take(elite_count)
-            .map(|entry| entry.1.clone())
-            .collect::<Vec<_>>();
-        let needed = config.population_size - next.len();
-        let children = (0..needed)
-            .into_par_iter()
-            .map(|child_index| {
-                let mut child_rng =
-                    ChaCha8Rng::seed_from_u64(splitmix64(generation_seed ^ child_index as u64));
-                let first = tournament(&scored, config.tournament_size, &mut child_rng);
-                let second = tournament(&scored, config.tournament_size, &mut child_rng);
-                let mut child = problem.crossover(first, second, &mut child_rng);
-                problem.mutate(&mut child, &mut child_rng, config.mutation_rate);
-                problem.repair(&mut child, &mut child_rng);
-                child
-            })
-            .collect::<Vec<_>>();
-        next.extend(children);
-        population = next;
     }
-    unreachable!()
 }
 
 fn validate_genetic_config(config: &GeneticAlgorithmConfig) -> Result<()> {
@@ -316,142 +258,15 @@ where
             received: initial.len(),
         });
     }
-    if config.max_iterations == 0
-        || config.history_size == 0
-        || config.gradient_tolerance <= 0.0
-        || config.initial_step <= 0.0
-        || config
-            .time_limit_seconds
-            .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
-    {
-        return Err(OptimizationError::InvalidConfiguration(
-            "positive iteration, history, tolerance, and step values are required".into(),
-        ));
+    let mut state = resumable::LbfgsState::new(initial, config)?;
+    while let Some(point) = state.request() {
+        let mut gradient = vec![0.0; point.len()];
+        let value = objective.value_gradient(point, &mut gradient)?;
+        if let Some(event) = state.submit(value, gradient)? {
+            progress(event);
+        }
     }
-    let started = Instant::now();
-    let mut point = initial.to_vec();
-    let mut gradient = vec![0.0; point.len()];
-    let mut value = objective.value_gradient(&point, &mut gradient)?;
-    let mut values = vec![value];
-    progress(LbfgsProgress {
-        iteration: 0,
-        value,
-        rms_gradient: rms_norm(&gradient),
-        max_gradient: infinity_norm(&gradient),
-        accepted_steps: 0,
-    });
-    let mut s_history: Vec<Vec<f64>> = Vec::new();
-    let mut y_history: Vec<Vec<f64>> = Vec::new();
-    let mut rho_history: Vec<f64> = Vec::new();
-
-    for iteration in 0..config.max_iterations {
-        if config
-            .time_limit_seconds
-            .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
-        {
-            return Ok(LbfgsOutcome {
-                point,
-                value,
-                iterations: iteration,
-                converged: false,
-                history: values,
-            });
-        }
-        if infinity_norm(&gradient) <= config.gradient_tolerance {
-            return Ok(LbfgsOutcome {
-                point,
-                value,
-                iterations: iteration,
-                converged: true,
-                history: values,
-            });
-        }
-        let direction = lbfgs_direction(&gradient, &s_history, &y_history, &rho_history);
-        let slope = dot(&gradient, &direction);
-        let direction = if slope < 0.0 {
-            direction
-        } else {
-            gradient.iter().map(|value| -value).collect()
-        };
-        let slope = dot(&gradient, &direction);
-        let mut step = config.initial_step;
-        let mut candidate = vec![0.0; point.len()];
-        let mut candidate_gradient = vec![0.0; point.len()];
-        let mut line_search_stalled = false;
-        let candidate_value = loop {
-            if config
-                .time_limit_seconds
-                .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
-            {
-                line_search_stalled = true;
-                break value;
-            }
-            for index in 0..point.len() {
-                candidate[index] = point[index] + step * direction[index];
-            }
-            let trial = objective.value_gradient(&candidate, &mut candidate_gradient)?;
-            if trial.is_finite() && trial <= value + config.armijo * step * slope {
-                break trial;
-            }
-            step *= 0.5;
-            if step < 1.0e-12 {
-                line_search_stalled = true;
-                break value;
-            }
-        };
-        // A failed Armijo search cannot produce a new point.  Continuing to
-        // iterate the same coordinates only repeats expensive force-field
-        // evaluations (particularly visible in large glycoproteins), so stop
-        // and return the best point found so far.
-        if line_search_stalled {
-            return Ok(LbfgsOutcome {
-                point,
-                value,
-                iterations: iteration,
-                converged: false,
-                history: values,
-            });
-        }
-        let s = candidate
-            .iter()
-            .zip(&point)
-            .map(|(new, old)| new - old)
-            .collect::<Vec<_>>();
-        let y = candidate_gradient
-            .iter()
-            .zip(&gradient)
-            .map(|(new, old)| new - old)
-            .collect::<Vec<_>>();
-        let curvature = dot(&s, &y);
-        if curvature > 1.0e-12 {
-            if s_history.len() == config.history_size {
-                s_history.remove(0);
-                y_history.remove(0);
-                rho_history.remove(0);
-            }
-            s_history.push(s);
-            y_history.push(y);
-            rho_history.push(1.0 / curvature);
-        }
-        point = candidate;
-        gradient = candidate_gradient;
-        value = candidate_value;
-        values.push(value);
-        progress(LbfgsProgress {
-            iteration: iteration + 1,
-            value,
-            rms_gradient: rms_norm(&gradient),
-            max_gradient: infinity_norm(&gradient),
-            accepted_steps: values.len().saturating_sub(1),
-        });
-    }
-    Ok(LbfgsOutcome {
-        point,
-        value,
-        iterations: config.max_iterations,
-        converged: false,
-        history: values,
-    })
+    Ok(state.outcome().expect("completed L-BFGS state"))
 }
 
 /// A particle seed with immutable application context.
@@ -1047,6 +862,41 @@ mod tests {
 
         fn evaluate(&self, state: &Self::State) -> f64 {
             f64::from((*state - 17).pow(2))
+        }
+    }
+
+    #[test]
+    fn genetic_checkpoint_retries_without_advancing_random_streams() {
+        let config = GeneticAlgorithmConfig {
+            population_size: 16,
+            generations: 8,
+            seed: 71,
+            ..Default::default()
+        };
+        let mut state = genetic_state::GeneticState::new(&IntegerTarget, &config).unwrap();
+        let expected = genetic_optimize(&IntegerTarget, &config).unwrap();
+        while state.outcome().is_none() {
+            let checkpoint = state.clone();
+            assert!(
+                state
+                    .submit(&IntegerTarget, vec![f64::NAN; 16], |_| {}, || false)
+                    .is_err()
+            );
+            assert_eq!(state.population(), checkpoint.population());
+            let scores = state
+                .population()
+                .iter()
+                .map(|s| IntegerTarget.evaluate(s))
+                .collect();
+            state
+                .submit(&IntegerTarget, scores, |_| {}, || false)
+                .unwrap();
+        }
+        let actual = state.outcome().unwrap();
+        assert_eq!(actual.best_state, expected.best_state);
+        for (a, e) in actual.history.iter().zip(expected.history) {
+            assert_eq!(a.best_score, e.best_score);
+            assert_eq!(a.mean_score, e.mean_score);
         }
     }
 

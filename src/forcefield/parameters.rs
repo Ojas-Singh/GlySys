@@ -20,6 +20,8 @@ pub(crate) struct TorsionParameter {
     pub force: f64,
     pub periodicity: i32,
     pub phase_degrees: f64,
+    pub scee: f64,
+    pub scnb: f64,
 }
 
 #[derive(Debug, Default)]
@@ -28,6 +30,7 @@ pub(crate) struct ParameterSet {
     bonds: HashMap<[String; 2], BondParameter>,
     angles: HashMap<[String; 3], AngleParameter>,
     dihedrals: Vec<([String; 4], TorsionParameter)>,
+    pending_dihedral: Option<([String;4],f64,f64)>,
     impropers: Vec<([String; 4], TorsionParameter)>,
     nonbonded: HashMap<String, (f64, f64)>,
     nonbonded_aliases: HashMap<String, String>,
@@ -219,23 +222,20 @@ impl ParameterSet {
                     }
                 }
                 Section::Dihedral => {
-                    if let Some((types, values)) = parse_typed_values(line, 4)
-                        && values.len() >= 4
-                    {
-                        let divider = values[0].abs().max(1.0);
-                        self.dihedrals.push((
-                            [
-                                types[0].clone(),
-                                types[1].clone(),
-                                types[2].clone(),
-                                types[3].clone(),
-                            ],
-                            TorsionParameter {
-                                force: values[1] / divider,
-                                phase_degrees: values[2],
-                                periodicity: values[3].abs().round() as i32,
-                            },
-                        ));
+                    let parsed=parse_typed_values(line,4).or_else(|| {
+                        let (types,_,_)=self.pending_dihedral.as_ref()?;
+                        let values=line.split_whitespace().take_while(|v|v.parse::<f64>().is_ok()).filter_map(|v|v.parse().ok()).collect::<Vec<_>>();
+                        (values.len()>=4).then(||(types.to_vec(),values))
+                    });
+                    if let Some((types,values))=parsed && values.len()>=4 {
+                        let pattern:[String;4]=types.try_into().expect("four torsion types");
+                        let mut reversed=pattern.clone();reversed.reverse();
+                        let continuation=self.pending_dihedral.as_ref().filter(|(p,_,_)|p==&pattern||p==&reversed);
+                        let scee=scaling_annotation(line,"SCEE").unwrap_or(continuation.map_or(1.2,|p|p.1));
+                        let scnb=scaling_annotation(line,"SCNB").unwrap_or(continuation.map_or(2.0,|p|p.2));
+                        if continuation.is_none(){self.dihedrals.retain(|(p,_)|p!=&pattern&&p!=&reversed);}
+                        self.dihedrals.push((pattern.clone(),TorsionParameter{force:values[1]/values[0].abs().max(1.),phase_degrees:values[2],periodicity:values[3].abs().round() as i32,scee,scnb}));
+                        self.pending_dihedral=(values[3]<0.).then_some((pattern,scee,scnb));
                     }
                 }
                 Section::Improper => {
@@ -250,6 +250,8 @@ impl ParameterSet {
                                 types[3].clone(),
                             ],
                             TorsionParameter {
+                                scee: scaling_annotation(line, "SCEE").unwrap_or(1.2),
+                                scnb: scaling_annotation(line, "SCNB").unwrap_or(2.0),
                                 force: values[0],
                                 phase_degrees: values[1],
                                 periodicity: values[2].abs().round() as i32,
@@ -312,6 +314,11 @@ fn parse_typed_values(line: &str, type_count: usize) -> Option<(Vec<String>, Vec
         .filter_map(|value| value.parse().ok())
         .collect::<Vec<_>>();
     Some((types, values))
+}
+
+fn scaling_annotation(line:&str,name:&str)->Option<f64>{
+    let marker=format!("{name}=");let start=line.find(&marker)?+marker.len();
+    line[start..].split_whitespace().next()?.parse::<f64>().ok().filter(|v|v.is_finite()&&*v>0.)
 }
 
 fn parse_nonbond_line(line: &str) -> Option<(String, f64, f64)> {
@@ -397,6 +404,16 @@ pub(crate) fn element_mass(element: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torsion_continuations_scaling_and_override_are_preserved() {
+        let mut p=ParameterSet::default();
+        p.parse_lines(Section::Dihedral,["Cg-Cg-Os-Cg   1 0.3 0.0 -3. SCEE=1.0 SCNB=1.0", "              1 0.2 180.0 2."].into_iter()).unwrap();
+        let t=p.dihedrals(["Cg","Cg","Os","Cg"]).unwrap();
+        assert_eq!(t.len(),2);assert_eq!(t[1].scee,1.);assert_eq!(t[1].scnb,1.);
+        p.parse_lines(Section::Dihedral,["Cg-Cg-Os-Cg   1 0.7 0.0 1. SCEE=1.2 SCNB=2.0"].into_iter()).unwrap();
+        let t=p.dihedrals(["Cg","Cg","Os","Cg"]).unwrap();assert_eq!(t.len(),1);assert_eq!(t[0].force,0.7);assert_eq!(t[0].scee,1.2);
+    }
 
     #[test]
     fn loads_combined_parameter_precedence() {

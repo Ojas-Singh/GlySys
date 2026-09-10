@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "modelVersion": "obc2-baoab-v1",
+  "fixture": "dipeptide",
+  "units": {
+    "position": "angstrom",
+    "velocity": "angstrom/picosecond",
+    "energy": "kcal/mol"
+  },
+  "comparison": "OpenMM Reference with identical exported topology and parameters; custom BAOAB, matched normal variates. This validates dynamics and forces, not independent chemical parameter assignment.",
+  "files": {
+    "dipeptide-baoab.json": "079a1dd525244f47b89ee3ef6c26700e9d62e4627a3e4a24855196a20a8d57c8",
+    "dipeptide-openmm.json": "0acf2ba9334516c9f20c5367a714b49675cc885b2d277a1f48e349347bb69144"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "openmmVersion": "8.1.1",
+  "platform": "Reference",
+  "results": [
+    {
+      "frictionPerPs": 0.0,
+      "coordinateErrorAngstrom": 2.028629708661356e-09,
+      "velocityErrorAngstromPerPs": 2.131387377701799e-07,
+      "potentialEnergyError": -6.777270016300463e-07
+    },
+    {
+      "frictionPerPs": 1.0,
+      "coordinateErrorAngstrom": 2.107615415525288e-09,
+      "velocityErrorAngstromPerPs": 2.0467006622837403e-07,
+      "potentialEnergyError": -6.811672221829213e-07
+    }
+  ]
+}

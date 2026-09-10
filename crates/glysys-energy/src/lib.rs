@@ -1,5 +1,11 @@
 //! Molecular-mechanics energies and gradients for parameterized GlySys systems.
 
+mod obc2;
+pub mod prior;
+pub mod geometry;
+pub mod scoring;
+pub mod hydration;
+
 use std::collections::{BTreeMap, HashMap};
 
 use glysys::{Atom, ParameterizedSystem, Vec3};
@@ -465,10 +471,10 @@ impl<'a> EnergyEvaluator<'a> {
     /// forward automatic differentiation.
     pub fn energy_and_gradient(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
         let components = self.components(coordinates)?;
-        let mut gradients = self.analytic_gradient(coordinates)?;
+        let mut gradients = self.analytic_gradient(coordinates, &[1.0;9])?;
         for (gradient, residual) in gradients
             .iter_mut()
-            .zip(self.residual_gradient(coordinates))
+            .zip(self.residual_gradient(coordinates, &[1.0;9]))
         {
             gradient.x += residual.x;
             gradient.y += residual.y;
@@ -480,7 +486,31 @@ impl<'a> EnergyEvaluator<'a> {
         })
     }
 
-    fn analytic_gradient(&self, coordinates: &[Vec3]) -> Result<Vec<Vec3>> {
+    /// Analytic derivative of an explicitly weighted component sum.
+    pub fn weighted_gradient(&self, coordinates:&[Vec3], weights:[f64;9])->Result<Vec<Vec3>> {
+        if weights.iter().any(|w|!w.is_finite()){return Err(EnergyError::InvalidConfiguration("nonfinite term weight".into()));}
+        let mut gradient=self.analytic_gradient(coordinates,&weights)?;
+        for (g,r) in gradient.iter_mut().zip(self.residual_gradient(coordinates,&weights)){add_scaled(g,r,1.);}
+        Ok(gradient)
+    }
+    pub fn interaction_gradient(&self,coordinates:&[Vec3],first:&AtomGroupMask,second:&AtomGroupMask,weights:[f64;2])->Result<Vec<Vec3>> {
+        self.interaction_energy(coordinates,first,second)?;
+        let mut gradients=vec![Vec3{x:0.,y:0.,z:0.};coordinates.len()];
+        for (a,b) in cross_nonbonded_pairs(coordinates,self.options.cutoff,first,second){
+            let scales=self.one_four.get(&ordered(a,b)).copied();
+            if self.system.exclusions()[a].contains(&b)&&scales.is_none(){continue;}
+            let (scee,scnb)=scales.unwrap_or((1.,1.));let aa=&self.system.atoms()[a];let ab=&self.system.atoms()[b];
+            let delta=subtract(coordinates[a],coordinates[b]);let d=norm(delta).max(1e-8);
+            let epsilon=(aa.lennard_jones_epsilon()*ab.lennard_jones_epsilon()).sqrt();let r6=((aa.lennard_jones_radius()+ab.lennard_jones_radius())/d).powi(6);
+            let coulomb=COULOMB_KCAL_ANGSTROM*aa.charge()*ab.charge()/(self.options.dielectric*scee*d);
+            let factor=(weights[0]*12.*epsilon*(r6-r6*r6)/(scnb*d)-weights[1]*coulomb/d)/d;
+            if self.selection.is_movable(a){add_scaled(&mut gradients[a],delta,factor);}
+            if self.selection.is_movable(b){add_scaled(&mut gradients[b],delta,-factor);}
+        }
+        Ok(gradients)
+    }
+
+    fn analytic_gradient(&self, coordinates: &[Vec3], weights: &[f64;9]) -> Result<Vec<Vec3>> {
         validate_coordinates(self.system.atom_count(), coordinates)?;
         let mut gradient = vec![
             Vec3 {
@@ -500,7 +530,7 @@ impl<'a> EnergyEvaluator<'a> {
             }
             let vector = subtract(coordinates[first], coordinates[second]);
             let radius = norm(vector).max(1.0e-12);
-            let derivative = 2.0 * bond.force() * (radius - bond.length()) / radius;
+            let derivative = weights[0] * 2.0 * bond.force() * (radius - bond.length()) / radius;
             add_scaled(&mut gradient[first], vector, derivative);
             add_scaled(&mut gradient[second], vector, -derivative);
         }
@@ -520,7 +550,7 @@ impl<'a> EnergyEvaluator<'a> {
             let cosine = (dot(left, right) / (left_norm * right_norm)).clamp(-1.0, 1.0);
             let theta = cosine.acos();
             let sine = (1.0 - cosine * cosine).sqrt().max(1.0e-12);
-            let factor = 2.0 * angle.force() * (theta - angle.radians()) / sine;
+            let factor = weights[1] * 2.0 * angle.force() * (theta - angle.radians()) / sine;
             let first_derivative = subtract(
                 scale(left, cosine / (left_norm * left_norm)),
                 scale(right, 1.0 / (left_norm * right_norm)),
@@ -553,14 +583,14 @@ impl<'a> EnergyEvaluator<'a> {
             let coulomb = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
                 / (self.options.dielectric * scee * radius);
             let derivative =
-                12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - coulomb / radius;
+                weights[4] * 12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - weights[5] * coulomb / radius;
             add_scaled(&mut gradient[first], vector, derivative / radius);
             add_scaled(&mut gradient[second], vector, -derivative / radius);
         }
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
                 let vector = subtract(*position, restraint.reference);
-                add_scaled(&mut gradient[restraint.atom], vector, 2.0 * restraint.force);
+                add_scaled(&mut gradient[restraint.atom], vector, weights[8] * 2.0 * restraint.force);
             }
         }
         for (index, value) in gradient.iter_mut().enumerate() {
@@ -575,8 +605,7 @@ impl<'a> EnergyEvaluator<'a> {
         Ok(gradient)
     }
 
-    fn residual_gradient(&self, coordinates: &[Vec3]) -> Vec<Vec3> {
-        let selected = self.selection.indices().collect::<Vec<_>>();
+    fn residual_gradient(&self, coordinates: &[Vec3], weights: &[f64;9]) -> Vec<Vec3> {
         let mut gradients = vec![
             Vec3 {
                 x: 0.0,
@@ -613,7 +642,7 @@ impl<'a> EnergyEvaluator<'a> {
             let argument = phi
                 .scale(torsion.periodicity() as f64)
                 .add_constant(-torsion.phase());
-            let term = argument.cos().add_constant(1.0).scale(torsion.force());
+            let term = argument.cos().add_constant(1.0).scale(torsion.force() * weights[if torsion.is_improper(){3}else{2}]);
             for (local, atom) in atoms.iter().enumerate() {
                 if self.selection.is_movable(*atom) {
                     gradients[*atom].x += term.gradient[local * 3];
@@ -623,29 +652,13 @@ impl<'a> EnergyEvaluator<'a> {
             }
         }
         if let Some(options) = &self.options.obc2 {
-            let dimension = selected.len() * 3;
-            let offsets = selected
-                .iter()
-                .enumerate()
-                .map(|(offset, atom)| (*atom, offset * 3))
-                .collect::<HashMap<_, _>>();
-            let points = coordinates
-                .iter()
-                .enumerate()
-                .map(|(atom, point)| {
-                    let offset = offsets.get(&atom).copied();
-                    DualVec3 {
-                        x: Dual::coordinate(point.x, dimension, offset),
-                        y: Dual::coordinate(point.y, dimension, offset.map(|value| value + 1)),
-                        z: Dual::coordinate(point.z, dimension, offset.map(|value| value + 2)),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let total = dual_obc2(self.system.atoms(), &points, options, dimension);
-            for (offset, atom) in selected.iter().enumerate() {
-                gradients[*atom].x += total.gradient[offset * 3];
-                gradients[*atom].y += total.gradient[offset * 3 + 1];
-                gradients[*atom].z += total.gradient[offset * 3 + 2];
+            if weights[6] == weights[7] {
+                let values=obc2::gradient(self.system.atoms(),coordinates,options);
+                for (i,value) in values.into_iter().enumerate(){if self.selection.is_movable(i){add_scaled(&mut gradients[i],value,weights[6]);}}
+            } else {
+                let mut polar=options.clone();polar.surface_tension=0.;
+                let mut surface=options.clone();surface.solute_dielectric=surface.solvent_dielectric;
+                for (opts,weight) in [(&polar,weights[6]),(&surface,weights[7])] {if weight!=0.{for (i,value) in obc2::gradient(self.system.atoms(),coordinates,opts).into_iter().enumerate(){if self.selection.is_movable(i){add_scaled(&mut gradients[i],value,weight);}}}}
             }
         }
         gradients
@@ -813,6 +826,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn div(self, other: Self) -> Self {
         self.mul(other.reciprocal())
     }
@@ -830,6 +844,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn exp(self) -> Self {
         let value = self.value.exp();
         Self {
@@ -842,6 +857,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn ln(self) -> Self {
         let value = self.value.ln();
         let factor = 1.0 / self.value;
@@ -855,6 +871,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn tanh(self) -> Self {
         let value = self.value.tanh();
         let factor = 1.0 - value * value;
@@ -895,6 +912,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn powi(self, exponent: usize) -> Self {
         if exponent == 0 {
             return Self::constant(1.0, self.gradient.len());
@@ -911,6 +929,7 @@ impl Dual {
         }
     }
 
+    #[cfg(test)]
     fn abs(self) -> Self {
         if self.value < 0.0 {
             self.scale(-1.0)
@@ -981,7 +1000,7 @@ fn dual_cross(first: &DualVec3, second: &DualVec3) -> DualVec3 {
 }
 
 fn dual_dihedral(first: &DualVec3, second: &DualVec3, third: &DualVec3, fourth: &DualVec3) -> Dual {
-    let b0 = dual_subtract(second, first);
+    let b0 = dual_subtract(first, second);
     let b1 = dual_subtract(third, second);
     let b2 = dual_subtract(fourth, third);
     let inverse_norm = dual_dot(&b1, &b1).sqrt().floor(1.0e-30).reciprocal();
@@ -991,11 +1010,13 @@ fn dual_dihedral(first: &DualVec3, second: &DualVec3, third: &DualVec3, fourth: 
     dual_dot(&dual_cross(&normalized, &v), &w).atan2(dual_dot(&v, &w))
 }
 
+#[cfg(test)]
 fn dual_squared_distance(first: &DualVec3, second: &DualVec3) -> Dual {
     let difference = dual_subtract(first, second);
     dual_dot(&difference, &difference)
 }
 
+#[cfg(test)]
 fn dual_obc2(
     atoms: &[Atom],
     coordinates: &[DualVec3],
@@ -1017,7 +1038,7 @@ fn dual_obc2(
             let distance = dual_squared_distance(&coordinates[first], &coordinates[second])
                 .sqrt()
                 .floor(1.0e-8);
-            let scaled = atoms[second].gb_radius() * atoms[second].gb_screen();
+            let scaled = (atoms[second].gb_radius() - OFFSET).max(0.1) * atoms[second].gb_screen();
             if distance.value + scaled <= radius {
                 continue;
             }
@@ -1163,7 +1184,7 @@ fn obc2_born_radii(atoms: &[Atom], coordinates: &[Vec3]) -> Vec<f64> {
                 continue;
             }
             let distance = distance(coordinates[first], coordinates[second]).max(1.0e-8);
-            let scaled = atoms[second].gb_radius() * atoms[second].gb_screen();
+            let scaled = (atoms[second].gb_radius() - OFFSET).max(0.1) * atoms[second].gb_screen();
             if distance + scaled <= radius {
                 continue;
             }
@@ -1373,7 +1394,7 @@ fn angle_value(first: Vec3, center: Vec3, third: Vec3) -> f64 {
 }
 
 fn dihedral(first: Vec3, second: Vec3, third: Vec3, fourth: Vec3) -> f64 {
-    let b0 = subtract(second, first);
+    let b0 = subtract(first, second);
     let b1 = subtract(third, second);
     let b2 = subtract(fourth, third);
     let b1_normalized = scale(b1, 1.0 / norm(b1).max(1.0e-30));
@@ -1436,6 +1457,34 @@ mod tests {
         .unwrap()
         .prepare_pdb_str(DIPEPTIDE)
         .unwrap()
+    }
+
+    #[test]
+    fn analytic_obc2_matches_full_forward_ad() {
+        let system = system();
+        let coordinates = system.coordinates();
+        let n = coordinates.len();
+        let points = coordinates
+            .iter()
+            .enumerate()
+            .map(|(i, p)| DualVec3 {
+                x: Dual::coordinate(p.x, 3 * n, Some(3 * i)),
+                y: Dual::coordinate(p.y, 3 * n, Some(3 * i + 1)),
+                z: Dual::coordinate(p.z, 3 * n, Some(3 * i + 2)),
+            })
+            .collect::<Vec<_>>();
+        let options = Obc2Options::default();
+        let reference = dual_obc2(system.atoms(), &points, &options, 3 * n);
+        let actual = obc2::gradient(system.atoms(), &coordinates, &options);
+        for (i, g) in actual.iter().enumerate() {
+            for (axis, value) in [g.x, g.y, g.z].into_iter().enumerate() {
+                let expected = reference.gradient[3 * i + axis];
+                assert!(
+                    (value - expected).abs() < 1e-8 * (1.0 + expected.abs()),
+                    "atom={i}, axis={axis}, actual={value}, expected={expected}"
+                );
+            }
+        }
     }
 
     #[test]

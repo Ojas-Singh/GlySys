@@ -545,20 +545,18 @@ fn dihedral_records(dihedrals: &[&Dihedral], indices: &HashMap<DihedralKey, usiz
                 dihedral.atoms[0].min(dihedral.atoms[3]),
                 dihedral.atoms[0].max(dihedral.atoms[3]),
             );
-            let third = if dihedral.improper {
-                -((dihedral.atoms[2] * 3) as isize)
-            } else {
-                (dihedral.atoms[2] * 3) as isize
-            };
-            let fourth_value = (dihedral.atoms[3] * 3) as isize;
-            let fourth = if dihedral.improper || !seen_pairs.insert(pair) {
-                -fourth_value
-            } else {
-                fourth_value
-            };
+            // Amber stores signed coordinate indices. Zero cannot carry a
+            // suppression/improper sign and readers require positive third and
+            // fourth indices for a 1–4 interaction. Reversing all four atoms
+            // preserves the dihedral while moving atom zero out of those slots.
+            let mut atoms = dihedral.atoms;
+            if atoms[2] == 0 || atoms[3] == 0 { atoms.reverse(); }
+            let suppress_14 = dihedral.improper || !seen_pairs.insert(pair);
+            let third = (atoms[2] * 3) as isize * if suppress_14 { -1 } else { 1 };
+            let fourth = (atoms[3] * 3) as isize * if dihedral.improper { -1 } else { 1 };
             [
-                (dihedral.atoms[0] * 3) as isize,
-                (dihedral.atoms[1] * 3) as isize,
+                (atoms[0] * 3) as isize,
+                (atoms[1] * 3) as isize,
                 third,
                 fourth,
                 (indices[&(
