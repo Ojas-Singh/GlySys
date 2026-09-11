@@ -1,12 +1,21 @@
-//! Full-energy, nonperiodic dynamics. Distances Å, time ps, energy kcal/mol.
+//! Molecular dynamics: implicit-solvent Langevin plus explicit-water PBC.
+//! Distances Å, time ps, energy kcal/mol.
+pub mod accumulators;
 pub mod analysis;
+pub mod explicit;
+pub mod settle;
 use glysys::{ParameterizedSystem, Vec3};
 use glysys_energy::{EnergyEvaluator, EnergyOptions, Obc2Options};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-const KB: f64 = 0.00198720425864083;
-const ACCEL: f64 = 418.4; // (kcal/mol/Å)/amu -> Å/ps²
+pub(crate) const KB: f64 = 0.00198720425864083;
+pub(crate) const ACCEL: f64 = 418.4; // (kcal/mol/Å)/amu -> Å/ps²
+/// kcal/mol/A^3 per bar, for pressure reporting from the virial.
+pub(crate) const KBAR_PER_KCAL_MOL_A3: f64 = 694_770.0;
 pub const MODEL_VERSION: &str = "obc2-baoab-v1";
+/// Explicit-water PBC model: TIP3P, cutoff plus reaction field, velocity
+/// Verlet NVE / BAOAB NVT / Monte Carlo barostat NPT, SETTLE waters.
+pub const EXPLICIT_MODEL_VERSION: &str = "tip3p-rf-md-v1";
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid simulation: {0}")]
@@ -17,6 +26,62 @@ pub enum Error {
     Optimization(#[from] glysys_opt::OptimizationError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+/// Solvent treatment for a run. `implicit` is the original OBC2 path and
+/// stays byte-for-byte compatible; `explicit` requires a solvated preparation
+/// with a periodic box and runs the PBC engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SolventModel {
+    #[default]
+    Implicit,
+    Explicit,
+}
+
+/// Ensemble per simulation segment. NVE exists so force, constraint, PBC,
+/// and neighbor-list errors show up as energy drift instead of hiding behind
+/// a thermostat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ensemble {
+    Nve,
+    #[default]
+    Nvt,
+    Npt,
+}
+
+/// Rigid-water treatment. `none` integrates flexible waters at small
+/// timesteps; `settle` constrains O-H and H-H distances.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstraintModel {
+    #[default]
+    None,
+    Settle,
+}
+
+/// Thermostat for explicit NVT/NPT segments. Langevin matches OpenMM's
+/// LangevinMiddle ordering for parity runs; v-rescale enforces the target
+/// temperature exactly and is the production default with constraints.
+/// (An earlier revision blamed OU equilibration on RATTLE deleting
+/// kick-supplied radial velocity; the actual defect was systematic
+/// rotational damping from RATTLE projection, since replaced by
+/// rotation-based water handling in the settle module.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Thermostat {
+    Langevin,
+    #[default]
+    VRescale,
+}
+
+fn default_pressure_bar() -> f64 {
+    1.0
+}
+
+fn default_barostat_interval() -> usize {
+    25
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SimulationProtocol {
@@ -29,6 +94,28 @@ pub struct SimulationProtocol {
     pub minimization_iterations: usize,
     #[serde(with="u64_string")]
     pub seed: u64,
+    /// Solvent treatment. Defaults to the original implicit behavior.
+    pub solvent: SolventModel,
+    /// Ensemble for the equilibration and production segments.
+    pub equilibration_ensemble: Ensemble,
+    pub production_ensemble: Ensemble,
+    /// Target pressure for NPT segments, in bar.
+    #[serde(default = "default_pressure_bar")]
+    pub pressure_bar: f64,
+    /// Water constraints for explicit runs.
+    pub constraints: ConstraintModel,
+    /// Thermostat for explicit NVT/NPT segments.
+    pub thermostat: Thermostat,
+    /// Nonbonded cutoff in angstrom for explicit runs (9-10 recommended).
+    pub cutoff_angstrom: Option<f64>,
+    /// Reaction-field solvent dielectric for explicit runs.
+    pub rf_dielectric: Option<f64>,
+    /// Monte Carlo barostat attempt interval in steps.
+    #[serde(default = "default_barostat_interval")]
+    pub barostat_interval: usize,
+    /// Harmonic solute restraint strength in kcal/mol/A^2 (0 disables).
+    #[serde(default)]
+    pub restraint_force: f64,
 }
 impl Default for SimulationProtocol {
     fn default() -> Self {
@@ -41,6 +128,16 @@ impl Default for SimulationProtocol {
             save_every: 100,
             minimization_iterations: 500,
             seed: 0,
+            solvent: SolventModel::Implicit,
+            equilibration_ensemble: Ensemble::Nvt,
+            production_ensemble: Ensemble::Nvt,
+            pressure_bar: 1.0,
+            constraints: ConstraintModel::None,
+            thermostat: Thermostat::VRescale,
+            cutoff_angstrom: None,
+            rf_dielectric: None,
+            barostat_interval: 25,
+            restraint_force: 0.0,
         }
     }
 }
@@ -60,6 +157,22 @@ pub struct SimulationState {
     #[serde(with = "u64_string")]
     pub rng_state: u64,
     pub integrator_phase: String,
+    /// Periodic box in angstrom; zeros for the nonperiodic implicit path.
+    #[serde(default)]
+    pub box_angstrom: [f64; 3],
+    /// `sum(r_unwrapped . F)` in kcal/mol; feeds pressure reporting.
+    #[serde(default)]
+    pub virial_kcal_mol: f64,
+    /// Instantaneous pressure in bar from kinetic plus virial terms.
+    #[serde(default)]
+    pub pressure_bar: f64,
+    /// Independent Monte Carlo barostat stream; thermostat noise keeps the
+    /// main `rng_state` reproducible across barostat schedule changes.
+    #[serde(default)]
+    pub barostat_rng: u64,
+    /// On-the-fly water occupancy grid over production frames, if enabled.
+    #[serde(default)]
+    pub water_occupancy: Option<accumulators::WaterOccupancy>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +184,15 @@ pub struct TrajectoryFrame {
     pub kinetic_energy: f64,
     pub temperature_k: f64,
     pub coordinates: Vec<Vec3>,
+    /// Periodic box at this frame; zeros for implicit runs.
+    #[serde(default)]
+    pub box_angstrom: [f64; 3],
+    /// Instantaneous pressure in bar; zero for non-NPT segments.
+    #[serde(default)]
+    pub pressure_bar: f64,
+    /// System density in g/mL; zero for implicit runs.
+    #[serde(default)]
+    pub density_g_ml: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,8 +224,21 @@ mod u64_string {
         }
     }
 }
-fn invalid(s: &str) -> Error {
+pub(crate) fn invalid(s: impl Into<String>) -> Error {
     Error::Invalid(s.into())
+}
+
+pub(crate) fn uniform(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut x = *state;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    ((x >> 11) as f64 + 0.5) / 9007199254740992.
+}
+
+pub(crate) fn normal(state: &mut u64) -> f64 {
+    (-2. * uniform(state).ln()).sqrt() * (std::f64::consts::TAU * uniform(state)).cos()
 }
 fn add(a: Vec3, b: Vec3) -> Vec3 {
     Vec3 {
@@ -124,17 +259,6 @@ fn norm2(a: Vec3) -> f64 {
 }
 fn finite(a: &Vec3) -> bool {
     a.x.is_finite() && a.y.is_finite() && a.z.is_finite()
-}
-fn uniform(state: &mut u64) -> f64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut x = *state;
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^= x >> 31;
-    ((x >> 11) as f64 + 0.5) / 9007199254740992.
-}
-fn normal(state: &mut u64) -> f64 {
-    (-2. * uniform(state).ln()).sqrt() * (std::f64::consts::TAU * uniform(state)).cos()
 }
 /// Advance the same RNG stream as CPU BAOAB, packing independent normal triples.
 pub fn normal_noise(state: &mut u64, count: usize) -> Vec<[f32; 4]> {
@@ -168,7 +292,7 @@ impl SimulationProtocol {
             || self.temperature_k <= 0.
             || !self.timestep_fs.is_finite()
             || self.timestep_fs <= 0.
-            || self.timestep_fs > 0.5
+            || self.timestep_fs > 2.0
             || !self.friction_per_ps.is_finite()
             || self.friction_per_ps < 0.
             || self.save_every == 0
@@ -177,9 +301,16 @@ impl SimulationProtocol {
                 .equilibration_steps
                 .checked_add(self.production_steps)
                 .is_none_or(|s| s > 10_000_000)
+            || !self.pressure_bar.is_finite()
+            || self.pressure_bar < 0.
+            || self.barostat_interval == 0
+            || !self.restraint_force.is_finite()
+            || self.restraint_force < 0.
+            || self.cutoff_angstrom.is_some_and(|c| !c.is_finite() || c <= 0.)
+            || self.rf_dielectric.is_some_and(|d| !d.is_finite() || d < 1.)
         {
             return Err(invalid(
-                "positive temperature, timestep ≤0.5 fs, finite friction and bounded step counts required",
+                "positive temperature, timestep ≤2 fs, finite friction/pressure/restraints and bounded step counts required",
             ));
         }
         Ok(())
@@ -333,6 +464,11 @@ impl<'a> CpuSimulation<'a> {
             potential_energy,
             rng_state: rng,
             integrator_phase: "ready".into(),
+            box_angstrom: [0., 0., 0.],
+            virial_kcal_mol: 0.,
+            pressure_bar: 0.,
+            barostat_rng: 0,
+            water_occupancy: None,
         };
         Ok(Self {
             evaluator,
@@ -441,6 +577,9 @@ pub fn frame_from_state(state: &SimulationState, masses: &[f64]) -> TrajectoryFr
         kinetic_energy,
         temperature_k: 2. * kinetic_energy / (3. * masses.len() as f64 * KB),
         coordinates: state.coordinates.clone(),
+        box_angstrom: state.box_angstrom,
+        pressure_bar: state.pressure_bar,
+        density_g_ml: 0.,
     }
 }
 #[cfg(test)]
@@ -476,6 +615,11 @@ mod tests {
             potential_energy: 0.005,
             rng_state: 0,
             integrator_phase: "ready".into(),
+            box_angstrom: [0., 0., 0.],
+            virial_kcal_mol: 0.,
+            pressure_bar: 0.,
+            barostat_rng: 0,
+            water_occupancy: None,
         }
     }
     #[test]

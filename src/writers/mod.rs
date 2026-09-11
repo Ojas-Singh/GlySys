@@ -31,6 +31,14 @@ fn element_symbol(atomic_number: u8) -> &'static str {
 /// Serialize a fully parameterized (possibly solvated) system as PDB text.
 pub(crate) fn write_pdb_system(system: &System) -> String {
     let mut output = String::new();
+    if system.box_angstrom.iter().all(|length| *length > 0.0) {
+        // Orthorhombic periodic box for solvated systems; zeros mean
+        // nonperiodic, in which case no record is written.
+        output.push_str(&format!(
+            "CRYST1{:>9.3}{:>9.3}{:>9.3}  90.00  90.00  90.00 P 1           1\n",
+            system.box_angstrom[0], system.box_angstrom[1], system.box_angstrom[2],
+        ));
+    }
     let mut serial = 0;
     let addresses = pdb_residue_addresses(system);
     for (index, residue) in system.residues.iter().enumerate() {

@@ -5,6 +5,7 @@ pub mod prior;
 pub mod geometry;
 pub mod scoring;
 pub mod hydration;
+pub mod pbc;
 
 use std::collections::{BTreeMap, HashMap};
 
