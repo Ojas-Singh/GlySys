@@ -1,10 +1,11 @@
 //! Resident, bounded rigid-water probe batches. No atom-pair matrices.
-use crate::device::{BUFFER_BUDGET, Error};
+use crate::context::{AllocationReservation, GpuContext};
+use crate::device::Error;
 use glysys::Vec3;
 use glysys_energy::hydration::{PhysicalProbe, ProbeScore, WaterPose};
 use wgpu::util::DeviceExt;
 pub struct ResidentWaterProbe {
-    _instance: wgpu::Instance,
+    pub(crate) _context: GpuContext,
     device: wgpu::Device,
     queue: wgpu::Queue,
     buffers: Vec<wgpu::Buffer>,
@@ -14,24 +15,19 @@ pub struct ResidentWaterProbe {
     origin: Vec3,
     atoms: u32,
     pub capacity: usize,
+    _allocation: AllocationReservation,
 }
 impl ResidentWaterProbe {
-    pub async fn new(probe: &PhysicalProbe, requested: usize) -> Result<Self, Error> {
+    pub async fn with_context(
+        context: &GpuContext,
+        probe: &PhysicalProbe,
+        requested: usize,
+    ) -> Result<Self, Error> {
         if probe.atoms.is_empty() || requested == 0 {
             return Err(Error::Input("empty water-probe batch"));
         }
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&Default::default())
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("GlySys water probes"),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
+        let device = context.device().clone();
+        let queue = context.queue().clone();
         let origin = probe.atoms[0].position;
         let data: Vec<[f32; 8]> = probe
             .atoms
@@ -54,16 +50,24 @@ impl ResidentWaterProbe {
         let limit = limits
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size as u64);
-        if fixed >= BUFFER_BUDGET || fixed > limit {
+        let budget = context.memory_profile().budget();
+        if fixed > budget || fixed > limit {
             return Err(Error::Capacity);
         }
         let capacity = requested
-            .min(((BUFFER_BUDGET - fixed - 16) / 80) as usize)
+            .min(((budget.saturating_sub(fixed).saturating_sub(16)) / 80) as usize)
             .min((limit / 48) as usize)
             .min(limits.max_compute_workgroups_per_dimension as usize);
         if capacity == 0 {
             return Err(Error::Capacity);
         }
+        let reservation = context.reserve(
+            fixed
+                .checked_add(capacity as u64 * 48)
+                .and_then(|v| v.checked_add(capacity as u64 * 16))
+                .and_then(|v| v.checked_add(capacity as u64 * 16))
+                .ok_or(Error::Capacity)?,
+        )?;
         device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let buffer = |size, usage| {
@@ -149,6 +153,7 @@ impl ResidentWaterProbe {
             compilation_options: Default::default(),
             cache: None,
         });
+        context.record_pipeline("hydration.evaluate");
         let validation = device.pop_error_scope().await;
         let allocation = device.pop_error_scope().await;
         if let Some(e) = validation {
@@ -158,7 +163,7 @@ impl ResidentWaterProbe {
             return Err(Error::Capacity);
         }
         Ok(Self {
-            _instance: instance,
+            _context: context.clone(),
             device,
             queue,
             buffers,
@@ -168,6 +173,7 @@ impl ResidentWaterProbe {
             origin,
             atoms: data.len() as u32,
             capacity,
+            _allocation: reservation,
         })
     }
     pub async fn evaluate(

@@ -1,27 +1,12 @@
 //! Rigid three-site water constraints.
 //!
-//! The position solve iterates the three distance constraints (two O-H, one
-//! H-H) to 1e-12 angstrom. For MD-scale displacements this is the same
-//! solution analytic SETTLE produces, and the OpenMM parity harness — not the
-//! algorithm name — is the acceptance gate.
-//!
-//! Water *velocities* are handled the analytic-SETTLE way: each water's
-//! velocities are rotated by the same rigid rotation its positions underwent
-//! over the step, instead of projecting out bond-parallel components
-//! (RATTLE). Projection deletes the mismatch between the velocity direction
-//! and the rotating bond frame every step, which systematically damps
-//! molecular rotation — measurably, a force-free rotor loses most of its
-//! kinetic energy within picoseconds, and solvated NVT stalls far below
-//! target temperature. Rotation is an isometry about the molecular center of
-//! mass: it preserves kinetic energy and linear momentum exactly, keeps
-//! tangential velocities tangential to the new geometry, and cannot
-//! systematically drain energy because kinetic energy then changes only
-//! through conservative force kicks. Solute X-H bonds keep iterative
-//! RATTLE (their rotation is slow, so projection loss is negligible), as
-//! does one-time Maxwell-velocity initialization, which has no prior frame
-//! to rotate from. All loops use fixed iteration caps with residual checks,
-//! so results are deterministic and failures are explicit instead of
-//! silently loose.
+//! Analytic SETTLE positions are coupled to RATTLE velocity corrections.
+//! The position solve returns its coordinate correction, and the matching
+//! half-step velocity is reconstructed from the constrained displacement.
+//! Waters never use a frame-rotation heuristic. Solute X-H bonds use the
+//! general iterative SHAKE/RATTLE solver, as does one-time projection of
+//! initialized Maxwell velocities. All loops have bounded iterations and
+//! explicit residual failures.
 use super::{Error, Result};
 use glysys::Vec3;
 
@@ -34,6 +19,22 @@ fn sub(a: Vec3, b: Vec3) -> Vec3 {
         x: a.x - b.x,
         y: a.y - b.y,
         z: a.z - b.z,
+    }
+}
+
+fn add(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3 {
+        x: a.x + b.x,
+        y: a.y + b.y,
+        z: a.z + b.z,
+    }
+}
+
+fn scale(a: Vec3, s: f64) -> Vec3 {
+    Vec3 {
+        x: a.x * s,
+        y: a.y * s,
+        z: a.z * s,
     }
 }
 
@@ -61,43 +62,279 @@ fn norm(v: Vec3) -> Option<Vec3> {
     })
 }
 
-/// Orthonormal frame of a water triangle: e1 along O→H1, e3 along the
-/// triangle normal, e2 completing the right-handed system. Returns the
-/// basis vectors as (x, y, z) triples. Both the pre-step and post-SHAKE
-/// geometries are exactly rigid (constrained to 1e-10 A or better), so the
-/// frames are always well defined for physical H-O-H angles.
-fn water_frame(o: Vec3, h1: Vec3, h2: Vec3) -> Option<[[f64; 3]; 3]> {
-    let e1 = norm(sub(h1, o))?;
-    let e3 = norm(cross(sub(h1, o), sub(h2, o)))?;
-    let e2v = cross(e3, e1);
-    let (e1a, e2a, e3a) = (
-        [e1.x, e1.y, e1.z],
-        [e2v.x, e2v.y, e2v.z],
-        [e3.x, e3.y, e3.z],
+/// Analytic SETTLE solve for one isosceles water (Miyamoto & Kollman 1992,
+/// J. Comput. Chem. 13:952). The solve is relative to the old constrained
+/// triangle and returns both constrained coordinates and the coordinate
+/// correction. The latter is required by RATTLE: the matching velocity
+/// correction is `v += dx / dt`.
+///
+/// This is the canonical formulation intended for both CPU and WGSL. It has a
+/// fixed flop count, no convergence branch, and no history-dependent iteration
+/// path. It requires equal hydrogen masses, a non-degenerate old triangle, and
+/// an MD-scale unconstrained displacement.
+pub fn settle_triangle(
+    old_o: Vec3,
+    old_h1: Vec3,
+    old_h2: Vec3,
+    qo: Vec3,
+    q1: Vec3,
+    q2: Vec3,
+    mo: f64,
+    m1: f64,
+    m2: f64,
+    doh: f64,
+    dhh: f64,
+) -> Result<([Vec3; 3], [Vec3; 3])> {
+    // This is a direct translation of OpenMM's ReferenceSETTLEAlgorithm.
+    // Keeping the displacement variables explicit is important: the old
+    // triangle supplies the reference frame while the predicted coordinates
+    // supply the center-of-mass displacement and orientation.
+    let total = mo + m1 + m2;
+    if !total.is_finite() || total <= 0. || !mo.is_finite() || !m1.is_finite() || !m2.is_finite() {
+        return Err(invalid("water masses must be finite and positive"));
+    }
+    if !(doh.is_finite() && dhh.is_finite() && doh > 0.3 && doh < 3.0 && dhh > 0.3 && dhh < 3.0) {
+        return Err(invalid("unphysical water equilibrium length"));
+    }
+    let rc = 0.5 * dhh;
+    let rb0_sq = doh * doh - rc * rc;
+    if !(rb0_sq > 1e-20) {
+        return Err(invalid("H-H target incompatible with O-H target"));
+    }
+
+    let xb0 = old_h1.x - old_o.x;
+    let yb0 = old_h1.y - old_o.y;
+    let zb0 = old_h1.z - old_o.z;
+    let xc0 = old_h2.x - old_o.x;
+    let yc0 = old_h2.y - old_o.y;
+    let zc0 = old_h2.z - old_o.z;
+    let xp0 = sub(qo, old_o);
+    let xp1 = sub(q1, old_h1);
+    let xp2 = sub(q2, old_h2);
+    let inv_total = 1.0 / total;
+    let xcom = (xp0.x * mo + (xb0 + xp1.x) * m1 + (xc0 + xp2.x) * m2) * inv_total;
+    let ycom = (xp0.y * mo + (yb0 + xp1.y) * m1 + (yc0 + xp2.y) * m2) * inv_total;
+    let zcom = (xp0.z * mo + (zb0 + xp1.z) * m1 + (zc0 + xp2.z) * m2) * inv_total;
+
+    let xa1 = xp0.x - xcom;
+    let ya1 = xp0.y - ycom;
+    let za1 = xp0.z - zcom;
+    let xb1 = xb0 + xp1.x - xcom;
+    let yb1 = yb0 + xp1.y - ycom;
+    let zb1 = zb0 + xp1.z - zcom;
+    let xc1 = xc0 + xp2.x - xcom;
+    let yc1 = yc0 + xp2.y - ycom;
+    let zc1 = zc0 + xp2.z - zcom;
+
+    // Old-water normal, followed by the mass-weighted COM axis. These three
+    // cross products are the SETTLE reference frame; no best-fit rotation is
+    // involved.
+    let zaks = Vec3 {
+        x: yb0 * zc0 - zb0 * yc0,
+        y: zb0 * xc0 - xb0 * zc0,
+        z: xb0 * yc0 - yb0 * xc0,
+    };
+    let xaks = cross(
+        Vec3 {
+            x: xa1,
+            y: ya1,
+            z: za1,
+        },
+        zaks,
     );
-    Some([e1a, e2a, e3a])
+    let yaks = cross(zaks, xaks);
+    let ax = norm(xaks).ok_or_else(|| invalid("degenerate old water triangle"))?;
+    let ay = norm(yaks).ok_or_else(|| invalid("degenerate old water triangle"))?;
+    let az = norm(zaks).ok_or_else(|| invalid("degenerate old water triangle"))?;
+    let project = |v: Vec3| (dot(ax, v), dot(ay, v), dot(az, v));
+    let (xb0d, yb0d, _) = project(Vec3 {
+        x: xb0,
+        y: yb0,
+        z: zb0,
+    });
+    let (xc0d, yc0d, _) = project(Vec3 {
+        x: xc0,
+        y: yc0,
+        z: zc0,
+    });
+    let (_, _, za1d) = project(Vec3 {
+        x: xa1,
+        y: ya1,
+        z: za1,
+    });
+    let (xb1d, yb1d, zb1d) = project(Vec3 {
+        x: xb1,
+        y: yb1,
+        z: zb1,
+    });
+    let (xc1d, yc1d, zc1d) = project(Vec3 {
+        x: xc1,
+        y: yc1,
+        z: zc1,
+    });
+
+    let rb = rb0_sq.sqrt();
+    let ra = rb * (m1 + m2) * inv_total;
+    let rb = rb - ra;
+    let sinphi = za1d / ra;
+    let cosphi2 = 1.0 - sinphi * sinphi;
+    if !(cosphi2 > 1e-14) {
+        return Err(invalid("water displacement leaves the SETTLE branch (phi)"));
+    }
+    let cosphi = cosphi2.sqrt();
+    let sinpsi = (zb1d - zc1d) / (2.0 * rc * cosphi);
+    let cospsi2 = 1.0 - sinpsi * sinpsi;
+    if !(cospsi2 > 1e-14) {
+        return Err(invalid("water displacement leaves the SETTLE branch (psi)"));
+    }
+    let cospsi = cospsi2.sqrt();
+    let ya2d = ra * cosphi;
+    let mut xb2d = -rc * cospsi;
+    let yb2d = -rb * cosphi - rc * sinpsi * sinphi;
+    let yc2d = -rb * cosphi + rc * sinpsi * sinphi;
+    // The H-H quadratic correction is essential. Omitting it gives a
+    // plausible-looking triangle but introduces a systematic O(dt^2)
+    // irreversibility and was the source of the Phase-0 drift.
+    let hh2 = 4.0 * xb2d * xb2d + (yb2d - yc2d) * (yb2d - yc2d) + (zb1d - zc1d) * (zb1d - zc1d);
+    let root = 4.0 * xb2d * xb2d - hh2 + dhh * dhh;
+    if !(root >= -1e-12) {
+        return Err(invalid("water displacement leaves the SETTLE branch (H-H)"));
+    }
+    let deltx = 2.0 * xb2d + root.max(0.0).sqrt();
+    xb2d -= 0.5 * deltx;
+
+    let alpha = xb2d * (xb0d - xc0d) + yb0d * yb2d + yc0d * yc2d;
+    let beta = xb2d * (yc0d - yb0d) + xb0d * yb2d + xc0d * yc2d;
+    let gamma = xb0d * yb1d - xb1d * yb0d + xc0d * yc1d - xc1d * yc0d;
+    let ab2 = alpha * alpha + beta * beta;
+    let theta_root = ab2 - gamma * gamma;
+    if !(ab2 > 1e-24 && theta_root >= -1e-12) {
+        return Err(invalid(
+            "water displacement leaves the SETTLE branch (theta)",
+        ));
+    }
+    let sintheta = (alpha * gamma - beta * theta_root.max(0.0).sqrt()) / ab2;
+    let costheta2 = 1.0 - sintheta * sintheta;
+    if !(costheta2 > 1e-14) {
+        return Err(invalid(
+            "water displacement leaves the SETTLE branch (theta)",
+        ));
+    }
+    let costheta = costheta2.sqrt();
+    let xa3d = Vec3 {
+        x: -ya2d * sintheta,
+        y: ya2d * costheta,
+        z: za1d,
+    };
+    let xb3d = Vec3 {
+        x: xb2d * costheta - yb2d * sintheta,
+        y: xb2d * sintheta + yb2d * costheta,
+        z: zb1d,
+    };
+    let xc3d = Vec3 {
+        x: -xb2d * costheta - yc2d * sintheta,
+        y: -xb2d * sintheta + yc2d * costheta,
+        z: zc1d,
+    };
+    let inverse = |v: Vec3| add(add(scale(ax, v.x), scale(ay, v.y)), scale(az, v.z));
+    let xa3 = inverse(xa3d);
+    let xb3 = inverse(xb3d);
+    let xc3 = inverse(xc3d);
+    let correction_o = sub(
+        xa3,
+        Vec3 {
+            x: xa1,
+            y: ya1,
+            z: za1,
+        },
+    );
+    let correction_h1 = sub(
+        xb3,
+        Vec3 {
+            x: xb1,
+            y: yb1,
+            z: zb1,
+        },
+    );
+    let correction_h2 = sub(
+        xc3,
+        Vec3 {
+            x: xc1,
+            y: yc1,
+            z: zc1,
+        },
+    );
+    Ok((
+        [
+            add(qo, correction_o),
+            add(q1, correction_h1),
+            add(q2, correction_h2),
+        ],
+        [correction_o, correction_h1, correction_h2],
+    ))
 }
 
-/// Rotation taking the `old` frame to the `new` frame: R[a][b] =
-/// sum_i new_i[a] * old_i[b]. Maps old bond directions onto new ones.
-fn frame_rotation(old: [[f64; 3]; 3], new: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut r = [[0.; 3]; 3];
-    for i in 0..3 {
-        for a in 0..3 {
-            for b in 0..3 {
-                r[a][b] += new[i][a] * old[i][b];
-            }
-        }
+/// Analytic SETTLE/RATTLE velocity projection for one water triangle. This is
+/// OpenMM's general three-mass velocity solve, expressed in the same vector
+/// convention as [`settle_triangle`]. It removes all bond-parallel relative
+/// velocities while preserving the mass-weighted center-of-mass velocity.
+pub fn settle_velocity_triangle(
+    coords: [Vec3; 3],
+    velocities: &mut [Vec3; 3],
+    masses: [f64; 3],
+) -> Result<f64> {
+    let [a, b, c] = coords;
+    let [mut va, mut vb, mut vc] = *velocities;
+    let [ma, mb, mc] = masses;
+    if !ma.is_finite() || !mb.is_finite() || !mc.is_finite() || ma <= 0. || mb <= 0. || mc <= 0. {
+        return Err(invalid("water masses must be finite and positive"));
     }
-    r
-}
-
-fn apply_rotation(r: [[f64; 3]; 3], v: Vec3) -> Vec3 {
-    Vec3 {
-        x: r[0][0] * v.x + r[0][1] * v.y + r[0][2] * v.z,
-        y: r[1][0] * v.x + r[1][1] * v.y + r[1][2] * v.z,
-        z: r[2][0] * v.x + r[2][1] * v.y + r[2][2] * v.z,
+    let unit = |v: Vec3| norm(v).ok_or_else(|| invalid("degenerate water triangle"));
+    let eab = unit(sub(b, a))?;
+    let ebc = unit(sub(c, b))?;
+    let eca = unit(sub(a, c))?;
+    let vab = dot(sub(vb, va), eab);
+    let vbc = dot(sub(vc, vb), ebc);
+    let vca = dot(sub(va, vc), eca);
+    let ca = -dot(eab, eca);
+    let cb = -dot(eab, ebc);
+    let cc = -dot(ebc, eca);
+    let s2a = (1.0 - ca * ca).max(0.0);
+    let s2b = (1.0 - cb * cb).max(0.0);
+    let s2c = (1.0 - cc * cc).max(0.0);
+    let mabc_inv = 1.0 / (ma * mb * mc);
+    let denom = (((s2a * mb + s2b * ma) * mc
+        + (s2a * mb * mb + 2.0 * (ca * cb * cc + 1.0) * ma * mb + s2b * ma * ma))
+        * mc
+        + s2c * ma * mb * (ma + mb))
+        * mabc_inv;
+    if !(denom.is_finite() && denom > 1e-18) {
+        return Err(invalid("singular SETTLE velocity system"));
     }
+    let tab = ((cb * cc * ma - ca * mb - ca * mc) * vca
+        + (ca * cc * mb - cb * mc - cb * ma) * vbc
+        + (s2c * ma * ma * mb * mb * mabc_inv + (ma + mb + mc)) * vab)
+        / denom;
+    let tbc = ((ca * cb * mc - cc * mb - cc * ma) * vca
+        + (s2a * mb * mb * mc * mc * mabc_inv + (ma + mb + mc)) * vbc
+        + (ca * cc * mb - cb * ma - cb * mc) * vab)
+        / denom;
+    let tca = ((s2b * ma * ma * mc * mc * mabc_inv + (ma + mb + mc)) * vca
+        + (ca * cb * mc - cc * mb - cc * ma) * vbc
+        + (cb * cc * ma - ca * mb - ca * mc) * vab)
+        / denom;
+    va = add(va, scale(sub(scale(eab, tab), scale(eca, tca)), 1.0 / ma));
+    vb = add(vb, scale(sub(scale(ebc, tbc), scale(eab, tab)), 1.0 / mb));
+    vc = add(vc, scale(sub(scale(eca, tca), scale(ebc, tbc)), 1.0 / mc));
+    *velocities = [va, vb, vc];
+    let residual = [
+        dot(sub(vb, va), sub(b, a)).abs(),
+        dot(sub(vc, vb), sub(c, b)).abs(),
+        dot(sub(va, vc), sub(a, c)).abs(),
+    ]
+    .into_iter()
+    .fold(0.0, f64::max);
+    Ok(residual)
 }
 
 /// General iterative bond solver shared by the CPU and GPU paths. Each entry
@@ -191,6 +428,13 @@ pub fn rattle_velocities(
 pub struct SettleWaters {
     /// Flat O/H/H triples, matching `classify_waters` order.
     pub waters: Vec<[usize; 3]>,
+    /// Per-water analytic-SETTLE geometry `(doh, dhh, isosceles)`, parallel
+    /// to `waters`. Non-isosceles waters (never from TIP3P equilibrium
+    /// targets) use the explicit iterative fallback in
+    /// [`Self::rigid_water_positions`].
+    water_geom: Vec<(f64, f64, bool)>,
+    /// Per-water masses in O/H1/H2 order for the analytic velocity solve.
+    water_masses: Vec<[f64; 3]>,
     constraints: Vec<(usize, usize, f64, f64, f64)>,
     /// Solute X-H bonds constrained alongside the waters, if any.
     solute_bonds: Vec<(usize, usize, f64, f64, f64)>,
@@ -201,11 +445,7 @@ impl SettleWaters {
     /// Targets measured from `coords` (the historical behavior). Prefer
     /// [`Self::from_equilibrium`] for dynamics: measuring targets on a
     /// strained snapshot pins strain into the manifold and pumps energy.
-    pub fn new(
-        waters: Vec<[usize; 3]>,
-        coords: &[Vec3],
-        masses: &[f64],
-    ) -> Result<Self> {
+    pub fn new(waters: Vec<[usize; 3]>, coords: &[Vec3], masses: &[f64]) -> Result<Self> {
         Self::with_solute_bonds(waters, Vec::new(), coords, masses)
     }
 
@@ -223,8 +463,20 @@ impl SettleWaters {
             return Err(invalid("water target count mismatch"));
         }
         let mut constraints = Vec::with_capacity(waters.len() * 3);
+        let mut water_geom = Vec::with_capacity(waters.len());
+        let mut water_masses = Vec::with_capacity(waters.len());
         for (w, &(oh1, oh2, hh)) in waters.iter().zip(&water) {
             let [o, h1, h2] = *w;
+            // Analytic SETTLE requires an isosceles triangle; TIP3P
+            // equilibrium targets satisfy this exactly. Reject anything else
+            // explicitly rather than solving the wrong triangle.
+            if (oh1 - oh2).abs() > 1e-9 {
+                return Err(invalid(
+                    "non-isosceles water target; analytic SETTLE needs oh1 == oh2",
+                ));
+            }
+            water_geom.push((0.5 * (oh1 + oh2), hh, true));
+            water_masses.push([masses[o], masses[h1], masses[h2]]);
             for (a, b, target) in [(o, h1, oh1), (o, h2, oh2), (h1, h2, hh)] {
                 if a >= atom_count || b >= atom_count || a >= masses.len() || b >= masses.len() {
                     return Err(invalid("water index out of range"));
@@ -253,6 +505,8 @@ impl SettleWaters {
         }
         Ok(Self {
             waters,
+            water_geom,
+            water_masses,
             constraints,
             solute_bonds: solute_constraints,
             tolerance: 1e-10,
@@ -281,7 +535,19 @@ impl SettleWaters {
             solute.push((a, b, target, 1. / masses[a], 1. / masses[b]));
         }
         let mut constraints = Vec::with_capacity(waters.len() * 3);
+        let mut water_geom = Vec::with_capacity(waters.len());
+        let mut water_masses = Vec::with_capacity(waters.len());
         for &[o, h1, h2] in &waters {
+            let measured = |a: usize, b: usize| {
+                let d = sub(coords[a], coords[b]);
+                dot(d, d).sqrt()
+            };
+            let (moh1, moh2, mhh) = (measured(o, h1), measured(o, h2), measured(h1, h2));
+            water_geom.push((0.5 * (moh1 + moh2), mhh, (moh1 - moh2).abs() <= 1e-6));
+            if o >= masses.len() || h1 >= masses.len() || h2 >= masses.len() {
+                return Err(invalid("water index out of range"));
+            }
+            water_masses.push([masses[o], masses[h1], masses[h2]]);
             for (a, b) in [(o, h1), (o, h2), (h1, h2)] {
                 if a >= coords.len() || b >= coords.len() || a >= masses.len() || b >= masses.len()
                 {
@@ -302,6 +568,8 @@ impl SettleWaters {
         }
         Ok(Self {
             waters,
+            water_geom,
+            water_masses,
             constraints,
             solute_bonds: solute,
             tolerance: 1e-10,
@@ -332,17 +600,22 @@ impl SettleWaters {
         shake_positions(coords, &self.solute_bonds, 1e-8, 200)
     }
 
-    /// Rigid-body position update for waters (analytic-SETTLE-style position
-    /// half): each water translates by its drifted center of mass and rotates
-    /// by the best-fit rotation from its old frame to its drifted frame.
-    /// `drifted` holds the ordinary unconstrained drift
+    /// Rigid-body position update for waters: analytic SETTLE per water
+    /// ([`settle_triangle`]). `drifted` holds the ordinary unconstrained drift
     /// (`old + v_half * dt`) for every atom; water entries are overwritten
-    /// with the rigid motion, solute entries are left for the caller to
-    /// SHAKE. Unlike drift-plus-SHAKE-pullback, the triangle never distorts,
-    /// so no bond-strain energy appears and disappears each step (that
-    /// strain slosh, pumped by kicks, is what explodes or — under RATTLE
-    /// deletion — drains). A water whose drifted frame cannot be built falls
-    /// back to SHAKE plus RATTLE for that water only.
+    /// with the exact rigid solution, solute entries are left for the caller
+    /// to SHAKE. The center of mass comes from the drift (it carries the kick
+    /// impulse exactly); orientation comes from the analytic construction in
+    /// the drifted triangle's plane. Unlike fitting a rotation between the
+    /// old and drifted frames, this map depends only on the unconstrained
+    /// triple: it is time-symmetric up to rounding and introduces no
+    /// O(dt^2) deformation-contaminated rotation error (Phase-0 diagnosis:
+    /// the frame fit accumulated ~3e-4 A/step/water of systematic
+    /// irreversibility even with zero forces; the analytic SETTLE
+    /// reversibility regression test covers this case).
+    /// Non-isosceles waters take an explicit iterative SHAKE projection from
+    /// the drifted positions (nearest-manifold, likewise symmetric); this
+    /// path never triggers for TIP3P equilibrium targets.
     pub fn rigid_water_positions(
         &self,
         old_coords: &[Vec3],
@@ -350,86 +623,181 @@ impl SettleWaters {
         coords: &mut [Vec3],
         masses: &[f64],
     ) -> Result<()> {
-        for &[o, h1, h2] in &self.waters {
-            let (Some(old_frame), Some(drift_frame)) = (
-                water_frame(old_coords[o], old_coords[h1], old_coords[h2]),
-                water_frame(drifted[o], drifted[h1], drifted[h2]),
-            ) else {
-                // Degenerate drifted triangle: project positions and
-                // velocities iteratively for this water only.
+        self.settle_positions(old_coords, drifted, coords, masses)
+    }
+
+    /// Apply the analytic SETTLE position solve to every isosceles water.
+    /// `old_coords` must satisfy the target geometry and `drifted` contains
+    /// the unconstrained post-drift coordinates. The solve preserves the
+    /// mass-weighted center-of-mass displacement and applies the exact
+    /// three-distance projection used by OpenMM.
+    pub fn settle_positions(
+        &self,
+        old_coords: &[Vec3],
+        drifted: &[Vec3],
+        coords: &mut [Vec3],
+        masses: &[f64],
+    ) -> Result<()> {
+        for (w, &(doh, dhh, iso)) in self.waters.iter().zip(&self.water_geom) {
+            let &[o, h1, h2] = w;
+            if iso {
+                let (corrected, _) = settle_triangle(
+                    old_coords[o],
+                    old_coords[h1],
+                    old_coords[h2],
+                    drifted[o],
+                    drifted[h1],
+                    drifted[h2],
+                    masses[o],
+                    masses[h1],
+                    masses[h2],
+                    doh,
+                    dhh,
+                )?;
+                [coords[o], coords[h1], coords[h2]] = corrected;
+            } else {
+                // This path is retained only for legacy/non-TIP3P callers.
+                // Supported TIP3P dynamics always takes the fixed-flop
+                // analytic branch above.
                 coords[o] = drifted[o];
                 coords[h1] = drifted[h1];
                 coords[h2] = drifted[h2];
-                shake_positions(coords, &self.water_constraints(o, h1, h2), self.tolerance, 200)?;
-                continue;
-            };
-            let rot = frame_rotation(old_frame, drift_frame);
-            let mtriple = masses[o] + masses[h1] + masses[h2];
-            if !mtriple.is_finite() || mtriple <= 0. {
-                return Err(invalid("water masses must be positive"));
+                shake_positions(
+                    coords,
+                    &self.water_constraints(o, h1, h2),
+                    self.tolerance,
+                    200,
+                )?;
             }
-            let old_com = Vec3 {
-                x: (masses[o] * old_coords[o].x
-                    + masses[h1] * old_coords[h1].x
-                    + masses[h2] * old_coords[h2].x)
-                    / mtriple,
-                y: (masses[o] * old_coords[o].y
-                    + masses[h1] * old_coords[h1].y
-                    + masses[h2] * old_coords[h2].y)
-                    / mtriple,
-                z: (masses[o] * old_coords[o].z
-                    + masses[h1] * old_coords[h1].z
-                    + masses[h2] * old_coords[h2].z)
-                    / mtriple,
-            };
-            // Center-of-mass motion comes from the drift (it carries the
-            // kick impulse); orientation comes from the best-fit rotation.
-            // Using the drifted COM keeps translation exact.
-            let new_com = Vec3 {
-                x: (masses[o] * drifted[o].x
-                    + masses[h1] * drifted[h1].x
-                    + masses[h2] * drifted[h2].x)
-                    / mtriple,
-                y: (masses[o] * drifted[o].y
-                    + masses[h1] * drifted[h1].y
-                    + masses[h2] * drifted[h2].y)
-                    / mtriple,
-                z: (masses[o] * drifted[o].z
-                    + masses[h1] * drifted[h1].z
-                    + masses[h2] * drifted[h2].z)
-                    / mtriple,
-            };
-            for &i in &[o, h1, h2] {
-                let rel = sub(old_coords[i], old_com);
-                let turned = apply_rotation(rot, rel);
-                coords[i] = Vec3 {
-                    x: turned.x + new_com.x,
-                    y: turned.y + new_com.y,
-                    z: turned.z + new_com.z,
-                };
-            }
+        }
+        let worst = self.max_violation(coords);
+        if !worst.is_finite() || worst > 1e-8 {
+            return Err(invalid(format!(
+                "rigid-water position residual {worst:.3e} A exceeds 1e-8"
+            )));
         }
         Ok(())
     }
 
-    /// Full RATTLE projection (waters and solute). One-time use only:
-    /// projecting the initial Maxwell velocities onto the constraint
-    /// manifold. Per-step velocity handling must use
-    /// [`Self::rotate_water_velocities`] plus
-    /// [`Self::project_solute_velocities`]: repeated projection
-    /// systematically damps molecular rotation, while rotation preserves it.
-    pub fn constrain_velocities(&self, coords: &[Vec3], velocities: &mut [Vec3]) -> Result<f64> {
-        let worst = rattle_velocities(coords, velocities, &self.constraints, 1e-8, 200)?;
-        if !self.solute_bonds.is_empty() {
-            rattle_velocities(coords, velocities, &self.solute_bonds, 1e-6, 200)?;
+    /// Compatibility helper that applies SETTLE positions and, when a
+    /// velocity slice is supplied, reconstructs the matching RATTLE
+    /// half-step velocity from the constrained displacement. This is the
+    /// operation used by a constrained velocity-Verlet drift: the position
+    /// constraint impulse is `dx/dt`, so retaining the unconstrained half-step
+    /// velocity would omit that impulse and produce secular energy drift.
+    /// New integrator code should call [`Self::settle_positions`] after the
+    /// drift and [`Self::constrain_velocities`] after the final kick. The
+    /// `inverse_dt` is the inverse drift interval in ps.
+    pub fn settle_positions_and_velocities(
+        &self,
+        old_coords: &[Vec3],
+        drifted: &[Vec3],
+        coords: &mut [Vec3],
+        mut velocities: Option<&mut [Vec3]>,
+        masses: &[f64],
+        inverse_dt: f64,
+    ) -> Result<()> {
+        self.settle_positions(old_coords, drifted, coords, masses)?;
+        if let Some(velocities) = velocities.as_deref_mut() {
+            if !inverse_dt.is_finite() || inverse_dt <= 0. {
+                return Err(invalid("SETTLE velocity projection requires dt > 0"));
+            }
+            self.velocity_from_displacement(old_coords, coords, velocities, inverse_dt)?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct velocities after a constrained position drift. The
+    /// constrained displacement is the RATTLE position impulse divided by the
+    /// drift interval. Replacing the trial velocities with this quotient is
+    /// the canonical velocity-Verlet update used by the OpenMM reference
+    /// integrator; it also leaves unconstrained atoms unchanged up to roundoff.
+    pub fn velocity_from_displacement(
+        &self,
+        old_coords: &[Vec3],
+        constrained_coords: &[Vec3],
+        velocities: &mut [Vec3],
+        inverse_dt: f64,
+    ) -> Result<f64> {
+        if old_coords.len() != constrained_coords.len() || velocities.len() != old_coords.len() {
+            return Err(invalid("RATTLE displacement length mismatch"));
+        }
+        if !inverse_dt.is_finite() || inverse_dt <= 0. {
+            return Err(invalid("RATTLE displacement requires dt > 0"));
+        }
+        // Only constrained atoms receive the position-constraint impulse.
+        // Unconstrained solute atoms must retain the velocity produced by the
+        // force kick and drift.  Reconstructing every velocity here silently
+        // removed those atoms' dynamics and was a major source of distorted
+        // NVE/NVT behavior in mixed solute/water systems.
+        let mut constrained_atoms = vec![false; old_coords.len()];
+        for &[o, h1, h2] in &self.waters {
+            constrained_atoms[o] = true;
+            constrained_atoms[h1] = true;
+            constrained_atoms[h2] = true;
+        }
+        for &(a, b, _, _, _) in &self.solute_bonds {
+            constrained_atoms[a] = true;
+            constrained_atoms[b] = true;
+        }
+        let mut worst: f64 = 0.0;
+        for (index, ((old, constrained), velocity)) in old_coords
+            .iter()
+            .zip(constrained_coords)
+            .zip(velocities.iter_mut())
+            .enumerate()
+        {
+            if !constrained_atoms[index] {
+                continue;
+            }
+            let updated = scale(sub(*constrained, *old), inverse_dt);
+            let delta = sub(updated, *velocity);
+            worst = worst.max(dot(delta, delta).sqrt());
+            *velocity = updated;
         }
         Ok(worst)
     }
 
-    /// RATTLE projection for solute X-H bonds only. Their rotation is slow,
-    /// so per-step projection loss is negligible, and unlike waters they do
-    /// not move as rigid bodies (the solute deforms), which makes frame
-    /// rotation inapplicable.
+    /// Full RATTLE projection (waters and solute), used to initialize
+    /// Maxwell velocities and after force kicks. Waters use the closed-form
+    /// SETTLE velocity solve; solute X-H bonds use the bounded general solver.
+    pub fn constrain_velocities(&self, coords: &[Vec3], velocities: &mut [Vec3]) -> Result<f64> {
+        let mut worst: f64 = 0.0;
+        for (index, (w, &(_, _, iso))) in self.waters.iter().zip(&self.water_geom).enumerate() {
+            let &[o, h1, h2] = w;
+            if iso {
+                let mut vv = [velocities[o], velocities[h1], velocities[h2]];
+                worst = worst.max(settle_velocity_triangle(
+                    [coords[o], coords[h1], coords[h2]],
+                    &mut vv,
+                    self.water_masses[index],
+                )?);
+                velocities[o] = vv[0];
+                velocities[h1] = vv[1];
+                velocities[h2] = vv[2];
+            } else {
+                worst = worst.max(rattle_velocities(
+                    coords,
+                    velocities,
+                    &self.water_constraints(o, h1, h2),
+                    1e-8,
+                    200,
+                )?);
+            }
+        }
+        if !self.solute_bonds.is_empty() {
+            worst = worst.max(rattle_velocities(
+                coords,
+                velocities,
+                &self.solute_bonds,
+                1e-6,
+                200,
+            )?);
+        }
+        Ok(worst)
+    }
+
+    /// RATTLE projection for solute X-H bonds only.
     pub fn project_solute_velocities(
         &self,
         coords: &[Vec3],
@@ -441,81 +809,14 @@ impl SettleWaters {
         rattle_velocities(coords, velocities, &self.solute_bonds, 1e-6, 200)
     }
 
-    /// SETTLE-style velocity update for waters: rotate each water's
-    /// velocities about its center of mass by the rigid rotation its
-    /// positions underwent between `old_coords` (start of step, constrained)
-    /// and `coords` (post-SHAKE, constrained). Both frames are exactly
-    /// rigid, so the rotation is well defined; it preserves kinetic energy
-    /// and center-of-mass velocity exactly and keeps tangential velocities
-    /// tangential to the new geometry. `masses` supplies atomic masses for
-    /// the center-of-mass velocity. A water whose frame cannot be built
-    /// (degenerate triangle, treated as a failure of the position solve)
-    /// falls back to RATTLE projection for that water only.
-    pub fn rotate_water_velocities(
+    /// The three distance constraints of one water, used by the explicit
+    /// non-isosceles fallback.
+    fn water_constraints(
         &self,
-        old_coords: &[Vec3],
-        coords: &[Vec3],
-        velocities: &mut [Vec3],
-        masses: &[f64],
-    ) -> Result<f64> {
-        let mut fallback = 0f64;
-        for &[o, h1, h2] in &self.waters {
-            let Some(old_frame) = water_frame(old_coords[o], old_coords[h1], old_coords[h2])
-            else {
-                fallback = fallback.max(rattle_velocities(
-                    coords,
-                    velocities,
-                    &self.water_constraints(o, h1, h2),
-                    1e-8,
-                    200,
-                )?);
-                continue;
-            };
-            let Some(new_frame) = water_frame(coords[o], coords[h1], coords[h2]) else {
-                fallback = fallback.max(rattle_velocities(
-                    coords,
-                    velocities,
-                    &self.water_constraints(o, h1, h2),
-                    1e-8,
-                    200,
-                )?);
-                continue;
-            };
-            let rot = frame_rotation(old_frame, new_frame);
-            let mtriple = masses[o] + masses[h1] + masses[h2];
-            if !mtriple.is_finite() || mtriple <= 0. {
-                return Err(invalid("water masses must be positive"));
-            }
-            let com_v = Vec3 {
-                x: (masses[o] * velocities[o].x
-                    + masses[h1] * velocities[h1].x
-                    + masses[h2] * velocities[h2].x)
-                    / mtriple,
-                y: (masses[o] * velocities[o].y
-                    + masses[h1] * velocities[h1].y
-                    + masses[h2] * velocities[h2].y)
-                    / mtriple,
-                z: (masses[o] * velocities[o].z
-                    + masses[h1] * velocities[h1].z
-                    + masses[h2] * velocities[h2].z)
-                    / mtriple,
-            };
-            for &i in &[o, h1, h2] {
-                let rel = sub(velocities[i], com_v);
-                let turned = apply_rotation(rot, rel);
-                velocities[i] = Vec3 {
-                    x: turned.x + com_v.x,
-                    y: turned.y + com_v.y,
-                    z: turned.z + com_v.z,
-                };
-            }
-        }
-        Ok(fallback)
-    }
-
-    /// The three distance constraints of one water, for the degenerate-frame
-    /// RATTLE fallback in [`Self::rotate_water_velocities`].
-    fn water_constraints(&self, o: usize, h1: usize, h2: usize) -> Vec<(usize, usize, f64, f64, f64)> {
+        o: usize,
+        h1: usize,
+        h2: usize,
+    ) -> Vec<(usize, usize, f64, f64, f64)> {
         self.constraints
             .iter()
             .filter(|&&(a, b, _, _, _)| {
@@ -534,6 +835,20 @@ impl SettleWaters {
             })
             .fold(0., f64::max)
     }
+
+    /// Maximum velocity-constraint residual `|(v_a-v_b)·r_hat|` in A/ps.
+    /// This is a diagnostic only; the integrator uses the analytic water
+    /// solve and bounded RATTLE projection directly.
+    pub fn max_velocity_violation(&self, coords: &[Vec3], velocities: &[Vec3]) -> f64 {
+        self.constraints
+            .iter()
+            .filter_map(|&(a, b, _, _, _)| {
+                let d = sub(coords[a], coords[b]);
+                let r = dot(d, d).sqrt();
+                (r > 1e-14).then(|| dot(sub(velocities[a], velocities[b]), d).abs() / r)
+            })
+            .fold(0., f64::max)
+    }
 }
 
 #[cfg(test)]
@@ -544,8 +859,16 @@ mod tests {
     const ANGLE: f64 = 104.52;
 
     fn tip3p() -> (Vec<Vec3>, Vec<f64>) {
-        let o = Vec3 { x: 0., y: 0., z: 0. };
-        let h1 = Vec3 { x: OH, y: 0., z: 0. };
+        let o = Vec3 {
+            x: 0.,
+            y: 0.,
+            z: 0.,
+        };
+        let h1 = Vec3 {
+            x: OH,
+            y: 0.,
+            z: 0.,
+        };
         let h2 = Vec3 {
             x: OH * (ANGLE.to_radians()).cos(),
             y: OH * (ANGLE.to_radians()).sin(),
@@ -568,47 +891,81 @@ mod tests {
         assert!(settle.max_violation(&coords) < 1e-9);
     }
 
-    /// Frame rotation must recover a known analytic rotation exactly (not
-    /// just preserve norms): the dynamics is only right if velocities rotate
-    /// *with* the body.
+    /// The canonical SETTLE map is reversible for a force-free rigid water.
     #[test]
-    fn frame_rotation_recovers_known_rotation() {
-        let (coords, _) = tip3p();
-        let (o, h1, h2) = (coords[0], coords[1], coords[2]);
-        let old = water_frame(o, h1, h2).unwrap();
-        // 37 degrees about (0.3, 0.8, 0.5).
-        let axis = Vec3 { x: 0.3, y: 0.8, z: 0.5 };
-        let an = dot(axis, axis).sqrt();
-        let (ux, uy, uz) = (axis.x / an, axis.y / an, axis.z / an);
-        let th = 37f64.to_radians();
-        let (c, s) = (th.cos(), th.sin());
-        let q = [
-            [c + ux * ux * (1. - c), ux * uy * (1. - c) - uz * s, ux * uz * (1. - c) + uy * s],
-            [uy * ux * (1. - c) + uz * s, c + uy * uy * (1. - c), uy * uz * (1. - c) - ux * s],
-            [uz * ux * (1. - c) - uy * s, uz * uy * (1. - c) + ux * s, c + uz * uz * (1. - c)],
+    fn analytic_settle_operator_reverses() {
+        let (coords, masses) = tip3p();
+        let targets = vec![(OH, OH, 2. * OH * (ANGLE.to_radians() / 2.).sin())];
+        let settle =
+            SettleWaters::from_equilibrium(vec![[0, 1, 2]], targets, vec![], &masses, 3).unwrap();
+        let mut velocities = vec![
+            Vec3 {
+                x: 12.,
+                y: -7.,
+                z: 4.,
+            },
+            Vec3 {
+                x: -9.,
+                y: 14.,
+                z: -6.,
+            },
+            Vec3 {
+                x: 5.,
+                y: 3.,
+                z: -11.,
+            },
         ];
-        let app = |p: Vec3| Vec3 {
-            x: q[0][0] * p.x + q[0][1] * p.y + q[0][2] * p.z,
-            y: q[1][0] * p.x + q[1][1] * p.y + q[1][2] * p.z,
-            z: q[2][0] * p.x + q[2][1] * p.y + q[2][2] * p.z,
-        };
-        let new = water_frame(app(o), app(h1), app(h2)).unwrap();
-        let r = frame_rotation(old, new);
-        for a in 0..3 {
-            for b in 0..3 {
-                assert!((r[a][b] - q[a][b]).abs() < 1e-12, "R[{a}][{b}] mismatch");
+        settle
+            .constrain_velocities(&coords, &mut velocities)
+            .unwrap();
+        let mut forward = coords.clone();
+        let dt = 0.002;
+        let step = |coords: &mut Vec<Vec3>, velocities: &mut Vec<Vec3>| {
+            let old = coords.clone();
+            let mut drifted = old.clone();
+            for (atom, velocity) in drifted.iter_mut().zip(velocities.iter()) {
+                *atom = add(
+                    *atom,
+                    Vec3 {
+                        x: velocity.x * dt,
+                        y: velocity.y * dt,
+                        z: velocity.z * dt,
+                    },
+                );
             }
+            settle
+                .settle_positions_and_velocities(
+                    &old,
+                    &drifted,
+                    coords,
+                    Some(velocities),
+                    &masses,
+                    1. / dt,
+                )
+                .unwrap();
+        };
+        for _ in 0..50 {
+            step(&mut forward, &mut velocities);
         }
-        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
-            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
-            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
-        assert!((det - 1.).abs() < 1e-12, "rotation must be proper, det={det}");
+        velocities.iter_mut().for_each(|v| {
+            *v = Vec3 {
+                x: -v.x,
+                y: -v.y,
+                z: -v.z,
+            }
+        });
+        for _ in 0..50 {
+            step(&mut forward, &mut velocities);
+        }
+        for (ended, started) in forward.iter().zip(coords.iter()) {
+            let delta = sub(*ended, *started);
+            assert!(dot(delta, delta).sqrt() < 1e-10);
+        }
+        assert!(settle.max_violation(&forward) < 1e-10);
     }
 
-    /// Rigid position update plus velocity rotation must conserve a spinning
-    /// water exactly (force-free): kinetic energy, center of mass, and
-    /// geometry. Iterative RATTLE projection instead drains rotation
-    /// measurably, which is why per-step velocity handling rotates.
+    /// Rigid position and velocity updates conserve a force-free spinning
+    /// water in kinetic energy, center-of-mass motion, and geometry.
     #[test]
     fn rigid_update_conserves_spinning_water() {
         let (coords, masses) = tip3p();
@@ -619,8 +976,10 @@ mod tests {
         // Rigid spin about z through the COM plus translation.
         let mtriple: f64 = masses.iter().sum();
         let com = Vec3 {
-            x: (masses[0] * coords[0].x + masses[1] * coords[1].x + masses[2] * coords[2].x) / mtriple,
-            y: (masses[0] * coords[0].y + masses[1] * coords[1].y + masses[2] * coords[2].y) / mtriple,
+            x: (masses[0] * coords[0].x + masses[1] * coords[1].x + masses[2] * coords[2].x)
+                / mtriple,
+            y: (masses[0] * coords[0].y + masses[1] * coords[1].y + masses[2] * coords[2].y)
+                / mtriple,
             z: 0.,
         };
         let w = 8.0;
@@ -654,13 +1013,18 @@ mod tests {
                 };
             }
             settle
-                .rigid_water_positions(&old, &drifted, &mut coords, &masses)
+                .settle_positions_and_velocities(
+                    &old,
+                    &drifted,
+                    &mut coords,
+                    Some(&mut vel),
+                    &masses,
+                    1. / dt,
+                )
                 .unwrap();
-            settle
-                .rotate_water_velocities(&old, &coords, &mut vel, &masses)
-                .unwrap();
+            settle.constrain_velocities(&coords, &mut vel).unwrap();
         }
-        assert!((kinetic(&vel) - e0).abs() < 1e-9, "rotation must preserve K");
+        assert!((kinetic(&vel) - e0).abs() < 1e-9, "SETTLE must preserve K");
         assert!(settle.max_violation(&coords) < 1e-9);
     }
 
@@ -669,11 +1033,25 @@ mod tests {
         let (coords, masses) = tip3p();
         let settle = SettleWaters::new(vec![[0, 1, 2]], &coords, &masses).unwrap();
         let mut velocities = vec![
-            Vec3 { x: 5., y: -3., z: 2. },
-            Vec3 { x: -4., y: 6., z: 1. },
-            Vec3 { x: 1., y: 1., z: -7. },
+            Vec3 {
+                x: 5.,
+                y: -3.,
+                z: 2.,
+            },
+            Vec3 {
+                x: -4.,
+                y: 6.,
+                z: 1.,
+            },
+            Vec3 {
+                x: 1.,
+                y: 1.,
+                z: -7.,
+            },
         ];
-        settle.constrain_velocities(&coords, &mut velocities).unwrap();
+        settle
+            .constrain_velocities(&coords, &mut velocities)
+            .unwrap();
         // Bond-parallel relative velocities must vanish; total momentum kept.
         for (a, b) in [(0, 1), (0, 2), (1, 2)] {
             let d = sub(coords[a], coords[b]);
@@ -681,5 +1059,39 @@ mod tests {
             let rel = sub(velocities[a], velocities[b]);
             assert!((rel.x * d.x + rel.y * d.y + rel.z * d.z).abs() / r < 1e-7);
         }
+    }
+
+    #[test]
+    fn displacement_velocity_reconstruction_leaves_free_atoms_untouched() {
+        let (water, water_masses) = tip3p();
+        let mut old = water.clone();
+        old.push(Vec3 {
+            x: 4.,
+            y: -2.,
+            z: 1.,
+        });
+        let mut drifted = old.clone();
+        drifted[0].x += 0.01;
+        drifted[1].x += 0.01;
+        drifted[2].x += 0.01;
+        drifted[3].x += 0.25;
+        let mut corrected = drifted.clone();
+        let mut masses = water_masses;
+        masses.push(12.);
+        let settle = SettleWaters::new(vec![[0, 1, 2]], &old, &masses).unwrap();
+        settle
+            .settle_positions(&old, &drifted, &mut corrected, &masses)
+            .unwrap();
+        let free_before = Vec3 {
+            x: 7.,
+            y: 8.,
+            z: 9.,
+        };
+        let mut velocities = vec![free_before; 4];
+        settle
+            .velocity_from_displacement(&old, &corrected, &mut velocities, 500.)
+            .unwrap();
+        assert_eq!(velocities[3], free_before);
+        assert!(settle.max_velocity_violation(&corrected, &velocities) < 1e-8);
     }
 }

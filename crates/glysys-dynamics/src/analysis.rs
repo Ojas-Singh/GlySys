@@ -36,6 +36,95 @@ pub struct FrameAnalysis {
     pub aligned_heavy_atom_rmsd: Option<f64>,
     pub torsion_degrees: Vec<Option<f64>>,
 }
+
+/// Geometry-only input for an analysis worker; no force field or simulation
+/// needs to be reconstructed from the displayed PDB.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisDefinition {
+    pub schema_version: u32,
+    pub atom_count: usize,
+    pub rmsd_atoms: Vec<usize>,
+    pub rmsd_reference: Vec<Vec3>,
+    pub torsions: Vec<TorsionDefinition>,
+}
+impl AnalysisDefinition {
+    pub fn from_system(
+        system: &ParameterizedSystem,
+        reference: &[Vec3],
+        torsions: &[TorsionDefinition],
+    ) -> crate::Result<Self> {
+        if reference.len() != system.atom_count() {
+            return Err(crate::invalid("analysis reference atom count"));
+        }
+        let rmsd_atoms: Vec<_> = system
+            .atoms()
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.element() != 1)
+            .map(|(i, _)| i)
+            .collect();
+        let rmsd_reference = rmsd_atoms.iter().map(|&i| reference[i]).collect();
+        Ok(Self {
+            schema_version: 1,
+            atom_count: system.atom_count(),
+            rmsd_atoms,
+            rmsd_reference,
+            torsions: torsions.to_vec(),
+        })
+    }
+}
+
+pub struct PreparedAnalysis {
+    definition: AnalysisDefinition,
+    moving: Vec<Vec3>,
+}
+impl PreparedAnalysis {
+    pub fn new(definition: AnalysisDefinition) -> crate::Result<Self> {
+        if definition.schema_version != 1
+            || definition.rmsd_atoms.len() != definition.rmsd_reference.len()
+            || definition
+                .rmsd_atoms
+                .iter()
+                .chain(definition.torsions.iter().flat_map(|t| &t.atoms))
+                .any(|&i| i >= definition.atom_count)
+            || definition
+                .rmsd_reference
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
+        {
+            return Err(crate::invalid("invalid analysis definition"));
+        }
+        Ok(Self {
+            moving: Vec::with_capacity(definition.rmsd_atoms.len()),
+            definition,
+        })
+    }
+    pub fn analyze_flat(&mut self, coordinates: &[f64]) -> crate::Result<FrameAnalysis> {
+        if coordinates.len() != self.definition.atom_count * 3
+            || coordinates.iter().any(|x| !x.is_finite())
+        {
+            return Err(crate::invalid("invalid analysis coordinates"));
+        }
+        let point = |i: usize| Vec3 {
+            x: coordinates[3 * i],
+            y: coordinates[3 * i + 1],
+            z: coordinates[3 * i + 2],
+        };
+        self.moving.clear();
+        self.moving
+            .extend(self.definition.rmsd_atoms.iter().map(|&i| point(i)));
+        Ok(FrameAnalysis {
+            aligned_heavy_atom_rmsd: aligned_rmsd(&self.definition.rmsd_reference, &self.moving),
+            torsion_degrees: self
+                .definition
+                .torsions
+                .iter()
+                .map(|t| torsion(t.atoms.map(point)))
+                .collect(),
+        })
+    }
+}
 /// Maximum-eigenvalue quaternion superposition; translation and rotation removed.
 pub fn aligned_rmsd(a: &[Vec3], b: &[Vec3]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() {
@@ -203,6 +292,66 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_analysis_matches_geometry_and_rejects_invalid_frames() {
+        let points = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+            },
+            Vec3 {
+                x: 1.,
+                y: 0.,
+                z: 0.,
+            },
+            Vec3 {
+                x: 1.,
+                y: 1.,
+                z: 0.,
+            },
+            Vec3 {
+                x: 2.,
+                y: 1.,
+                z: 1.,
+            },
+        ];
+        let definition = AnalysisDefinition {
+            schema_version: 1,
+            atom_count: 4,
+            rmsd_atoms: vec![0, 1, 2, 3],
+            rmsd_reference: points.clone(),
+            torsions: vec![TorsionDefinition {
+                label: "test".into(),
+                atoms: [0, 1, 2, 3],
+            }],
+        };
+        let encoded = serde_json::to_string(&definition).unwrap();
+        let mut worker = PreparedAnalysis::new(serde_json::from_str(&encoded).unwrap()).unwrap();
+        let moved: Vec<_> = points
+            .iter()
+            .map(|p| Vec3 {
+                x: 8. - p.y,
+                y: p.x + 4.,
+                z: p.z - 2.,
+            })
+            .collect();
+        let flat: Vec<_> = moved.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        let result = worker.analyze_flat(&flat).unwrap();
+        assert!(result.aligned_heavy_atom_rmsd.unwrap() < 1e-6);
+        assert!(
+            (result.torsion_degrees[0].unwrap() - torsion(points.try_into().unwrap()).unwrap())
+                .abs()
+                < 1e-10
+        );
+        assert!(worker.analyze_flat(&flat[..9]).is_err());
+        let mut invalid = flat;
+        invalid[2] = f64::NAN;
+        assert!(worker.analyze_flat(&invalid).is_err());
+        let mut invalid_definition = definition;
+        invalid_definition.torsions[0].atoms[3] = 4;
+        assert!(PreparedAnalysis::new(invalid_definition).is_err());
+    }
     #[test]
     fn rmsd_removes_rigid_motion() {
         let p = [

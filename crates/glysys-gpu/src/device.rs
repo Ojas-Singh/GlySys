@@ -1,8 +1,65 @@
 //! Worker-owned resident compute resources. This module never starts Rayon work.
+use crate::context::{AllocationReservation, GpuContext};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-pub const BUFFER_BUDGET: u64 = 256 * 1024 * 1024;
+/// The historical browser budget. It remains available as an explicit
+/// low-memory preset for constrained devices, but is no longer imposed on
+/// every adapter.
+pub const LOW_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+/// Compatibility alias for callers that still request the old low-memory
+/// profile explicitly.
+pub const BUFFER_BUDGET: u64 = LOW_MEMORY_BUDGET;
+/// Adaptive mode has no invented global ceiling. Allocation is still bounded
+/// by the adapter's legal buffer limits and by the actual resources required
+/// by the requested workload; OOM is handled by the existing batch fallback.
+pub const ADAPTIVE_MEMORY_BUDGET: u64 = u64::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryProfile {
+    /// Allocate the requested workload subject to device limits.
+    Adaptive,
+    /// Preserve the old 256 MiB ceiling for low-memory devices or tests.
+    LowMemory,
+    /// Caller-supplied aggregate allocation budget.
+    Explicit(u64),
+}
+
+impl Default for MemoryProfile {
+    fn default() -> Self {
+        Self::Adaptive
+    }
+}
+
+impl MemoryProfile {
+    pub const fn budget(self) -> u64 {
+        match self {
+            Self::Adaptive => ADAPTIVE_MEMORY_BUDGET,
+            Self::LowMemory => LOW_MEMORY_BUDGET,
+            Self::Explicit(bytes) => bytes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_profile_is_not_limited_to_legacy_cap() {
+        assert_eq!(MemoryProfile::LowMemory.budget(), LOW_MEMORY_BUDGET);
+        assert_eq!(MemoryProfile::Adaptive.budget(), ADAPTIVE_MEMORY_BUDGET);
+        assert!(MemoryProfile::Adaptive.budget() > LOW_MEMORY_BUDGET);
+    }
+
+    #[test]
+    fn explicit_profile_preserves_requested_budget() {
+        assert_eq!(
+            MemoryProfile::Explicit(768 * 1024 * 1024).budget(),
+            768 * 1024 * 1024
+        );
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Atom {
@@ -46,6 +103,17 @@ pub enum Error {
     #[error("GPU returned nonfinite values")]
     Nonfinite,
 }
+
+/// Prefer the fastest adapter exposed by the platform. This is a selection
+/// hint; callers still record the chosen adapter and handle capacity/device
+/// loss explicitly.
+pub fn high_performance_adapter_options() -> wgpu::RequestAdapterOptions<'static, 'static> {
+    wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }
+}
 /// Packed immutable topology. Coordinates and restraint references must share a centered origin.
 #[derive(Clone, Copy)]
 pub struct Topology<'a> {
@@ -56,10 +124,10 @@ pub struct Topology<'a> {
 }
 /// A single owner serializes dispatches and reuses all device and readback buffers.
 pub struct ResidentEvaluator {
-    // Keep the browser GPU instance alive for every pending map/dispatch.
-    _instance: wgpu::Instance,
-    _adapter: wgpu::Adapter,
     pub adapter_info: wgpu::AdapterInfo,
+    /// Handles cloned from the coordinator-owned context. No adapter or
+    /// device is created by this workload.
+    pub(crate) _context: GpuContext,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) buffers: Vec<wgpu::Buffer>,
@@ -68,6 +136,7 @@ pub struct ResidentEvaluator {
     pub(crate) staging: wgpu::Buffer,
     pub(crate) atoms: u32,
     capacity: u32,
+    _allocation: AllocationReservation,
 }
 pub struct BatchResult {
     /// Bond, angle, proper, improper, LJ, electrostatic, GB, SA, restraint, pair count, padding.
@@ -75,39 +144,48 @@ pub struct BatchResult {
     pub gradients: Option<Vec<[f32; 4]>>,
 }
 impl ResidentEvaluator {
-    pub async fn new(topology: Topology<'_>, requested_batch: u32) -> Result<Self, Error> {
-        Self::with_budget(topology, requested_batch, BUFFER_BUDGET).await
+    /// Construct an evaluator on an existing coordinator-owned context.
+    pub async fn with_context(
+        context: &GpuContext,
+        topology: Topology<'_>,
+        requested_batch: u32,
+    ) -> Result<Self, Error> {
+        Self::with_budget_context(
+            context,
+            topology,
+            requested_batch,
+            context.memory_profile().budget(),
+        )
+        .await
     }
-    pub async fn with_budget(topology: Topology<'_>, requested_batch: u32, budget: u64) -> Result<Self, Error> {
+
+    async fn with_budget_context(
+        context: &GpuContext,
+        topology: Topology<'_>,
+        requested_batch: u32,
+        budget: u64,
+    ) -> Result<Self, Error> {
         let mut batch = requested_batch;
         loop {
-            match Self::allocate(topology, batch, budget.min(BUFFER_BUDGET)).await {
+            match Self::allocate(context, topology, batch, budget).await {
                 Err(Error::Capacity) if batch > 1 => batch = (batch / 2).max(1),
                 result => return result,
             }
         }
     }
-    async fn allocate(topology: Topology<'_>, requested_batch: u32, budget: u64) -> Result<Self, Error> {
+    async fn allocate(
+        context: &GpuContext,
+        topology: Topology<'_>,
+        requested_batch: u32,
+        budget: u64,
+    ) -> Result<Self, Error> {
         if topology.atoms.is_empty() || requested_batch == 0 {
             return Err(Error::Input("empty topology or batch"));
         }
         let atoms = u32::try_from(topology.atoms.len()).map_err(|_| Error::Capacity)?;
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
-        let adapter_info = adapter.get_info();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("GlySys compute"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
+        let adapter_info = context.adapter_info().clone();
+        let device = context.device().clone();
+        let queue = context.queue().clone();
         let fixed: [&[u8]; 4] = [
             bytemuck::cast_slice(topology.atoms),
             bytemuck::cast_slice(topology.terms),
@@ -124,14 +202,28 @@ impl ResidentEvaluator {
         let fixed_bytes: u64 = fixed.iter().map(|x| (x.len() as u64).max(48)).sum();
         let mut capacity = requested_batch;
         loop {
-            let count = u64::from(atoms) * u64::from(capacity);
-            let output = count * 64 + u64::from(capacity) * 48;
-            let staging = count * 16 + u64::from(capacity) * 48;
+            let count = u64::from(atoms)
+                .checked_mul(u64::from(capacity))
+                .ok_or(Error::Capacity)?;
+            let output = count
+                .checked_mul(64)
+                .and_then(|v| v.checked_add(u64::from(capacity).checked_mul(48)?))
+                .ok_or(Error::Capacity)?;
+            let staging = count
+                .checked_mul(16)
+                .and_then(|v| v.checked_add(u64::from(capacity).checked_mul(48)?))
+                .ok_or(Error::Capacity)?;
+            let aggregate = fixed_bytes
+                .checked_add(count.checked_mul(32).ok_or(Error::Capacity)?)
+                .and_then(|v| v.checked_add(output))
+                .and_then(|v| v.checked_add(staging))
+                .and_then(|v| v.checked_add(64))
+                .ok_or(Error::Capacity)?;
             if count.div_ceil(64) <= u64::from(limits.max_compute_workgroups_per_dimension)
                 && capacity <= limits.max_compute_workgroups_per_dimension
                 && output <= max_buffer
                 && staging <= limits.max_buffer_size
-                && fixed_bytes + count * 32 + output + staging + 64 <= budget
+                && aggregate <= budget
             {
                 break;
             }
@@ -140,9 +232,25 @@ impl ResidentEvaluator {
             }
             capacity = (capacity / 2).max(1);
         }
+        let count = u64::from(atoms) * u64::from(capacity);
+        let output_bytes = count
+            .checked_mul(64)
+            .and_then(|v| v.checked_add(u64::from(capacity).checked_mul(48)?))
+            .ok_or(Error::Capacity)?;
+        let staging_bytes = count
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(u64::from(capacity).checked_mul(48)?))
+            .ok_or(Error::Capacity)?;
+        let reservation = context.reserve(
+            fixed_bytes
+                .checked_add(count.checked_mul(32).ok_or(Error::Capacity)?)
+                .and_then(|v| v.checked_add(output_bytes))
+                .and_then(|v| v.checked_add(staging_bytes))
+                .and_then(|v| v.checked_add(64))
+                .ok_or(Error::Capacity)?,
+        )?;
         device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let count = u64::from(atoms) * u64::from(capacity);
         let buffer = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -226,24 +334,79 @@ impl ResidentEvaluator {
             layout: &layout,
             entries: &entries,
         });
+        // Separate error scopes per stage so a driver rejection names the
+        // exact kernel: shader-module failures (WGSL/Tint) and per-pipeline
+        // failures (backend translation, e.g. Metal library creation) need
+        // different fixes, and the adapter identity matters for both.
+        // The gradient on/off variants are baked as WGSL `const` modules
+        // instead of `override` pipeline constants: identical numerics with
+        // no override-specialization interaction on any backend.
+        fn energy_source(gradients: bool) -> String {
+            include_str!("energy.wgsl").replacen(
+                "const COMPUTE_GRADIENTS: bool = true;",
+                &format!("const COMPUTE_GRADIENTS: bool = {gradients};"),
+                1,
+            )
+        }
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GlySys energies"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("energy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(energy_source(true).into()),
         });
-        let pipelines = ["born_radii", "born_adjoint", "evaluate", "reduce", "evaluate"]
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
+        if let Some(e) = device.pop_error_scope().await {
+            return Err(Error::Execution(format!(
+                "GlySys energy shader rejected on {}: {e}",
+                crate::adapter::describe(&adapter_info)
+            )));
+        }
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader_nograd = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("GlySys energies (score-only)"),
+            source: wgpu::ShaderSource::Wgsl(energy_source(false).into()),
+        });
+        if let Some(e) = device.pop_error_scope().await {
+            return Err(Error::Execution(format!(
+                "GlySys energy score-only shader rejected on {}: {e}",
+                crate::adapter::describe(&adapter_info)
+            )));
+        }
+        let mut pipelines = Vec::with_capacity(5);
+        // Pipeline 4 reuses the `evaluate` entry with gradients baked off,
+        // matching the previous `COMPUTE_GRADIENTS=false` specialization.
+        for (module, entry, gradients) in [
+            (&shader, "born_radii", true),
+            (&shader, "born_adjoint", true),
+            (&shader, "evaluate", true),
+            (&shader, "reduce", true),
+            (&shader_nograd, "evaluate", false),
+        ] {
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            pipelines.push(
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: Some(&pipeline_layout),
-                    module: &shader,
+                    module,
                     entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &[("COMPUTE_GRADIENTS", if index == 4 { 0.0 } else { 1.0 })], ..Default::default() },
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
-                })
-            })
-            .collect();
+                }),
+            );
+            if let Some(e) = device.pop_error_scope().await {
+                return Err(Error::Execution(format!(
+                    "GlySys energy pipeline '{entry}' (gradients={gradients}) rejected on {}: {e}",
+                    crate::adapter::describe(&adapter_info)
+                )));
+            }
+        }
+        for (_, entry, gradients) in [
+            (&shader, "born_radii", true),
+            (&shader, "born_adjoint", true),
+            (&shader, "evaluate", true),
+            (&shader, "reduce", true),
+            (&shader_nograd, "evaluate", false),
+        ] {
+            context.record_pipeline(format!("energy.{entry}.gradients={gradients}"));
+        }
         let validation = device.pop_error_scope().await;
         let allocation = device.pop_error_scope().await;
         if let Some(e) = validation {
@@ -256,15 +419,11 @@ impl ResidentEvaluator {
             drop(staging);
             drop(queue);
             drop(device);
-            if capacity == 1 {
-                return Err(Error::Capacity);
-            }
-            return Box::pin(Self::new(topology, (capacity / 2).max(1))).await;
+            return Err(Error::Capacity);
         }
         Ok(Self {
-            _instance: instance,
-            _adapter: adapter,
             adapter_info,
+            _context: context.clone(),
             device,
             queue,
             buffers,
@@ -273,6 +432,7 @@ impl ResidentEvaluator {
             staging,
             atoms,
             capacity,
+            _allocation: reservation,
         })
     }
     pub fn batch_capacity(&self) -> u32 {
@@ -320,7 +480,9 @@ impl ResidentEvaluator {
             .write_buffer(&self.buffers[2], 0, bytemuck::cast_slice(coordinates));
         let mut encoder = self.device.create_command_encoder(&Default::default());
         for i in 0..4 {
-            if i == 1 && !gradients { continue; }
+            if i == 1 && !gradients {
+                continue;
+            }
             let pipeline = &self.pipelines[if i == 2 && !gradients { 4 } else { i }];
             if i < 2 && (config.energy[2] == 0.0 || config.size[2] != 0) {
                 continue;

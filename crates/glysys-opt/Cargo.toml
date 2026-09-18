@@ -3,7 +3,7 @@ name = "glysys-opt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-license = "MIT"
+license.workspace = true
 description = "Deterministic generic optimization algorithms for GlySys applications"
 repository = "https://github.com/Ojas-Singh/GlySys"
 

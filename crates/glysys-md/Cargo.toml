@@ -1,0 +1,24 @@
+[package]
+name = "glysys-md"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Native GlySys molecular-dynamics runner"
+repository = "https://github.com/Ojas-Singh/GlySys"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+glysys = { version = "0.1.0", path = "../.." }
+glysys-dynamics = { version = "0.1.0", path = "../glysys-dynamics" }
+glysys-gpu = { version = "0.1.0", path = "../glysys-gpu" }
+glysys-energy = { version = "0.1.0", path = "../glysys-energy" }
+glysys-runtime = { version = "0.1.0", path = "../glysys-runtime" }
+rayon = "1"
+pollster = "0.4"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

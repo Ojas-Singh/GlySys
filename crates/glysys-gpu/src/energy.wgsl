@@ -1,4 +1,4 @@
-override COMPUTE_GRADIENTS: bool = true;
+const COMPUTE_GRADIENTS: bool = true;
 struct Config { size:vec4<u32>, energy:vec4<f32>, solvent:vec4<f32>, spare:vec4<f32> }
 struct Atom { ff:vec4<f32>, more:vec4<f32>, ranges:vec4<u32> }
 struct Term { ids:vec4<u32>, parameters:vec4<f32>, reference:vec4<f32> }

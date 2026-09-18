@@ -12,6 +12,7 @@ mod options;
 mod pdb;
 mod prepare;
 mod report;
+mod snapshot;
 mod solvate;
 mod structure;
 mod writers;

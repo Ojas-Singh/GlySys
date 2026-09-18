@@ -51,7 +51,10 @@ pub struct HydrationRequest {
 
 /// Returns true for GC requests; `None` (old JSON) stays on the probe path.
 pub fn is_gc_request(request: &HydrationRequest) -> bool {
-    request.method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("gc"))
+    request
+        .method
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("gc"))
 }
 
 pub fn gc_chemical_potential(request: &HydrationRequest) -> Result<f64> {
@@ -125,7 +128,7 @@ pub struct HydrationField {
     pub backend: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all="camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct HydrationContext {
     pub model_version: String,
     pub request: HydrationRequest,
@@ -147,6 +150,7 @@ pub trait HydrationProvider {
     fn model_version(&self) -> &str;
     fn predict(&self, request: &HydrationRequest) -> Result<HydrationField>;
 }
+#[derive(Clone)]
 pub struct PhysicalProbe {
     pub atoms: Vec<ProbeAtom>,
     pub fingerprint: String,
@@ -240,7 +244,10 @@ pub fn split_tiles(dimensions: [usize; 3], max_points: usize) -> Vec<TileRegion>
     }];
     let mut out = Vec::new();
     while let Some(region) = regions.pop() {
-        let points: usize = region.dimensions.iter().fold(1, |a, b| a.saturating_mul(*b));
+        let points: usize = region
+            .dimensions
+            .iter()
+            .fold(1, |a, b| a.saturating_mul(*b));
         if points <= max_points || region.dimensions.iter().all(|&d| d <= 1) {
             out.push(region);
             continue;
@@ -267,7 +274,6 @@ pub struct TileGrid {
 }
 
 impl PhysicalProbe {
-
     pub fn new(system: &ParameterizedSystem) -> Result<Self> {
         if system
             .atoms()
@@ -755,9 +761,7 @@ impl PhysicalProbe {
             return Ok(Vec::new());
         }
         // Rank by occupancy, then receptor energy; suppress 2.4 A neighbors.
-        let mut ranked: Vec<usize> = (0..m)
-            .filter(|&i| counts[i] > 0)
-            .collect();
+        let mut ranked: Vec<usize> = (0..m).filter(|&i| counts[i] > 0).collect();
         ranked.sort_by(|&a, &b| {
             counts[b]
                 .cmp(&counts[a])
@@ -840,7 +844,11 @@ impl PhysicalProbe {
                         let mut next = pose;
                         let d = sign * step;
                         if axis < 3 {
-                            let mut v = Vec3 { x: 0., y: 0., z: 0. };
+                            let mut v = Vec3 {
+                                x: 0.,
+                                y: 0.,
+                                z: 0.,
+                            };
                             match axis {
                                 0 => v.x = d,
                                 1 => v.y = d,
@@ -865,9 +873,10 @@ impl PhysicalProbe {
                         {
                             continue;
                         }
-                        if placed.iter().any(|q| {
-                            distance2(q.oxygen, next.oxygen) < 2.0f64.powi(2)
-                        }) {
+                        if placed
+                            .iter()
+                            .any(|q| distance2(q.oxygen, next.oxygen) < 2.0f64.powi(2))
+                        {
                             continue;
                         }
                         if let Some(e) = self.score(next, request.cutoff) {
@@ -902,11 +911,7 @@ impl PhysicalProbe {
                 }
             }
         }
-        if contacts == 1 {
-            "surface"
-        } else {
-            "exposed"
-        }
+        if contacts == 1 { "surface" } else { "exposed" }
     }
 }
 
@@ -1129,7 +1134,11 @@ mod tests {
         WaterPose {
             oxygen: Vec3 { x, y: 0., z: 0. },
             hydrogens: [
-                Vec3 { x: x + OH, y: 0., z: 0. },
+                Vec3 {
+                    x: x + OH,
+                    y: 0.,
+                    z: 0.,
+                },
                 Vec3 {
                     x: x + OH * ANGLE.cos(),
                     y: OH * ANGLE.sin(),
@@ -1141,8 +1150,16 @@ mod tests {
 
     fn test_request() -> HydrationRequest {
         HydrationRequest {
-            minimum: Vec3 { x: -10., y: -10., z: -10. },
-            maximum: Vec3 { x: 10., y: 10., z: 10. },
+            minimum: Vec3 {
+                x: -10.,
+                y: -10.,
+                z: -10.,
+            },
+            maximum: Vec3 {
+                x: 10.,
+                y: 10.,
+                z: 10.,
+            },
             spacing: 1.,
             orientations: 96,
             max_sites: 100,
@@ -1165,8 +1182,7 @@ HETATM    6  O   HOH A   2       5.000   0.000   0.000  1.00 30.00           O\n
 HETATM    7  O   WAT A   3       6.000   0.000   0.000  1.00 30.00           O\n\
 HETATM    8  O  TIP3 A   4       7.000   0.000   0.000  1.00 30.00           O\n\
 END\n";
-        let structure =
-            glysys::read_pdb_str(pdb, &glysys::BuildOptions::default()).unwrap();
+        let structure = glysys::read_pdb_str(pdb, &glysys::BuildOptions::default()).unwrap();
         let provider = SiteProvider::deposited(&structure, "test".into());
         assert_eq!(provider.sites.len(), 1);
         assert_eq!(provider.sites[0].id, "deposited-6");
@@ -1215,8 +1231,20 @@ END\n";
         let probe = test_probe();
         let request = test_request();
         let close = vec![
-            (test_pose(0.), ProbeScore { lennard_jones: -5., electrostatics: 0. }),
-            (test_pose(1.), ProbeScore { lennard_jones: -4., electrostatics: 0. }),
+            (
+                test_pose(0.),
+                ProbeScore {
+                    lennard_jones: -5.,
+                    electrostatics: 0.,
+                },
+            ),
+            (
+                test_pose(1.),
+                ProbeScore {
+                    lennard_jones: -4.,
+                    electrostatics: 0.,
+                },
+            ),
         ];
         let field = probe.finish_tiled(&request, [21, 21, 21], Vec::new(), close, "cpu");
         assert_eq!(field.sites.len(), 1);
@@ -1228,8 +1256,20 @@ END\n";
         let probe = test_probe();
         let request = test_request();
         let candidates = vec![
-            (test_pose(-5.), ProbeScore { lennard_jones: -5., electrostatics: 0. }),
-            (test_pose(5.), ProbeScore { lennard_jones: -4., electrostatics: 0. }),
+            (
+                test_pose(-5.),
+                ProbeScore {
+                    lennard_jones: -5.,
+                    electrostatics: 0.,
+                },
+            ),
+            (
+                test_pose(5.),
+                ProbeScore {
+                    lennard_jones: -4.,
+                    electrostatics: 0.,
+                },
+            ),
         ];
         let field = probe.finish_tiled(&request, [21, 21, 21], Vec::new(), candidates, "cpu");
         assert_eq!(field.sites.len(), 2);
@@ -1259,14 +1299,20 @@ END\n";
         assert!((ab.total() - ba.total()).abs() < 1e-9);
         let close = water_pair(test_pose(0.), test_pose(1.));
         assert!(close.is_some());
-        assert!(close.unwrap().total() > water_pair(test_pose(0.), test_pose(10.)).unwrap().total());
+        assert!(
+            close.unwrap().total() > water_pair(test_pose(0.), test_pose(10.)).unwrap().total()
+        );
     }
 
     #[test]
     fn gc_fingerprint_differs_from_probe_but_validates_same_chemistry() {
         let probe = PhysicalProbe {
             atoms: vec![crate::hydration::ProbeAtom {
-                position: Vec3 { x: 0., y: 0., z: 0. },
+                position: Vec3 {
+                    x: 0.,
+                    y: 0.,
+                    z: 0.,
+                },
                 charge: -0.4,
                 radius: 1.5,
                 epsilon: 0.2,
@@ -1281,13 +1327,21 @@ END\n";
     fn gc_sampling_is_deterministic_and_bounded() {
         let atoms = vec![
             crate::hydration::ProbeAtom {
-                position: Vec3 { x: 5., y: 0., z: 0. },
+                position: Vec3 {
+                    x: 5.,
+                    y: 0.,
+                    z: 0.,
+                },
                 charge: -0.5,
                 radius: 1.6,
                 epsilon: 0.2,
             },
             crate::hydration::ProbeAtom {
-                position: Vec3 { x: -5., y: 0., z: 0. },
+                position: Vec3 {
+                    x: -5.,
+                    y: 0.,
+                    z: 0.,
+                },
                 charge: 0.5,
                 radius: 1.6,
                 epsilon: 0.2,
@@ -1328,8 +1382,16 @@ END\n";
         let probe = test_probe();
         let request = test_request();
         let tiles = vec![
-            TileGrid { offset: [0, 0, 0], dimensions: [2, 1, 1], energies: vec![Some(-1.), None] },
-            TileGrid { offset: [2, 0, 0], dimensions: [1, 1, 1], energies: vec![Some(-2.)] },
+            TileGrid {
+                offset: [0, 0, 0],
+                dimensions: [2, 1, 1],
+                energies: vec![Some(-1.), None],
+            },
+            TileGrid {
+                offset: [2, 0, 0],
+                dimensions: [1, 1, 1],
+                energies: vec![Some(-2.)],
+            },
         ];
         let field = probe.finish_tiled(&request, [3, 1, 1], tiles, Vec::new(), "cpu");
         assert_eq!(field.probe_energy, vec![Some(-1.), None, Some(-2.)]);
@@ -1350,9 +1412,7 @@ impl SiteProvider {
         let sites = structure
             .atoms()
             .into_iter()
-            .filter(|a| {
-                a.residue_name.as_str() == "HOH" && a.element.eq_ignore_ascii_case("O")
-            })
+            .filter(|a| a.residue_name.as_str() == "HOH" && a.element.eq_ignore_ascii_case("O"))
             .map(|a| HydrationSite {
                 id: format!("deposited-{}", a.id.0),
                 position: a.position,
@@ -1374,20 +1434,27 @@ impl SiteProvider {
         }
     }
     pub fn imported(sites: Vec<HydrationSite>, receptor_fingerprint: String) -> Result<Self> {
-        if sites.len() > 100_000 { return Err(invalid("too many imported hydration sites")); }
+        if sites.len() > 100_000 {
+            return Err(invalid("too many imported hydration sites"));
+        }
         if sites.iter().any(|s| {
             !finite(s.position)
                 || s.hydrogens.is_some_and(|h| h.iter().any(|p| !finite(*p)))
-                || s.score.is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
+                || s.score
+                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
                 || s.source.is_empty()
                 || s.id.is_empty()
                 || s.experimental_occupancy
                     .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
                 || s.confidence.is_some_and(|x| !x.is_finite())
                 || s.displacement_free_energy.is_some_and(|x| !x.is_finite())
-                || s.occupancy.is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-                || s.water_water.is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
-                || s.bridging.as_ref().is_some_and(|b| b.is_empty() || b.len() > 32)
+                || s.occupancy
+                    .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+                || s.water_water
+                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
+                || s.bridging
+                    .as_ref()
+                    .is_some_and(|b| b.is_empty() || b.len() > 32)
         }) {
             return Err(invalid("invalid imported hydration site"));
         }
@@ -1435,4 +1502,3 @@ impl HydrationProvider for SiteProvider {
         })
     }
 }
-

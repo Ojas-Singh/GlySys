@@ -61,7 +61,12 @@ fn full_energy_and_obc2_parity() {
             )
             .unwrap();
         let result = pollster::block_on(async {
-            let mut gpu = ResidentEvaluator::new(packed.view(), 1).await.unwrap();
+            let context = glysys_gpu::GpuContext::new(glysys_gpu::GpuContextOptions::default())
+                .await
+                .unwrap();
+            let mut gpu = ResidentEvaluator::with_context(&context, packed.view(), 1)
+                .await
+                .unwrap();
             gpu.evaluate(
                 Config {
                     size: [system.atom_count() as u32, 1, 0, u32::from(active)],

@@ -12,9 +12,13 @@ fn water_probe_gpu_matches_reference_components() {
         .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
         .unwrap();
         let probe = PhysicalProbe::new(&system).unwrap();
-        let mut gpu = glysys_gpu::hydration::ResidentWaterProbe::new(&probe, 512)
+        let context = glysys_gpu::GpuContext::new(glysys_gpu::GpuContextOptions::default())
             .await
             .unwrap();
+        let mut gpu =
+            glysys_gpu::hydration::ResidentWaterProbe::with_context(&context, &probe, 512)
+                .await
+                .unwrap();
         let o = probe.atoms[0].position;
         let r = HydrationRequest {
             minimum: Vec3 {

@@ -154,7 +154,11 @@ impl LbfgsState {
                 self.values.push(value);
                 self.iteration += 1;
             }
-            Phase::Done { .. } => unreachable!(),
+            Phase::Done { .. } => {
+                return Err(OptimizationError::InvalidConfiguration(
+                    "completed optimizer has no pending evaluation".into(),
+                ));
+            }
         }
         let progress = LbfgsProgress {
             iteration: self.iteration,
@@ -235,10 +239,16 @@ where
             }
         }
         if requests.is_empty() {
-            return Ok(states
+            return states
                 .iter()
-                .map(|s| s.outcome().expect("finished state"))
-                .collect());
+                .map(|s| {
+                    s.outcome().ok_or_else(|| {
+                        OptimizationError::InvalidConfiguration(
+                            "optimizer stopped without a completed state".into(),
+                        )
+                    })
+                })
+                .collect();
         }
         let values = evaluate(requests).await?;
         if cancelled() {

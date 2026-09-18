@@ -83,20 +83,25 @@ impl CircularMixture {
         self.log_probability_and_derivative(angle).0
     }
     pub fn log_probability_and_derivative(&self, angle: f64) -> (f64, f64) {
-        let values: Vec<_> = self
+        // Keep the compiled mixture allocation-free in the search hot loop.
+        // The previous implementation built a temporary Vec for every angle
+        // evaluation, which made probability-ranked Build increasingly
+        // expensive as the population approached steric feasibility.
+        let maximum = self
             .components
             .iter()
             .zip(&self.log_constants)
-            .map(|(c, l)| l + c.concentration * (angle - c.mean).cos())
-            .collect();
-        let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let sum: f64 = values.iter().map(|v| (v - maximum).exp()).sum();
-        let derivative = values
-            .iter()
-            .zip(&self.components)
-            .map(|(v, c)| (v - maximum).exp() * (-c.concentration * (angle - c.mean).sin()))
-            .sum::<f64>()
-            / sum;
+            .map(|(c, constant)| constant + c.concentration * (angle - c.mean).cos())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = 0.0;
+        let mut derivative_numerator = 0.0;
+        for (component, constant) in self.components.iter().zip(&self.log_constants) {
+            let delta = angle - component.mean;
+            let scaled = (constant + component.concentration * delta.cos() - maximum).exp();
+            sum += scaled;
+            derivative_numerator += scaled * (-component.concentration * delta.sin());
+        }
+        let derivative = derivative_numerator / sum;
         (maximum + sum.ln(), derivative)
     }
 }

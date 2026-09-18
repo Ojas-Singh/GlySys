@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["GlySys contributors"]
-license = "MIT"
+license.workspace = true
 description = "Pure-Rust Amber/GLYCAM preparation of solvated glycan and glycoprotein systems"
 repository = "https://github.com/Ojas-Singh/GlySys"
 keywords = ["glycan", "glycoprotein", "amber", "glycam", "gromacs"]
@@ -35,7 +35,7 @@ clap = { version = "4.5", features = ["derive"] }
 # needed by automatic glycan discovery.
 crabwurcs = { path = "../crabWURCS/crabwurcs", version = "0.3.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 thiserror = "2"
 toml = "0.9"
@@ -48,6 +48,9 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = ["crates/glysys-energy", "crates/glysys-opt", "crates/glysys-gpu", "crates/glysys-dynamics"]
-default-members = [".", "crates/glysys-energy", "crates/glysys-opt"]
+members = ["crates/glysys-energy", "crates/glysys-opt", "crates/glysys-gpu", "crates/glysys-dynamics", "crates/glysys-runtime", "crates/glysys-md"]
+default-members = [".", "crates/glysys-energy", "crates/glysys-opt", "crates/glysys-runtime"]
 resolver = "3"
+
+[workspace.package]
+license = "AGPL-3.0-only"

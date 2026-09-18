@@ -550,7 +550,9 @@ fn dihedral_records(dihedrals: &[&Dihedral], indices: &HashMap<DihedralKey, usiz
             // fourth indices for a 1–4 interaction. Reversing all four atoms
             // preserves the dihedral while moving atom zero out of those slots.
             let mut atoms = dihedral.atoms;
-            if atoms[2] == 0 || atoms[3] == 0 { atoms.reverse(); }
+            if atoms[2] == 0 || atoms[3] == 0 {
+                atoms.reverse();
+            }
             let suppress_14 = dihedral.improper || !seen_pairs.insert(pair);
             let third = (atoms[2] * 3) as isize * if suppress_14 { -1 } else { 1 };
             let fourth = (atoms[3] * 3) as isize * if dihedral.improper { -1 } else { 1 };

@@ -1,6 +1,7 @@
 //! Named scoring adapter. Shader component slots are private to this backend.
 //! Unsupported derivative/feature plans explicitly use the reference evaluator.
 use crate::{
+    context::GpuContext,
     device::{Config, Error, ResidentEvaluator},
     topology::PreparedTopology,
 };
@@ -26,7 +27,8 @@ pub struct PreparedGpuEvaluator {
     resident: ResidentEvaluator,
 }
 impl PreparedGpuEvaluator {
-    pub async fn new(
+    pub async fn with_context(
+        context: &GpuContext,
         scene: PreparedScene,
         model: ScoreModel,
         capacity: u32,
@@ -44,7 +46,7 @@ impl PreparedGpuEvaluator {
         }
         let topology =
             PreparedTopology::new(&reference.scene.system, &reference.scene.options, &groups)?;
-        let resident = ResidentEvaluator::new(topology.view(), capacity).await?;
+        let resident = ResidentEvaluator::with_context(context, topology.view(), capacity).await?;
         Ok(Self {
             reference,
             topology,
@@ -199,6 +201,7 @@ mod tests {
     #[ignore = "requires Vulkan; software adapters establish correctness only"]
     fn named_adapter_matches_reference() {
         pollster::block_on(async {
+            let context = GpuContext::new(Default::default()).await.unwrap();
             let system = glysys::SystemBuilder::new(glysys::BuildOptions {
                 add_water: false,
                 add_ions: false,
@@ -214,9 +217,10 @@ mod tests {
                 poses: vec![Pose::cartesian(93, scene.system.coordinates())],
             };
             let cpu = PreparedEvaluator::new(scene.clone(), ScoreModel::amber()).unwrap();
-            let mut gpu = PreparedGpuEvaluator::new(scene, ScoreModel::amber(), 2)
-                .await
-                .unwrap();
+            let mut gpu =
+                PreparedGpuEvaluator::with_context(&context, scene, ScoreModel::amber(), 2)
+                    .await
+                    .unwrap();
             for gradients in [false, true] {
                 let request = EvaluationRequest {
                     gradients,

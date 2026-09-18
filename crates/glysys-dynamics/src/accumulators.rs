@@ -91,7 +91,18 @@ mod tests {
         let mut acc = WaterOccupancy::new([10., 10., 10.], 1.);
         assert_eq!(acc.dimensions, [10, 10, 10]);
         acc.observe(
-            &[Vec3 { x: 1.2, y: 1.2, z: 1.2 }, Vec3 { x: 11.2, y: -0.5, z: 25. } ],
+            &[
+                Vec3 {
+                    x: 1.2,
+                    y: 1.2,
+                    z: 1.2,
+                },
+                Vec3 {
+                    x: 11.2,
+                    y: -0.5,
+                    z: 25.,
+                },
+            ],
             [10., 10., 10.],
         );
         // Second oxygen wraps to voxel (1, 9, 5).

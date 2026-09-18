@@ -747,6 +747,7 @@ version = "0.1.0"
 dependencies = [
  "glysys",
  "pulp",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -770,6 +771,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "glysys-md"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "glysys",
+ "glysys-dynamics",
+ "glysys-energy",
+ "glysys-gpu",
+ "glysys-runtime",
+ "pollster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "glysys-opt"
 version = "0.1.0"
 dependencies = [
@@ -779,6 +798,20 @@ dependencies = [
  "serde",
  "thiserror",
  "web-time",
+]
+
+[[package]]
+name = "glysys-runtime"
+version = "0.1.0"
+dependencies = [
+ "glysys",
+ "glysys-dynamics",
+ "glysys-energy",
+ "glysys-gpu",
+ "pollster",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

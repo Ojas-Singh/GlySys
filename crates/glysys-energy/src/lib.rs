@@ -1,11 +1,18 @@
 //! Molecular-mechanics energies and gradients for parameterized GlySys systems.
 
-mod obc2;
-pub mod prior;
 pub mod geometry;
-pub mod scoring;
 pub mod hydration;
+mod obc2;
 pub mod pbc;
+pub mod prior;
+pub mod scoring;
+
+/// Number of workers available to the shared CPU evaluator. Native builds
+/// use the Rayon pool; portable browser WASM reports one unless the caller
+/// initializes a shared-memory Rayon pool explicitly.
+pub fn cpu_thread_count() -> usize {
+    rayon::current_num_threads()
+}
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -37,6 +44,11 @@ pub struct EnergyComponents {
     pub generalized_born: f64,
     pub surface_area: f64,
     pub restraints: f64,
+    /// Homogeneous long-range Lennard-Jones correction used by periodic
+    /// constant-pressure protocols. It is kept separate so reports can
+    /// distinguish the cutoff energy from its volume-dependent correction.
+    #[serde(default)]
+    pub dispersion_correction: f64,
 }
 
 /// The energy quantity used by a structure-selection workflow.
@@ -54,6 +66,16 @@ pub enum EnergyScoringMode {
 pub struct InteractionEnergyComponents {
     pub van_der_waals: f64,
     pub electrostatics: f64,
+}
+
+/// One parameterized torsion contribution, retained for downstream
+/// per-linkage diagnostics. Multiple Fourier terms on the same four atoms
+/// are returned separately and must be summed by the caller when desired.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TorsionEnergyContribution {
+    pub atoms: [usize; 4],
+    pub energy: f64,
+    pub improper: bool,
 }
 
 impl InteractionEnergyComponents {
@@ -117,6 +139,7 @@ impl EnergyComponents {
             + self.generalized_born
             + self.surface_area
             + self.restraints
+            + self.dispersion_correction
     }
 }
 
@@ -270,7 +293,7 @@ impl AtomSelection {
 
 /// Reusable evaluator with immutable topology and configurable movable atoms.
 pub struct EnergyEvaluator<'a> {
-    system: &'a ParameterizedSystem,
+    system: std::borrow::Cow<'a, ParameterizedSystem>,
     options: EnergyOptions,
     selection: AtomSelection,
     one_four: HashMap<(usize, usize), (f64, f64)>,
@@ -346,12 +369,24 @@ impl<'a> EnergyEvaluator<'a> {
             ));
         }
         Ok(Self {
-            system,
+            system: std::borrow::Cow::Borrowed(system),
             options,
             selection: AtomSelection::all(system.atom_count()),
             one_four,
             active_terms_only: false,
         })
+    }
+
+    /// Retain prepared topology and lookup tables for a long-lived job.
+    /// A borrowed topology is cloned once; subsequent evaluations reuse it.
+    pub fn into_owned(self) -> EnergyEvaluator<'static> {
+        EnergyEvaluator {
+            system: std::borrow::Cow::Owned(self.system.into_owned()),
+            options: self.options,
+            selection: self.selection,
+            one_four: self.one_four,
+            active_terms_only: self.active_terms_only,
+        }
     }
 
     pub fn with_selection(mut self, selection: AtomSelection) -> Result<Self> {
@@ -472,10 +507,10 @@ impl<'a> EnergyEvaluator<'a> {
     /// forward automatic differentiation.
     pub fn energy_and_gradient(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
         let components = self.components(coordinates)?;
-        let mut gradients = self.analytic_gradient(coordinates, &[1.0;9])?;
+        let mut gradients = self.analytic_gradient(coordinates, &[1.0; 9])?;
         for (gradient, residual) in gradients
             .iter_mut()
-            .zip(self.residual_gradient(coordinates, &[1.0;9]))
+            .zip(self.residual_gradient(coordinates, &[1.0; 9]))
         {
             gradient.x += residual.x;
             gradient.y += residual.y;
@@ -488,30 +523,65 @@ impl<'a> EnergyEvaluator<'a> {
     }
 
     /// Analytic derivative of an explicitly weighted component sum.
-    pub fn weighted_gradient(&self, coordinates:&[Vec3], weights:[f64;9])->Result<Vec<Vec3>> {
-        if weights.iter().any(|w|!w.is_finite()){return Err(EnergyError::InvalidConfiguration("nonfinite term weight".into()));}
-        let mut gradient=self.analytic_gradient(coordinates,&weights)?;
-        for (g,r) in gradient.iter_mut().zip(self.residual_gradient(coordinates,&weights)){add_scaled(g,r,1.);}
+    pub fn weighted_gradient(&self, coordinates: &[Vec3], weights: [f64; 9]) -> Result<Vec<Vec3>> {
+        if weights.iter().any(|w| !w.is_finite()) {
+            return Err(EnergyError::InvalidConfiguration(
+                "nonfinite term weight".into(),
+            ));
+        }
+        let mut gradient = self.analytic_gradient(coordinates, &weights)?;
+        for (g, r) in gradient
+            .iter_mut()
+            .zip(self.residual_gradient(coordinates, &weights))
+        {
+            add_scaled(g, r, 1.);
+        }
         Ok(gradient)
     }
-    pub fn interaction_gradient(&self,coordinates:&[Vec3],first:&AtomGroupMask,second:&AtomGroupMask,weights:[f64;2])->Result<Vec<Vec3>> {
-        self.interaction_energy(coordinates,first,second)?;
-        let mut gradients=vec![Vec3{x:0.,y:0.,z:0.};coordinates.len()];
-        for (a,b) in cross_nonbonded_pairs(coordinates,self.options.cutoff,first,second){
-            let scales=self.one_four.get(&ordered(a,b)).copied();
-            if self.system.exclusions()[a].contains(&b)&&scales.is_none(){continue;}
-            let (scee,scnb)=scales.unwrap_or((1.,1.));let aa=&self.system.atoms()[a];let ab=&self.system.atoms()[b];
-            let delta=subtract(coordinates[a],coordinates[b]);let d=norm(delta).max(1e-8);
-            let epsilon=(aa.lennard_jones_epsilon()*ab.lennard_jones_epsilon()).sqrt();let r6=((aa.lennard_jones_radius()+ab.lennard_jones_radius())/d).powi(6);
-            let coulomb=COULOMB_KCAL_ANGSTROM*aa.charge()*ab.charge()/(self.options.dielectric*scee*d);
-            let factor=(weights[0]*12.*epsilon*(r6-r6*r6)/(scnb*d)-weights[1]*coulomb/d)/d;
-            if self.selection.is_movable(a){add_scaled(&mut gradients[a],delta,factor);}
-            if self.selection.is_movable(b){add_scaled(&mut gradients[b],delta,-factor);}
+    pub fn interaction_gradient(
+        &self,
+        coordinates: &[Vec3],
+        first: &AtomGroupMask,
+        second: &AtomGroupMask,
+        weights: [f64; 2],
+    ) -> Result<Vec<Vec3>> {
+        self.interaction_energy(coordinates, first, second)?;
+        let mut gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            coordinates.len()
+        ];
+        for (a, b) in cross_nonbonded_pairs(coordinates, self.options.cutoff, first, second) {
+            let scales = self.one_four.get(&ordered(a, b)).copied();
+            if self.system.exclusions()[a].contains(&b) && scales.is_none() {
+                continue;
+            }
+            let (scee, scnb) = scales.unwrap_or((1., 1.));
+            let aa = &self.system.atoms()[a];
+            let ab = &self.system.atoms()[b];
+            let delta = subtract(coordinates[a], coordinates[b]);
+            let d = norm(delta).max(1e-8);
+            let epsilon = (aa.lennard_jones_epsilon() * ab.lennard_jones_epsilon()).sqrt();
+            let r6 = ((aa.lennard_jones_radius() + ab.lennard_jones_radius()) / d).powi(6);
+            let coulomb = COULOMB_KCAL_ANGSTROM * aa.charge() * ab.charge()
+                / (self.options.dielectric * scee * d);
+            let factor = (weights[0] * 12. * epsilon * (r6 - r6 * r6) / (scnb * d)
+                - weights[1] * coulomb / d)
+                / d;
+            if self.selection.is_movable(a) {
+                add_scaled(&mut gradients[a], delta, factor);
+            }
+            if self.selection.is_movable(b) {
+                add_scaled(&mut gradients[b], delta, -factor);
+            }
         }
         Ok(gradients)
     }
 
-    fn analytic_gradient(&self, coordinates: &[Vec3], weights: &[f64;9]) -> Result<Vec<Vec3>> {
+    fn analytic_gradient(&self, coordinates: &[Vec3], weights: &[f64; 9]) -> Result<Vec<Vec3>> {
         validate_coordinates(self.system.atom_count(), coordinates)?;
         let mut gradient = vec![
             Vec3 {
@@ -583,15 +653,20 @@ impl<'a> EnergyEvaluator<'a> {
             let ratio6 = (sigma / radius).powi(6);
             let coulomb = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
                 / (self.options.dielectric * scee * radius);
-            let derivative =
-                weights[4] * 12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - weights[5] * coulomb / radius;
+            let derivative = weights[4] * 12.0 * epsilon * (ratio6 - ratio6 * ratio6)
+                / (scnb * radius)
+                - weights[5] * coulomb / radius;
             add_scaled(&mut gradient[first], vector, derivative / radius);
             add_scaled(&mut gradient[second], vector, -derivative / radius);
         }
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
                 let vector = subtract(*position, restraint.reference);
-                add_scaled(&mut gradient[restraint.atom], vector, weights[8] * 2.0 * restraint.force);
+                add_scaled(
+                    &mut gradient[restraint.atom],
+                    vector,
+                    weights[8] * 2.0 * restraint.force,
+                );
             }
         }
         for (index, value) in gradient.iter_mut().enumerate() {
@@ -606,7 +681,7 @@ impl<'a> EnergyEvaluator<'a> {
         Ok(gradient)
     }
 
-    fn residual_gradient(&self, coordinates: &[Vec3], weights: &[f64;9]) -> Vec<Vec3> {
+    fn residual_gradient(&self, coordinates: &[Vec3], weights: &[f64; 9]) -> Vec<Vec3> {
         let mut gradients = vec![
             Vec3 {
                 x: 0.0,
@@ -643,7 +718,10 @@ impl<'a> EnergyEvaluator<'a> {
             let argument = phi
                 .scale(torsion.periodicity() as f64)
                 .add_constant(-torsion.phase());
-            let term = argument.cos().add_constant(1.0).scale(torsion.force() * weights[if torsion.is_improper(){3}else{2}]);
+            let term = argument
+                .cos()
+                .add_constant(1.0)
+                .scale(torsion.force() * weights[if torsion.is_improper() { 3 } else { 2 }]);
             for (local, atom) in atoms.iter().enumerate() {
                 if self.selection.is_movable(*atom) {
                     gradients[*atom].x += term.gradient[local * 3];
@@ -654,12 +732,29 @@ impl<'a> EnergyEvaluator<'a> {
         }
         if let Some(options) = &self.options.obc2 {
             if weights[6] == weights[7] {
-                let values=obc2::gradient(self.system.atoms(),coordinates,options);
-                for (i,value) in values.into_iter().enumerate(){if self.selection.is_movable(i){add_scaled(&mut gradients[i],value,weights[6]);}}
+                let values = obc2::gradient(self.system.atoms(), coordinates, options);
+                for (i, value) in values.into_iter().enumerate() {
+                    if self.selection.is_movable(i) {
+                        add_scaled(&mut gradients[i], value, weights[6]);
+                    }
+                }
             } else {
-                let mut polar=options.clone();polar.surface_tension=0.;
-                let mut surface=options.clone();surface.solute_dielectric=surface.solvent_dielectric;
-                for (opts,weight) in [(&polar,weights[6]),(&surface,weights[7])] {if weight!=0.{for (i,value) in obc2::gradient(self.system.atoms(),coordinates,opts).into_iter().enumerate(){if self.selection.is_movable(i){add_scaled(&mut gradients[i],value,weight);}}}}
+                let mut polar = options.clone();
+                polar.surface_tension = 0.;
+                let mut surface = options.clone();
+                surface.solute_dielectric = surface.solvent_dielectric;
+                for (opts, weight) in [(&polar, weights[6]), (&surface, weights[7])] {
+                    if weight != 0. {
+                        for (i, value) in obc2::gradient(self.system.atoms(), coordinates, opts)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            if self.selection.is_movable(i) {
+                                add_scaled(&mut gradients[i], value, weight);
+                            }
+                        }
+                    }
+                }
             }
         }
         gradients
@@ -746,6 +841,36 @@ impl<'a> EnergyEvaluator<'a> {
             }
         }
         Ok(result)
+    }
+
+    /// Return each proper/improper torsion term without collapsing distinct
+    /// Fourier terms. This is a diagnostic API used to attribute
+    /// glycosidic-bond torsions in ReGlyco reports.
+    pub fn torsion_energy_contributions(
+        &self,
+        coordinates: &[Vec3],
+    ) -> Result<Vec<TorsionEnergyContribution>> {
+        validate_coordinates(self.system.atom_count(), coordinates)?;
+        Ok(self
+            .system
+            .dihedrals()
+            .iter()
+            .map(|torsion| {
+                let atoms = torsion.atoms();
+                let phi = dihedral(
+                    coordinates[atoms[0]],
+                    coordinates[atoms[1]],
+                    coordinates[atoms[2]],
+                    coordinates[atoms[3]],
+                );
+                TorsionEnergyContribution {
+                    atoms,
+                    energy: torsion.force()
+                        * (1.0 + ((torsion.periodicity() as f64) * phi - torsion.phase()).cos()),
+                    improper: torsion.is_improper(),
+                }
+            })
+            .collect())
     }
 }
 

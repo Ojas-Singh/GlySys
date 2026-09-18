@@ -266,7 +266,11 @@ where
             progress(event);
         }
     }
-    Ok(state.outcome().expect("completed L-BFGS state"))
+    state.outcome().ok_or_else(|| {
+        OptimizationError::InvalidConfiguration(
+            "optimizer stopped without a completed state".into(),
+        )
+    })
 }
 
 /// A particle seed with immutable application context.

@@ -1,5 +1,6 @@
 //! Resident attachment library and batched traversal-compatible steric screening.
-use crate::device::{BUFFER_BUDGET, Error};
+use crate::context::{AllocationReservation, GpuContext};
+use crate::device::Error;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 #[repr(C)]
@@ -26,25 +27,45 @@ pub struct AttachmentLibrary {
 }
 // Sorted streams retain Cookbook's original receptor atom traversal order.
 fn receptor_cells(library: &AttachmentLibrary) -> Vec<[u32; 4]> {
-    let flexible: std::collections::BTreeSet<_> = library.updates.iter().map(|u| u.indices[0]).collect();
-    let mut cells = std::collections::BTreeMap::<[i32;3], Vec<u32>>::new();
-    let safe = library.protein.iter().chain(&library.coordinates).all(|p| p[..3].iter().all(|v| v.is_finite() && v.abs() < 100_000.));
-    for (i,p) in library.protein.iter().enumerate() {
-        if !flexible.contains(&(i as u32)) { cells.entry([p[0],p[1],p[2]].map(|x| (x / 3.4).floor() as i32)).or_default().push(i as u32); }
+    let flexible: std::collections::BTreeSet<_> =
+        library.updates.iter().map(|u| u.indices[0]).collect();
+    let mut cells = std::collections::BTreeMap::<[i32; 3], Vec<u32>>::new();
+    let safe = library
+        .protein
+        .iter()
+        .chain(&library.coordinates)
+        .all(|p| p[..3].iter().all(|v| v.is_finite() && v.abs() < 100_000.));
+    for (i, p) in library.protein.iter().enumerate() {
+        if !flexible.contains(&(i as u32)) {
+            cells
+                .entry([p[0], p[1], p[2]].map(|x| (x / 3.4).floor() as i32))
+                .or_default()
+                .push(i as u32);
+        }
     }
-    let mut packed = vec![[0;4];1+2*cells.len()];
-    packed[0]=[cells.len() as u32,0,flexible.len() as u32,u32::from(safe)];
-    for (i,(key,atoms)) in cells.into_iter().enumerate() {
-        packed[1+2*i]=[key[0] as u32,key[1] as u32,key[2] as u32,packed.len() as u32];
-        packed[2+2*i]=[atoms.len() as u32,0,0,0];
-        packed.extend(atoms.into_iter().map(|atom| [atom,0,0,0]));
+    let mut packed = vec![[0; 4]; 1 + 2 * cells.len()];
+    packed[0] = [
+        cells.len() as u32,
+        0,
+        flexible.len() as u32,
+        u32::from(safe),
+    ];
+    for (i, (key, atoms)) in cells.into_iter().enumerate() {
+        packed[1 + 2 * i] = [
+            key[0] as u32,
+            key[1] as u32,
+            key[2] as u32,
+            packed.len() as u32,
+        ];
+        packed[2 + 2 * i] = [atoms.len() as u32, 0, 0, 0];
+        packed.extend(atoms.into_iter().map(|atom| [atom, 0, 0, 0]));
     }
-    packed[0][1]=packed.len() as u32;
-    packed.extend(flexible.into_iter().map(|atom| [atom,0,0,0]));
+    packed[0][1] = packed.len() as u32;
+    packed.extend(flexible.into_iter().map(|atom| [atom, 0, 0, 0]));
     packed
 }
 pub struct ResidentSteric {
-    _instance: wgpu::Instance,
+    pub(crate) _context: GpuContext,
     device: wgpu::Device,
     queue: wgpu::Queue,
     buffers: Vec<wgpu::Buffer>,
@@ -56,21 +77,43 @@ pub struct ResidentSteric {
     protein: u32,
     pub capacity: u32,
     poses: Vec<AttachmentPose>,
+    _allocation: AllocationReservation,
 }
 impl ResidentSteric {
-    pub async fn new(library: &AttachmentLibrary, requested: u32) -> Result<Self, Error> {
-        Self::with_budget(library, requested, BUFFER_BUDGET).await
+    pub async fn with_context(
+        context: &GpuContext,
+        library: &AttachmentLibrary,
+        requested: u32,
+    ) -> Result<Self, Error> {
+        Self::with_budget_context(
+            context,
+            library,
+            requested,
+            context.memory_profile().budget(),
+        )
+        .await
     }
-    pub async fn with_budget(library: &AttachmentLibrary, requested: u32, budget: u64) -> Result<Self, Error> {
+
+    async fn with_budget_context(
+        context: &GpuContext,
+        library: &AttachmentLibrary,
+        requested: u32,
+        budget: u64,
+    ) -> Result<Self, Error> {
         let mut batch = requested;
         loop {
-            match Self::allocate(library, batch, budget.min(BUFFER_BUDGET)).await {
+            match Self::allocate(context, library, batch, budget).await {
                 Err(Error::Capacity) if batch > 1 => batch = (batch / 2).max(1),
                 result => return result,
             }
         }
     }
-    async fn allocate(library: &AttachmentLibrary, requested: u32, budget: u64) -> Result<Self, Error> {
+    async fn allocate(
+        context: &GpuContext,
+        library: &AttachmentLibrary,
+        requested: u32,
+        budget: u64,
+    ) -> Result<Self, Error> {
         if library.sites == 0 || library.candidate_atoms == 0 || requested == 0 {
             return Err(Error::Input("empty attachment library"));
         }
@@ -94,18 +137,8 @@ impl ResidentSteric {
         {
             return Err(Error::Input("invalid receptor update"));
         }
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&Default::default())
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("GlySys steric"),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| Error::Unavailable(e.to_string()))?;
+        let device = context.device().clone();
+        let queue = context.queue().clone();
         let grid = receptor_cells(library);
         let data: [&[u8]; 5] = [
             bytemuck::cast_slice(&library.protein),
@@ -129,6 +162,16 @@ impl ResidentSteric {
         if capacity == 0 {
             return Err(Error::Capacity);
         }
+        let reservation = context.reserve(
+            fixed
+                .checked_add(u64::from(capacity) * u64::from(library.sites) * 16)
+                .and_then(|v| {
+                    v.checked_add(u64::from(capacity) * u64::from(library.candidate_atoms) * 16)
+                })
+                .and_then(|v| v.checked_add(u64::from(capacity) * u64::from(library.sites) * 4))
+                .and_then(|v| v.checked_add(u64::from(capacity) * u64::from(library.sites) * 4))
+                .ok_or(Error::Capacity)?,
+        )?;
         device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let alloc = |name, size, usage| {
@@ -236,6 +279,8 @@ impl ResidentSteric {
                 })
             })
             .collect();
+        context.record_pipeline("steric.transform");
+        context.record_pipeline("steric.evaluate");
         let validation = device.pop_error_scope().await;
         let allocation = device.pop_error_scope().await;
         if let Some(e) = validation {
@@ -245,7 +290,7 @@ impl ResidentSteric {
             return Err(Error::Capacity);
         }
         Ok(Self {
-            _instance: instance,
+            _context: context.clone(),
             device,
             queue,
             buffers,
@@ -257,6 +302,7 @@ impl ResidentSteric {
             protein: library.protein.len() as u32,
             capacity,
             poses: library.poses.clone(),
+            _allocation: reservation,
         })
     }
     pub async fn evaluate(&mut self, genes: &[[u32; 4]], cutoff: f32) -> Result<Vec<f32>, Error> {

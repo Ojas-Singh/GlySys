@@ -18,7 +18,7 @@ impl Vec3 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Atom {
     pub(crate) name: String,
     pub(crate) atom_type: String,
@@ -31,7 +31,7 @@ pub struct Atom {
     pub(crate) position: Vec3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Residue {
     pub(crate) name: String,
     pub(crate) number: i32,
@@ -42,21 +42,21 @@ pub struct Residue {
     pub(crate) component: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Bond {
     pub(crate) atoms: [usize; 2],
     pub(crate) force: f64,
     pub(crate) length: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Angle {
     pub(crate) atoms: [usize; 3],
     pub(crate) force: f64,
     pub(crate) radians: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Dihedral {
     pub(crate) atoms: [usize; 4],
     pub(crate) force: f64,
@@ -67,7 +67,7 @@ pub struct Dihedral {
     pub(crate) scnb: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct System {
     pub atoms: Vec<Atom>,
     pub residues: Vec<Residue>,
@@ -187,6 +187,7 @@ impl ParameterizedSystem {
             "system.inpcrd",
             "system.top",
             "system.gro",
+            "system.snapshot.json",
             "manifest.json",
         ];
         if directory.exists()
@@ -216,6 +217,7 @@ impl ParameterizedSystem {
                 "system.gro",
                 crate::writers::gromacs::write_gro(&self.system),
             ),
+            ("system.snapshot.json", self.snapshot_json()?),
         ];
         let mut manifest = self.report.clone();
         manifest.output_sha256 = outputs
@@ -260,6 +262,7 @@ impl ParameterizedSystem {
                 "system.gro".to_string(),
                 crate::writers::gromacs::write_gro(&self.system),
             ),
+            ("system.snapshot.json".to_string(), self.snapshot_json()?),
         ];
         let mut manifest = self.report.clone();
         manifest.output_sha256 = outputs

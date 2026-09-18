@@ -3,12 +3,13 @@ name = "glysys-gpu"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-license = "MIT"
+license.workspace = true
 description = "Optional WebGPU molecular-mechanics evaluator for GlySys"
+repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
-glysys = { path = "../.." }
-glysys-energy = { path = "../glysys-energy" }
+glysys = { version = "0.1.0", path = "../.." }
+glysys-energy = { version = "0.1.0", path = "../glysys-energy" }
 wgpu = { version = "26", default-features = false, features = ["std", "webgpu", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 futures-channel = "0.3"
@@ -19,6 +20,6 @@ serde = { version = "1", features = ["derive"] }
 wgpu = { version = "26", default-features = false, features = ["vulkan"] }
 
 [dev-dependencies]
-glysys-dynamics = { path = "../glysys-dynamics" }
+glysys-dynamics = { version = "0.1.0", path = "../glysys-dynamics" }
 pollster = "0.4"
 naga = { version = "26", features = ["wgsl-in"] }

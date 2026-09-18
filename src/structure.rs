@@ -679,25 +679,66 @@ impl Structure {
 
     /// Retain generated hydrogens at their evaluated positions when exporting
     /// an optimized model. Existing atom identities and metadata are preserved.
-    pub fn update_with_parameterized_hydrogens(&mut self, system: &crate::ParameterizedSystem) -> Result<()> {
+    pub fn update_with_parameterized_hydrogens(
+        &mut self,
+        system: &crate::ParameterizedSystem,
+    ) -> Result<()> {
         self.update_from_parameterized(system)?;
-        let mut next=self.parsed.residues.iter().flat_map(|r|&r.atoms).map(|a|a.serial).max().unwrap_or(0);
-        let mut mapped=BTreeMap::new();
+        let mut next = self
+            .parsed
+            .residues
+            .iter()
+            .flat_map(|r| &r.atoms)
+            .map(|a| a.serial)
+            .max()
+            .unwrap_or(0);
+        let mut mapped = BTreeMap::new();
         for residue in system.residues() {
-            let id=ResidueId{chain:residue.chain().into(),number:residue.number(),insertion_code:residue.insertion_code()};
-            if self.find_residue(&id).is_none(){continue;}
+            let id = ResidueId {
+                chain: residue.chain().into(),
+                number: residue.number(),
+                insertion_code: residue.insertion_code(),
+            };
+            if self.find_residue(&id).is_none() {
+                continue;
+            }
             for index in residue.atom_range() {
-                let atom=&system.atoms()[index];
-                let serial=if let Some(existing)=self.find_atom(&id,atom.name()){existing.0} else if atom.element()==1 {
-                    next=next.checked_add(1).ok_or_else(||BuildError::InvalidPdb("atom serial overflow".into()))?;
-                    let target=self.find_residue_mut(&id).unwrap();
-                    target.atoms.push(PdbAtom{serial:next,name:atom.name().into(),residue_name:target.reference.name.clone(),chain:id.chain.clone(),residue_number:id.number,insertion_code:id.insertion_code,element:"H".into(),occupancy:1.,b_factor:0.,position:atom.position()});
+                let atom = &system.atoms()[index];
+                let serial = if let Some(existing) = self.find_atom(&id, atom.name()) {
+                    existing.0
+                } else if atom.element() == 1 {
+                    next = next
+                        .checked_add(1)
+                        .ok_or_else(|| BuildError::InvalidPdb("atom serial overflow".into()))?;
+                    let target = self.find_residue_mut(&id).unwrap();
+                    target.atoms.push(PdbAtom {
+                        serial: next,
+                        name: atom.name().into(),
+                        residue_name: target.reference.name.clone(),
+                        chain: id.chain.clone(),
+                        residue_number: id.number,
+                        insertion_code: id.insertion_code,
+                        element: "H".into(),
+                        occupancy: 1.,
+                        b_factor: 0.,
+                        position: atom.position(),
+                    });
                     next
-                } else {continue;};
-                mapped.insert(index,serial);
+                } else {
+                    continue;
+                };
+                mapped.insert(index, serial);
             }
         }
-        for bond in system.bonds(){let [a,b]=bond.atoms();if system.atoms()[a].element()!=1&&system.atoms()[b].element()!=1{continue;}if let (Some(&a),Some(&b))=(mapped.get(&a),mapped.get(&b)){self.parsed.conect.insert((a.min(b),a.max(b)));}}
+        for bond in system.bonds() {
+            let [a, b] = bond.atoms();
+            if system.atoms()[a].element() != 1 && system.atoms()[b].element() != 1 {
+                continue;
+            }
+            if let (Some(&a), Some(&b)) = (mapped.get(&a), mapped.get(&b)) {
+                self.parsed.conect.insert((a.min(b), a.max(b)));
+            }
+        }
         Ok(())
     }
 

@@ -75,7 +75,9 @@ impl BoxVectors {
         let mut out = coords.to_vec();
         for mol in molecules {
             let Some(&anchor) = mol.first() else { continue };
-            let Some(a) = coords.get(anchor) else { continue };
+            let Some(a) = coords.get(anchor) else {
+                continue;
+            };
             let shift = Vec3 {
                 x: -self.x * (a.x / self.x).floor(),
                 y: -self.y * (a.y / self.y).floor(),
@@ -212,6 +214,7 @@ pub struct PbcNeighborList {
     pub pairs: Vec<(usize, usize)>,
     pub cutoff: f64,
     pub skin: f64,
+    box_vectors: BoxVectors,
     reference: Vec<Vec3>,
 }
 
@@ -222,9 +225,15 @@ impl PbcNeighborList {
                 "neighbor cutoff must be positive and skin non-negative".into(),
             ));
         }
-        if cutoff + skin >= 0.5 * box_vec.x.min(box_vec.y).min(box_vec.z) {
+        // The physical cutoff must be below half the shortest edge.  A skin
+        // larger than that margin is still valid: the list may conservatively
+        // contain every pair in the box, but the evaluator applies the
+        // physical cutoff and minimum image exactly.  Rejecting on
+        // `cutoff + skin` would make otherwise valid NPT volume moves fail
+        // merely because an execution buffer was chosen too generously.
+        if cutoff >= 0.5 * box_vec.x.min(box_vec.y).min(box_vec.z) {
             return Err(EnergyError::InvalidConfiguration(
-                "cutoff plus skin must be below half the shortest box edge".into(),
+                "cutoff must be below half the shortest box edge".into(),
             ));
         }
         if wrapped.iter().any(|p| {
@@ -246,7 +255,11 @@ impl PbcNeighborList {
         let nx = ((box_vec.x / limit).floor() as i32).max(1);
         let ny = ((box_vec.y / limit).floor() as i32).max(1);
         let nz = ((box_vec.z / limit).floor() as i32).max(1);
-        let (cx, cy, cz) = (box_vec.x / nx as f64, box_vec.y / ny as f64, box_vec.z / nz as f64);
+        let (cx, cy, cz) = (
+            box_vec.x / nx as f64,
+            box_vec.y / ny as f64,
+            box_vec.z / nz as f64,
+        );
         let key = |p: Vec3| {
             (
                 ((p.x / cx).floor() as i32).clamp(0, nx - 1),
@@ -270,8 +283,11 @@ impl PbcNeighborList {
             for dx in -1..=1 {
                 for dy in -1..=1 {
                     for dz in -1..=1 {
-                        let Some(other) = at(cell_key.0.saturating_add(dx), cell_key.1.saturating_add(dy), cell_key.2.saturating_add(dz))
-                        else {
+                        let Some(other) = at(
+                            cell_key.0.saturating_add(dx),
+                            cell_key.1.saturating_add(dy),
+                            cell_key.2.saturating_add(dz),
+                        ) else {
                             continue;
                         };
                         for &i in members {
@@ -295,21 +311,28 @@ impl PbcNeighborList {
             pairs,
             cutoff,
             skin,
+            box_vectors: *box_vec,
             reference: wrapped.to_vec(),
         })
     }
 
+    /// A box change invalidates both the cell geometry and the displacement
+    /// reference, even when uniformly scaled coordinates happen to have the
+    /// same wrapped values.  Callers use this before checking atom motion so
+    /// NPT transitions cannot continue with a list built for the old cell.
+    pub fn box_changed(&self, box_vec: &BoxVectors) -> bool {
+        self.box_vectors != *box_vec
+    }
+
     pub fn needs_rebuild(&self, wrapped: &[Vec3]) -> bool {
         wrapped.len() != self.reference.len()
-            || wrapped
-                .iter()
-                .zip(&self.reference)
-                .any(|(c, r)| {
-                    let dx = c.x - r.x;
-                    let dy = c.y - r.y;
-                    let dz = c.z - r.z;
-                    dx * dx + dy * dy + dz * dz > (self.skin * 0.5).powi(2)
-                })
+            || wrapped.iter().zip(&self.reference).any(|(c, r)| {
+                let displacement = self.box_vectors.displacement(*c, *r);
+                let distance2 = displacement.x * displacement.x
+                    + displacement.y * displacement.y
+                    + displacement.z * displacement.z;
+                distance2 > (self.skin * 0.5).powi(2)
+            })
     }
 }
 
@@ -429,14 +452,46 @@ pub struct PbcEnergy {
     pub virial_pair_split: [f64; 2],
 }
 
+/// Thread-local result for a deterministic nonbonded reduction. Each worker
+/// walks its pair chunk in the canonical sorted order and owns a private
+/// gradient buffer; the caller combines chunks in chunk order, so parallel
+/// evaluation never needs floating-point atomics or a full pair matrix.
+struct PairChunk {
+    van_der_waals: f64,
+    electrostatics: f64,
+    gradients: Vec<Vec3>,
+    virial: f64,
+    virial_pair_split: [f64; 2],
+}
+
+impl PairChunk {
+    fn new(atom_count: usize) -> Self {
+        Self {
+            van_der_waals: 0.,
+            electrostatics: 0.,
+            gradients: vec![
+                Vec3 {
+                    x: 0.,
+                    y: 0.,
+                    z: 0.
+                };
+                atom_count
+            ],
+            virial: 0.,
+            virial_pair_split: [0., 0.],
+        }
+    }
+}
+
 /// Periodic force field borrowing topology; positions are always unwrapped.
 pub struct PbcForceField<'a> {
-    system: &'a ParameterizedSystem,
+    system: std::borrow::Cow<'a, ParameterizedSystem>,
     sigma: Vec<f64>,
     epsilon: Vec<f64>,
     charge: Vec<f64>,
     exclusions: Vec<std::collections::BTreeSet<usize>>,
     one_four: HashMap<(usize, usize), (f64, f64)>,
+    one_four_atoms: Vec<bool>,
     restraints: Vec<HarmonicRestraint>,
 }
 
@@ -466,8 +521,13 @@ impl<'a> PbcForceField<'a> {
                 torsion.lennard_jones_14_scale(),
             ));
         }
+        let mut one_four_atoms = vec![false; system.atom_count()];
+        for &(a, b) in one_four.keys() {
+            one_four_atoms[a] = true;
+            one_four_atoms[b] = true;
+        }
         Ok(Self {
-            system,
+            system: std::borrow::Cow::Borrowed(system),
             sigma: system
                 .atoms()
                 .iter()
@@ -481,8 +541,140 @@ impl<'a> PbcForceField<'a> {
             charge: system.atoms().iter().map(|a| a.charge()).collect(),
             exclusions: system.exclusions().to_vec(),
             one_four,
+            one_four_atoms,
             restraints,
         })
+    }
+
+    pub fn into_owned(self) -> PbcForceField<'static> {
+        PbcForceField {
+            system: std::borrow::Cow::Owned(self.system.into_owned()),
+            sigma: self.sigma,
+            epsilon: self.epsilon,
+            charge: self.charge,
+            exclusions: self.exclusions,
+            one_four: self.one_four,
+            one_four_atoms: self.one_four_atoms,
+            restraints: self.restraints,
+        }
+    }
+
+    /// OpenMM-compatible homogeneous long-range Lennard-Jones coefficient in
+    /// kcal mol^-1 Å^3. The returned correction is `coefficient / volume`.
+    /// Parameter classes are counted exactly as OpenMM's dispersion
+    /// correction: all particle pairs use Lorentz-Berthelot mixing and no
+    /// atom-pair matrix is materialized.
+    pub fn dispersion_coefficient(&self, cutoff: f64) -> Result<f64> {
+        if !cutoff.is_finite() || cutoff <= 0. {
+            return Err(EnergyError::InvalidConfiguration(
+                "dispersion correction needs a positive cutoff".into(),
+            ));
+        }
+        let mut classes: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+        for (&sigma, &epsilon) in self.sigma.iter().zip(&self.epsilon) {
+            if !sigma.is_finite() || !epsilon.is_finite() || sigma < 0. || epsilon < 0. {
+                return Err(EnergyError::InvalidConfiguration(
+                    "invalid Lennard-Jones parameters for dispersion correction".into(),
+                ));
+            }
+            *classes
+                .entry((sigma.to_bits(), epsilon.to_bits()))
+                .or_default() += 1;
+        }
+        let mut sum6 = 0.0;
+        let mut sum12 = 0.0;
+        let entries: Vec<((f64, f64), usize)> = classes
+            .into_iter()
+            .map(|((sigma, epsilon), count)| {
+                ((f64::from_bits(sigma), f64::from_bits(epsilon)), count)
+            })
+            .collect();
+        for i in 0..entries.len() {
+            let (a, na) = entries[i];
+            for j in i..entries.len() {
+                let (b, nb) = entries[j];
+                // GlySys stores Amber Rmin/2 radii and evaluates
+                // eps*((Rmin/r)^12 - 2*(Rmin/r)^6). OpenMM's correction is
+                // written in sigma, where sigma = Rmin / 2^(1/6).
+                let sigma = (a.0 + b.0) / 2f64.powf(1. / 6.);
+                let epsilon = (a.1 * b.1).sqrt();
+                let pair_count = if i == j {
+                    (na * (na + 1) / 2) as f64
+                } else {
+                    (na * nb) as f64
+                };
+                let sigma6 = sigma.powi(6);
+                sum12 += pair_count * epsilon * sigma6 * sigma6;
+                sum6 += pair_count * epsilon * sigma6;
+            }
+        }
+        let n = self.sigma.len() as f64;
+        if n == 0. {
+            return Ok(0.);
+        }
+        // OpenMM normalizes the class sums by the number of unordered
+        // particle pairs, then multiplies by 8πN².
+        let pair_norm = n * (n + 1.0) * 0.5;
+        Ok(8.0
+            * std::f64::consts::PI
+            * n
+            * n
+            * (sum12 / pair_norm / (9.0 * cutoff.powi(9))
+                - sum6 / pair_norm / (3.0 * cutoff.powi(3))))
+    }
+
+    /// Evaluate the cutoff Hamiltonian and optionally add the homogeneous
+    /// dispersion correction. Existing callers retain the historical
+    /// truncated-LJ behavior through `evaluate`.
+    pub fn evaluate_with_dispersion(
+        &self,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        backend: &dyn ElectrostaticsBackend,
+        cutoff: f64,
+        include_dispersion: bool,
+    ) -> Result<PbcEnergy> {
+        let coefficient = if include_dispersion {
+            self.dispersion_coefficient(cutoff)?
+        } else {
+            0.0
+        };
+        self.evaluate_with_dispersion_coefficient(
+            unwrapped,
+            box_vec,
+            pairs,
+            backend,
+            cutoff,
+            coefficient,
+            include_dispersion,
+        )
+    }
+
+    /// Evaluate with a caller-supplied homogeneous correction coefficient.
+    /// Dynamics sessions precompute this once per prepared topology and use
+    /// this entry point in their hot loop; the convenience method above stays
+    /// available for one-off scoring calls.
+    pub fn evaluate_with_dispersion_coefficient(
+        &self,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        backend: &dyn ElectrostaticsBackend,
+        cutoff: f64,
+        dispersion_coefficient: f64,
+        include_dispersion: bool,
+    ) -> Result<PbcEnergy> {
+        let mut result = self.evaluate(unwrapped, box_vec, pairs, backend, cutoff)?;
+        if include_dispersion {
+            if !dispersion_coefficient.is_finite() {
+                return Err(EnergyError::InvalidConfiguration(
+                    "non-finite dispersion correction coefficient".into(),
+                ));
+            }
+            result.components.dispersion_correction = dispersion_coefficient / box_vec.volume();
+        }
+        Ok(result)
     }
 
     pub fn evaluate(
@@ -500,7 +692,10 @@ impl<'a> PbcForceField<'a> {
                 received: unwrapped.len(),
             });
         }
-        if unwrapped.iter().any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite()) {
+        if unwrapped
+            .iter()
+            .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
+        {
             return Err(EnergyError::NonFiniteCoordinate);
         }
         let mut components = EnergyComponents::default();
@@ -548,7 +743,8 @@ impl<'a> PbcForceField<'a> {
                 gradients[i].z += f * v.z;
                 // Translation-invariant term: unwrapped coords are exact.
                 // Minus sign: virial uses forces, gradients store dE/dx.
-                virial_terms[1] -= f * (unwrapped[i].x * v.x + unwrapped[i].y * v.y + unwrapped[i].z * v.z);
+                virial_terms[1] -=
+                    f * (unwrapped[i].x * v.x + unwrapped[i].y * v.y + unwrapped[i].z * v.z);
             }
         }
         for torsion in self.system.dihedrals() {
@@ -578,49 +774,37 @@ impl<'a> PbcForceField<'a> {
                         + unwrapped[*atom].z * grad[k].z);
             }
         }
-        // Nonbonded pairs use the minimum image of wrapped positions.
+        // Nonbonded pairs use the minimum image of wrapped positions. Every
+        // worker receives a sorted contiguous chunk and reduces privately;
+        // chunks are folded below in the same order for reproducibility.
         let wrapped: Vec<Vec3> = unwrapped.iter().map(|p| box_vec.wrap(*p)).collect();
-        for &(a, b) in pairs {
-            if a >= n || b >= n {
-                continue;
+        let thread_count = rayon::current_num_threads();
+        let chunk_size = pairs
+            .len()
+            .saturating_add(thread_count.saturating_sub(1))
+            .checked_div(thread_count.max(1))
+            .unwrap_or(1)
+            .max(1);
+        let chunks: Vec<PairChunk> = if thread_count > 1 && pairs.len() >= 512 {
+            use rayon::prelude::*;
+            pairs
+                .par_chunks(chunk_size)
+                .map(|chunk| self.evaluate_pair_chunk(&wrapped, box_vec, chunk, backend, cutoff))
+                .collect()
+        } else {
+            vec![self.evaluate_pair_chunk(&wrapped, box_vec, pairs, backend, cutoff)]
+        };
+        for chunk in chunks {
+            components.van_der_waals += chunk.van_der_waals;
+            components.electrostatics += chunk.electrostatics;
+            virial_terms[3] += chunk.virial;
+            virial_pair_split[0] += chunk.virial_pair_split[0];
+            virial_pair_split[1] += chunk.virial_pair_split[1];
+            for (total, local) in gradients.iter_mut().zip(chunk.gradients) {
+                total.x += local.x;
+                total.y += local.y;
+                total.z += local.z;
             }
-            let pair = ordered(a, b);
-            let scale = self.one_four.get(&pair).copied();
-            if self.exclusions[a].contains(&b) && scale.is_none() {
-                continue;
-            }
-            let (scee, scnb) = scale.unwrap_or((1., 1.));
-            let d = box_vec.displacement(wrapped[a], wrapped[b]);
-            let r2 = d.x * d.x + d.y * d.y + d.z * d.z;
-            // Verlet lists span cutoff plus skin; only pairs inside the
-            // cutoff contribute, so rebuilds never move the Hamiltonian.
-            if r2 > cutoff * cutoff {
-                continue;
-            }
-            let r = r2.sqrt().max(1.0e-8);
-            let sig = self.sigma[a] + self.sigma[b];
-            let eps = (self.epsilon[a] * self.epsilon[b]).sqrt() / scnb;
-            let ratio6 = (sig / r).powi(6);
-            components.van_der_waals += eps * (ratio6 * ratio6 - 2. * ratio6);
-            let qq = COULOMB * self.charge[a] * self.charge[b] / scee;
-            let (ecoul, decoul_dr) = backend.pair(r, qq);
-            components.electrostatics += ecoul;
-            let flj = 12. * eps * (ratio6 - ratio6 * ratio6) / r;
-            let fmag = (flj + decoul_dr) / r;
-            gradients[a].x += fmag * d.x;
-            gradients[a].y += fmag * d.y;
-            gradients[a].z += fmag * d.z;
-            gradients[b].x -= fmag * d.x;
-            gradients[b].y -= fmag * d.y;
-            gradients[b].z -= fmag * d.z;
-            // Pair virial from the minimum-image vector: unwrapped
-            // separations can span images and would corrupt the pressure.
-            let w_pair = fmag * (d.x * d.x + d.y * d.y + d.z * d.z);
-            virial_terms[3] -= w_pair;
-            // LJ vs electrostatic split for pressure diagnostics.
-            let w_lj = (flj / r) * (d.x * d.x + d.y * d.y + d.z * d.z);
-            virial_pair_split[0] -= w_lj;
-            virial_pair_split[1] -= w_pair - w_lj;
         }
         for restraint in &self.restraints {
             if let Some(p) = unwrapped.get(restraint.atom) {
@@ -643,6 +827,75 @@ impl<'a> PbcForceField<'a> {
             virial_terms,
             virial_pair_split,
         })
+    }
+
+    fn evaluate_pair_chunk(
+        &self,
+        wrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        backend: &dyn ElectrostaticsBackend,
+        cutoff: f64,
+    ) -> PairChunk {
+        let mut result = PairChunk::new(self.system.atom_count());
+        let cutoff2 = cutoff * cutoff;
+        for &(a, b) in pairs {
+            if a >= self.system.atom_count() || b >= self.system.atom_count() {
+                continue;
+            }
+            let pair = ordered(a, b);
+            // Most explicit-solvent pairs involve water atoms, which cannot
+            // participate in a 1–4 torsion. Avoid their hash lookup while
+            // retaining the identical override and summation semantics.
+            let scale = if self.one_four_atoms[a] && self.one_four_atoms[b] {
+                self.one_four.get(&pair).copied()
+            } else {
+                None
+            };
+            if self.exclusions[a].contains(&b) && scale.is_none() {
+                continue;
+            }
+            let (scee, scnb) = scale.unwrap_or((1., 1.));
+            let d = box_vec.displacement(wrapped[a], wrapped[b]);
+            let r2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            // Verlet lists span cutoff plus skin; only pairs inside the
+            // cutoff contribute, so rebuilds never move the Hamiltonian.
+            if r2 > cutoff2 {
+                continue;
+            }
+            let r = r2.sqrt().max(1.0e-8);
+            let sig = self.sigma[a] + self.sigma[b];
+            let eps = (self.epsilon[a] * self.epsilon[b]).sqrt() / scnb;
+            let ratio6 = (sig / r).powi(6);
+            result.van_der_waals += eps * (ratio6 * ratio6 - 2. * ratio6);
+            let qq = COULOMB * self.charge[a] * self.charge[b] / scee;
+            // 1-4 exceptions bypass the electrostatics backend: OpenMM and
+            // Amber evaluate them with plain Coulomb (scaled by 1/scee),
+            // while reaction-field screening (and later PME) applies to
+            // regular pairs only.
+            let (ecoul, decoul_dr) = if scale.is_some() {
+                (qq / r, -qq / (r * r))
+            } else {
+                backend.pair(r, qq)
+            };
+            result.electrostatics += ecoul;
+            let flj = 12. * eps * (ratio6 - ratio6 * ratio6) / r;
+            let fmag = (flj + decoul_dr) / r;
+            result.gradients[a].x += fmag * d.x;
+            result.gradients[a].y += fmag * d.y;
+            result.gradients[a].z += fmag * d.z;
+            result.gradients[b].x -= fmag * d.x;
+            result.gradients[b].y -= fmag * d.y;
+            result.gradients[b].z -= fmag * d.z;
+            // Pair virial from the minimum-image vector: unwrapped
+            // separations can span images and would corrupt the pressure.
+            let w_pair = fmag * r2;
+            result.virial -= w_pair;
+            let w_lj = (flj / r) * r2;
+            result.virial_pair_split[0] -= w_lj;
+            result.virial_pair_split[1] -= w_pair - w_lj;
+        }
+        result
     }
 }
 
@@ -709,40 +962,28 @@ fn dihedral_with_gradient(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3
             for i in 0..12 {
                 g[i] = self.g[i] + o.g[i];
             }
-            Self {
-                v: self.v + o.v,
-                g,
-            }
+            Self { v: self.v + o.v, g }
         }
         fn sub(self, o: Self) -> Self {
             let mut g = [0.; 12];
             for i in 0..12 {
                 g[i] = self.g[i] - o.g[i];
             }
-            Self {
-                v: self.v - o.v,
-                g,
-            }
+            Self { v: self.v - o.v, g }
         }
         fn mul(self, o: Self) -> Self {
             let mut g = [0.; 12];
             for i in 0..12 {
                 g[i] = self.g[i] * o.v + self.v * o.g[i];
             }
-            Self {
-                v: self.v * o.v,
-                g,
-            }
+            Self { v: self.v * o.v, g }
         }
         fn div(self, o: Self) -> Self {
             let mut g = [0.; 12];
             for i in 0..12 {
                 g[i] = (self.g[i] * o.v - self.v * o.g[i]) / (o.v * o.v);
             }
-            Self {
-                v: self.v / o.v,
-                g,
-            }
+            Self { v: self.v / o.v, g }
         }
         fn sqrt(self) -> Self {
             let r = self.v.sqrt().max(1.0e-16);
@@ -794,7 +1035,7 @@ fn dihedral_with_gradient(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3
     let mut grad = [Vec3 {
         x: 0.,
         y: 0.,
-        z: 0.
+        z: 0.,
     }; 4];
     for k in 0..12 {
         let dphi = (x.v * y.g[k] - y.v * x.g[k]) / denom.v.max(1.0e-32);
@@ -822,6 +1063,20 @@ mod tests {
         assert!(w.x >= 0. && w.x < 10. && w.y >= 0. && w.y < 12. && w.z >= 0. && w.z < 14.);
         let d = b.displacement(v(9.5, 0., 0.), v(0.5, 0., 0.));
         assert!((d.x + 1.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn neighbor_skin_may_fill_the_half_box_margin() {
+        // A valid physical cutoff can be close to half the box edge.  The
+        // execution skin may then cover the complete box; rejecting that
+        // conservative list would make an otherwise valid NPT contraction
+        // fail before the force evaluator applies the real cutoff.
+        let b = BoxVectors::new(20., 20., 20.).unwrap();
+        let coords = [v(0., 0., 0.), v(9.5, 0., 0.)];
+        let list = PbcNeighborList::build(&coords, &b, 9., 3.).unwrap();
+        assert_eq!(list.pairs, vec![(0, 1)]);
+        assert_eq!(list.cutoff, 9.);
+        assert_eq!(list.skin, 3.);
     }
 
     #[test]
@@ -908,7 +1163,13 @@ mod tests {
         let base = field
             .evaluate(&coords, &box_vec, &pairs.pairs, &backend, 4.0)
             .unwrap();
-        let s = 1.0 + 1e-5;
+        // Keep the perturbation below the width at which a hard-cutoff pair
+        // can enter or leave the list.  The reaction-field potential is
+        // continuous at the cutoff, but its force is not, so a larger finite
+        // difference would measure the cutoff discontinuity rather than the
+        // virial at this configuration.
+        let h = 1.0e-6;
+        let s = 1.0 + h;
         let scaled_box = BoxVectors::new(box_vec.x * s, box_vec.y * s, box_vec.z * s).unwrap();
         let scaled: Vec<Vec3> = coords
             .iter()
@@ -925,11 +1186,40 @@ mod tests {
             .unwrap();
         // W = -3V dU/dV = -(U(s) - U(1))/ln(s): the 3 counts box
         // dimensionality (pressure acts on three face pairs).
-        let numeric = -(up.components.total() - base.components.total()) / s.ln();
+        let s_minus = 1.0 - h;
+        let scaled_box_minus = BoxVectors::new(
+            box_vec.x * s_minus,
+            box_vec.y * s_minus,
+            box_vec.z * s_minus,
+        )
+        .unwrap();
+        let scaled_minus: Vec<Vec3> = coords
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x * s_minus,
+                y: p.y * s_minus,
+                z: p.z * s_minus,
+            })
+            .collect();
+        let wminus: Vec<Vec3> = scaled_minus
+            .iter()
+            .map(|p| scaled_box_minus.wrap(*p))
+            .collect();
+        let pairs_minus = PbcNeighborList::build(&wminus, &scaled_box_minus, 4.0, 1.5).unwrap();
+        let down = field
+            .evaluate(
+                &scaled_minus,
+                &scaled_box_minus,
+                &pairs_minus.pairs,
+                &backend,
+                4.0,
+            )
+            .unwrap();
+        let numeric = -(up.components.total() - down.components.total()) / (s.ln() - s_minus.ln());
         let analytic = base.virial;
         let diff = (numeric - analytic).abs();
         assert!(
-            diff < 0.05 * analytic.abs().max(1.),
+            diff < 0.001 * analytic.abs().max(1.),
             "virial {analytic} vs volume derivative {numeric}"
         );
     }
@@ -947,5 +1237,331 @@ mod tests {
         moved[0].x += 0.5;
         assert!(list.needs_rebuild(&moved));
         assert!(!list.needs_rebuild(&wrapped));
+    }
+
+    #[test]
+    fn neighbor_rebuild_uses_minimum_image_for_reference_motion_and_box_changes() {
+        let old_box = BoxVectors::new(10., 10., 10.).unwrap();
+        let wrapped = vec![v(0.2, 5., 5.)];
+        let list = PbcNeighborList::build(&wrapped, &old_box, 1.0, 0.4).unwrap();
+        // Crossing the periodic boundary by 9.8 Å is a 0.2 Å physical move,
+        // so it must not trigger the half-skin rebuild threshold.
+        let crossed = vec![v(10.0, 5., 5.)];
+        assert!(!list.needs_rebuild(&crossed));
+        let new_box = BoxVectors::new(10.1, 10., 10.).unwrap();
+        assert!(list.box_changed(&new_box));
+        assert!(!list.box_changed(&old_box));
+    }
+}
+
+#[cfg(test)]
+mod parity_probes {
+    //! Hand-computed nonbonded probes: exclusions, 1-4 scaling, cutoff
+    //! boundary, and minimum image, checked against independently written
+    //! Amber formulas (not against the implementation's own helpers).
+    use super::*;
+
+    fn v(x: f64, y: f64, z: f64) -> Vec3 {
+        Vec3 { x, y, z }
+    }
+
+    fn small_solvated() -> glysys::ParameterizedSystem {
+        let pdb = include_str!("../../../tests/fixtures/dipeptide.pdb");
+        let options = glysys::BuildOptions {
+            add_water: true,
+            add_ions: false,
+            padding_angstrom: 6.0,
+            ..Default::default()
+        };
+        glysys::SystemBuilder::new(options)
+            .unwrap()
+            .prepare_pdb_str(pdb)
+            .unwrap()
+    }
+
+    const TIP3P_OH: f64 = 0.9572;
+
+    #[test]
+    fn excluded_pairs_contribute_nothing() {
+        let system = small_solvated();
+        let waters = classify_waters(&system);
+        assert!(waters.len() >= 2, "need waters for exclusion probes");
+        let [o, h1, h2] = waters[0];
+        // O-H is 1-2 excluded, H-H is 1-3 excluded.
+        assert!(system.exclusions()[o].contains(&h1));
+        assert!(system.exclusions()[h1].contains(&h2));
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let coords = system.coordinates();
+        let backend = ReactionField::new(4.0, 78.5).unwrap();
+        let base = field
+            .evaluate(&coords, &box_vec, &[], &backend, 4.0)
+            .unwrap();
+        assert_eq!(base.components.van_der_waals, 0.);
+        assert_eq!(base.components.electrostatics, 0.);
+        let probed = field
+            .evaluate(&coords, &box_vec, &[(o, h1), (h1, h2)], &backend, 4.0)
+            .unwrap();
+        assert_eq!(probed.components.van_der_waals, 0.);
+        assert_eq!(probed.components.electrostatics, 0.);
+        assert_eq!(probed.gradients, base.gradients);
+    }
+
+    /// Hand-written Amber 1-4 formulas for one proper torsion's end pair.
+    /// 1-4 electrostatics use plain Coulomb (scaled by 1/scee): they bypass
+    /// the reaction-field backend exactly as OpenMM exceptions do (verified:
+    /// plain sum 124.9516 vs RF-screened 64.0812 on the 40 solute pairs).
+    fn hand_14(
+        system: &glysys::ParameterizedSystem,
+        a: usize,
+        b: usize,
+        r: f64,
+        scee: f64,
+        scnb: f64,
+    ) -> (f64, f64, f64, f64) {
+        let qa = system.atoms()[a].charge();
+        let qb = system.atoms()[b].charge();
+        let sig =
+            system.atoms()[a].lennard_jones_radius() + system.atoms()[b].lennard_jones_radius();
+        let eps = (system.atoms()[a].lennard_jones_epsilon()
+            * system.atoms()[b].lennard_jones_epsilon())
+        .sqrt()
+            / scnb;
+        let u = (sig / r).powi(6);
+        let lj = eps * (u * u - 2. * u);
+        // dE/dr for the gradient check below: dE/dr = -eps*(12u^2-12u)/r
+        // since du/dr = -6u/r and dE/du = eps*(2u-2).
+        let dlj = -eps * (12. * u * u - 12. * u) / r;
+        let qq = COULOMB * qa * qb / scee;
+        let rf = qq / r;
+        let drf = -qq / (r * r);
+        (lj, rf, dlj, drf)
+    }
+
+    #[test]
+    fn one_four_scaling_matches_hand_computation() {
+        let system = small_solvated();
+        // Exclusions are built by 3-bond BFS, so every 1-4 pair is also
+        // exclusion-listed; the evaluator computes it with 1-4 scaling
+        // anyway (`excluded && scale.is_some()` branch). That exact branch is
+        // what this probe covers.
+        let torsion = system
+            .dihedrals()
+            .iter()
+            .find(|t| !t.is_improper())
+            .expect("need a proper torsion");
+        let ends = torsion.atoms();
+        let (a, b) = (ends[0], ends[3]);
+        assert!(
+            system.exclusions()[a].contains(&b),
+            "builder lists 1-4 pairs as excluded-with-scale"
+        );
+        let scee = torsion.electrostatic_14_scale();
+        let scnb = torsion.lennard_jones_14_scale();
+        assert!(scee > 1. && scnb > 1., "Amber 1-4 scales expected");
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let coords = system.coordinates();
+        let backend = ReactionField::new(4.0, 78.5).unwrap();
+        let d = box_vec.displacement(coords[a], coords[b]);
+        let r = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt();
+        assert!(r < 4.0, "1-4 pair must be inside the probe cutoff, r={r}");
+        let out = field
+            .evaluate(&coords, &box_vec, &[(a, b)], &backend, 4.0)
+            .unwrap();
+        let (lj, rf, dlj, drf) = hand_14(&system, a, b, r, scee, scnb);
+        assert!(
+            (out.components.van_der_waals - lj).abs() < 1e-9,
+            "LJ {} vs {lj}",
+            out.components.van_der_waals
+        );
+        assert!(
+            (out.components.electrostatics - rf).abs() < 1e-9,
+            "RF {} vs {rf}",
+            out.components.electrostatics
+        );
+        // Gradient check isolates the pair: bonded terms also write into
+        // `gradients`, so subtract the pairs-empty baseline first. Stored
+        // gradients are dE/dx (the integrator negates for forces).
+        let base = field
+            .evaluate(&coords, &box_vec, &[], &backend, 4.0)
+            .unwrap();
+        let fmag = (dlj + drf) / r;
+        for (got, want) in [
+            (out.gradients[a].x - base.gradients[a].x, fmag * d.x),
+            (out.gradients[a].y - base.gradients[a].y, fmag * d.y),
+            (out.gradients[a].z - base.gradients[a].z, fmag * d.z),
+        ] {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn cutoff_boundary_and_minimum_image() {
+        let system = small_solvated();
+        let waters = classify_waters(&system);
+        let [o1, _, _] = waters[0];
+        let w2 = waters[1];
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let cutoff = 4.0;
+        let backend = ReactionField::new(cutoff, 78.5).unwrap();
+        let base_coords = system.coordinates();
+        // Rigidly translate the second water so the O-O separation is an
+        // exact prescribed value; bonded terms are untouched.
+        let place = |r_target: f64| {
+            let mut coords = base_coords.clone();
+            let cur = box_vec.displacement(base_coords[w2[0]], base_coords[o1]);
+            let cur_r = (cur.x * cur.x + cur.y * cur.y + cur.z * cur.z).sqrt();
+            let shift = v(
+                base_coords[o1].x + cur.x / cur_r * r_target - base_coords[w2[0]].x,
+                base_coords[o1].y + cur.y / cur_r * r_target - base_coords[w2[0]].y,
+                base_coords[o1].z + cur.z / cur_r * r_target - base_coords[w2[0]].z,
+            );
+            for &i in &w2 {
+                coords[i] = v(
+                    coords[i].x + shift.x,
+                    coords[i].y + shift.y,
+                    coords[i].z + shift.z,
+                );
+            }
+            coords
+        };
+        // TIP3P O-O by hand (H atoms excluded from this pair's list).
+        let hand_oo = |r: f64| {
+            let sig = 2. * system.atoms()[o1].lennard_jones_radius();
+            let eps = system.atoms()[o1].lennard_jones_epsilon();
+            let u = (sig / r).powi(6);
+            let lj = eps * (u * u - 2. * u);
+            let qq = COULOMB * system.atoms()[o1].charge() * system.atoms()[w2[0]].charge();
+            let rc: f64 = cutoff;
+            let diel: f64 = 78.5;
+            let krf = (diel - 1.) / (2. * diel + 1.) / rc.powi(3);
+            let crf = 3. * diel / (2. * diel + 1.) / rc;
+            lj + qq * (1. / r + krf * r * r - crf)
+        };
+        for (r_target, expect_zero) in [(cutoff - 1e-3, false), (cutoff + 1e-3, true)] {
+            let coords = place(r_target);
+            let out = field
+                .evaluate(&coords, &box_vec, &[(o1, w2[0])], &backend, cutoff)
+                .unwrap();
+            let got = out.components.van_der_waals + out.components.electrostatics;
+            if expect_zero {
+                assert_eq!(got, 0., "pair outside cutoff must contribute nothing");
+            } else {
+                // Verifies the boundary pair is evaluated (not dropped) and
+                // matches the hand formula through the wrap.
+                assert!(
+                    (got - hand_oo(r_target)).abs() < 1e-9,
+                    "{got} vs {}",
+                    hand_oo(r_target)
+                );
+            }
+        }
+        // Minimum image: separate the oxygens by nearly a full box edge along
+        // x, so the raw distance is huge and only the wrapped 0.5 A counts.
+        let mut coords = base_coords.clone();
+        let want = v(
+            base_coords[o1].x + box_vec.x - 0.5,
+            base_coords[o1].y,
+            base_coords[o1].z,
+        );
+        let shift = v(
+            want.x - base_coords[w2[0]].x,
+            want.y - base_coords[w2[0]].y,
+            want.z - base_coords[w2[0]].z,
+        );
+        for &i in &w2 {
+            coords[i] = v(
+                coords[i].x + shift.x,
+                coords[i].y + shift.y,
+                coords[i].z + shift.z,
+            );
+        }
+        let raw = {
+            let d = v(
+                coords[w2[0]].x - coords[o1].x,
+                coords[w2[0]].y - coords[o1].y,
+                coords[w2[0]].z - coords[o1].z,
+            );
+            (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
+        };
+        assert!(raw > box_vec.x - 1., "test setup must span the box");
+        let out = field
+            .evaluate(&coords, &box_vec, &[(o1, w2[0])], &backend, cutoff)
+            .unwrap();
+        let got = out.components.van_der_waals + out.components.electrostatics;
+        assert!(
+            (got - hand_oo(0.5)).abs() < 1e-9,
+            "minimum-image energy {got} vs {}",
+            hand_oo(0.5)
+        );
+    }
+
+    #[test]
+    fn tip3p_geometry_matches_analytical_targets() {
+        // Guard for the hand probes above: fixture waters really are TIP3P.
+        let system = small_solvated();
+        let coords = system.coordinates();
+        // Solvate placement tolerance is ~1e-5 (measured 6.7e-6 max):
+        // this only guards that the hand probes below see sane TIP3P water.
+        for w in classify_waters(&system).iter().take(8) {
+            let d = |a: usize, b: usize| {
+                let dx = coords[a].x - coords[b].x;
+                let dy = coords[a].y - coords[b].y;
+                let dz = coords[a].z - coords[b].z;
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            };
+            assert!((d(w[0], w[1]) - TIP3P_OH).abs() < 1e-4);
+            assert!((d(w[0], w[2]) - TIP3P_OH).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn dispersion_correction_has_expected_inverse_volume_dependence() {
+        let system = small_solvated();
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let backend = ReactionField::new(4.0, 78.5).unwrap();
+        let box_a = BoxVectors::from_system(&system).unwrap();
+        let coords = system.coordinates();
+        let wrapped_a: Vec<Vec3> = coords.iter().map(|p| box_a.wrap(*p)).collect();
+        let pairs_a = PbcNeighborList::build(&wrapped_a, &box_a, 4.0, 1.5).unwrap();
+        let a = field
+            .evaluate_with_dispersion(&coords, &box_a, &pairs_a.pairs, &backend, 4.0, true)
+            .unwrap();
+
+        let scale = 1.07;
+        let box_b = BoxVectors::new(box_a.x * scale, box_a.y * scale, box_a.z * scale).unwrap();
+        let coords_b: Vec<Vec3> = coords
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x * scale,
+                y: p.y * scale,
+                z: p.z * scale,
+            })
+            .collect();
+        let wrapped_b: Vec<Vec3> = coords_b.iter().map(|p| box_b.wrap(*p)).collect();
+        let pairs_b = PbcNeighborList::build(&wrapped_b, &box_b, 4.0, 1.5).unwrap();
+        let b = field
+            .evaluate_with_dispersion(&coords_b, &box_b, &pairs_b.pairs, &backend, 4.0, true)
+            .unwrap();
+
+        // The homogeneous correction is C/V.  Scaling all coordinates and
+        // box vectors leaves the coefficient unchanged, so C recovered from
+        // either evaluation must agree independently of the pair energy.
+        let ca = a.components.dispersion_correction * box_a.volume();
+        let cb = b.components.dispersion_correction * box_b.volume();
+        assert!(ca.is_finite() && cb.is_finite());
+        assert!((ca - cb).abs() <= 1e-10 * ca.abs().max(1.0));
+
+        // Its volume derivative is -C/V²; this is the pressure contribution
+        // used by the MC barostat and provides a dimensional regression
+        // independent of the force virial.
+        // For a finite interval the exact secant is -C/(V₁V₂), which avoids
+        // conflating truncation error with a unit/conversion error.
+        let expected = -ca / (box_a.volume() * box_b.volume());
+        let finite = (b.components.dispersion_correction - a.components.dispersion_correction)
+            / (box_b.volume() - box_a.volume());
+        assert!((finite - expected).abs() < 1e-10 * expected.abs().max(1.0));
     }
 }

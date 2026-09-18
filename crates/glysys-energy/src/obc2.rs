@@ -117,7 +117,12 @@ pub(super) fn gradient(atoms: &[Atom], coordinates: &[Vec3], options: &Obc2Optio
             if d < 1.0e-8 {
                 continue;
             }
-            let derivative = integral(radius, (atoms[j].gb_radius() - 0.09).max(0.1) * atoms[j].gb_screen(), d).1;
+            let derivative = integral(
+                radius,
+                (atoms[j].gb_radius() - 0.09).max(0.1) * atoms[j].gb_screen(),
+                d,
+            )
+            .1;
             let factor = de_db[i] * db_di[i] * derivative / d;
             add_scaled(&mut gradient[i], delta, factor);
             add_scaled(&mut gradient[j], delta, -factor);
