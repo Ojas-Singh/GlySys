@@ -18,7 +18,7 @@ use glysys_energy::{
     pbc::NonbondedElectrostatics,
     scoring::{PreparedScene, ScoreModel},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// Options used when creating a shared GPU context.
@@ -43,6 +43,19 @@ pub struct AllocationStats {
     pub used_bytes: u64,
     pub peak_bytes: u64,
     pub reservations: u64,
+}
+
+/// Cached shader/layout/pipeline resources shared by repeated workloads.
+pub struct PipelineSet {
+    pub bind_group_layout: Arc<wgpu::BindGroupLayout>,
+    pub pipeline_layout: Arc<wgpu::PipelineLayout>,
+    pub shaders: Vec<Arc<wgpu::ShaderModule>>,
+    pub pipelines: Vec<Arc<wgpu::ComputePipeline>>,
+}
+
+#[derive(Default)]
+struct PipelineCache {
+    sets: HashMap<String, Arc<PipelineSet>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +125,7 @@ struct GpuContextInner {
     limits: wgpu::Limits,
     ledger: Arc<Mutex<AllocationLedger>>,
     pipelines: Mutex<BTreeSet<String>>,
+    pipeline_cache: Mutex<PipelineCache>,
     memory_profile: MemoryProfile,
 }
 
@@ -150,6 +164,7 @@ impl GpuContext {
                 options.memory_profile.budget(),
             ))),
             pipelines: Mutex::new(BTreeSet::new()),
+            pipeline_cache: Mutex::new(PipelineCache::default()),
             memory_profile: options.memory_profile,
         })))
     }
@@ -211,6 +226,177 @@ impl GpuContext {
             .lock()
             .map(|pipelines| pipelines.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    fn cached_pipeline_set(
+        &self,
+        key: &str,
+        create: impl FnOnce() -> Result<PipelineSet, Error>,
+    ) -> Result<(Arc<PipelineSet>, bool), Error> {
+        if let Some(set) = self
+            .0
+            .pipeline_cache
+            .lock()
+            .map_err(|_| Error::Execution("pipeline cache lock poisoned".into()))?
+            .sets
+            .get(key)
+        {
+            return Ok((Arc::clone(set), false));
+        }
+        let set = Arc::new(create()?);
+        let mut cache = self
+            .0
+            .pipeline_cache
+            .lock()
+            .map_err(|_| Error::Execution("pipeline cache lock poisoned".into()))?;
+        let set = Arc::clone(cache.sets.entry(key.to_string()).or_insert(set));
+        Ok((set, true))
+    }
+
+    /// Compile and retain the canonical steric shader and its two pipelines.
+    pub fn steric_pipeline_set(&self) -> Result<(Arc<PipelineSet>, bool), Error> {
+        self.cached_pipeline_set("steric.v1", || {
+            let device = self.device();
+            let entries = (0..9)
+                .map(|binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: if binding == 0 {
+                            wgpu::BufferBindingType::Uniform
+                        } else {
+                            wgpu::BufferBindingType::Storage {
+                                read_only: binding != 5 && binding != 6,
+                            }
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                })
+                .collect::<Vec<_>>();
+            let bind_group_layout =
+                Arc::new(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("steric bind group"),
+                    entries: &entries,
+                }));
+            let pipeline_layout =
+                Arc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("steric pipeline"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                }));
+            let shader = Arc::new(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("attachment transforms and sterics"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("steric.wgsl").into()),
+            }));
+            let pipelines = ["transform", "evaluate"]
+                .iter()
+                .map(|name| {
+                    Arc::new(device.create_compute_pipeline(
+                        &wgpu::ComputePipelineDescriptor {
+                            label: Some(name),
+                            layout: Some(&pipeline_layout),
+                            module: &shader,
+                            entry_point: Some(name),
+                            compilation_options: Default::default(),
+                            cache: None,
+                        },
+                    ))
+                })
+                .collect();
+            for name in ["steric.transform", "steric.evaluate"] {
+                self.record_pipeline(name);
+            }
+            Ok(PipelineSet {
+                bind_group_layout,
+                pipeline_layout,
+                shaders: vec![shader],
+                pipelines,
+            })
+        })
+    }
+
+    /// Compile and retain the canonical energy shader variants and pipelines.
+    pub fn energy_pipeline_set(&self) -> Result<(Arc<PipelineSet>, bool), Error> {
+        self.cached_pipeline_set("energy.v1", || {
+            let device = self.device();
+            let entries: Vec<_> = (0..8)
+                .map(|binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: if binding == 0 {
+                            wgpu::BufferBindingType::Uniform
+                        } else {
+                            wgpu::BufferBindingType::Storage {
+                                read_only: binding < 6,
+                            }
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                })
+                .collect();
+            let bind_group_layout =
+                Arc::new(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("energy bind group"),
+                    entries: &entries,
+                }));
+            let pipeline_layout =
+                Arc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("energy pipeline"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                }));
+            fn energy_source(gradients: bool) -> String {
+                include_str!("energy.wgsl").replacen(
+                    "const COMPUTE_GRADIENTS: bool = true;",
+                    &format!("const COMPUTE_GRADIENTS: bool = {gradients};"),
+                    1,
+                )
+            }
+            let shader = Arc::new(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("GlySys energies"),
+                source: wgpu::ShaderSource::Wgsl(energy_source(true).into()),
+            }));
+            let shader_nograd = Arc::new(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("GlySys energies (score-only)"),
+                source: wgpu::ShaderSource::Wgsl(energy_source(false).into()),
+            }));
+            let specs = [
+                (&shader, "born_radii", true),
+                (&shader, "born_adjoint", true),
+                (&shader, "evaluate", true),
+                (&shader, "reduce", true),
+                (&shader_nograd, "evaluate", false),
+            ];
+            let pipelines = specs
+                .iter()
+                .map(|(module, entry, _)| {
+                    Arc::new(device.create_compute_pipeline(
+                        &wgpu::ComputePipelineDescriptor {
+                            label: Some(entry),
+                            layout: Some(&pipeline_layout),
+                            module,
+                            entry_point: Some(*entry),
+                            compilation_options: Default::default(),
+                            cache: None,
+                        },
+                    ))
+                })
+                .collect();
+            for (_, entry, gradients) in specs {
+                self.record_pipeline(format!("energy.{entry}.gradients={gradients}"));
+            }
+            Ok(PipelineSet {
+                bind_group_layout,
+                pipeline_layout,
+                shaders: vec![shader, shader_nograd],
+                pipelines,
+            })
+        })
     }
 
     /// Typed workload factories keep device ownership in the coordinator and

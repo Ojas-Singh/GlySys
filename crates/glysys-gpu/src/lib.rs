@@ -122,6 +122,32 @@ pub mod hydration;
 
 pub mod dynamics;
 
+/// WebGPU error scopes are useful on native backends, but Safari's WebGPU
+/// implementation has returned a non-`GPUError` object from
+/// `popErrorScope()`. wgpu 26 currently performs an internal `dyn_into().unwrap()`
+/// for that value, which aborts the WASM worker as an opaque `unreachable`
+/// trap. Browser shader/device errors are still surfaced by the device and
+/// subsequent operation result paths; avoid the incompatible scope promise on
+/// wasm until wgpu provides a fallible conversion.
+pub(crate) fn push_error_scope(device: &wgpu::Device, filter: wgpu::ErrorFilter) {
+    #[cfg(not(target_arch = "wasm32"))]
+    device.push_error_scope(filter);
+    #[cfg(target_arch = "wasm32")]
+    let _ = (device, filter);
+}
+
+pub(crate) async fn pop_error_scope(device: &wgpu::Device) -> Option<wgpu::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        device.pop_error_scope().await
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = device;
+        None
+    }
+}
+
 pub use context::{AllocationReservation, AllocationStats, GpuContext, GpuContextOptions};
 pub use device::{ADAPTIVE_MEMORY_BUDGET, LOW_MEMORY_BUDGET, MemoryProfile};
 

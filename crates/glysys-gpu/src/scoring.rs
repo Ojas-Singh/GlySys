@@ -123,6 +123,25 @@ impl PreparedGpuEvaluator {
                 .resident
                 .evaluate(config, &coordinates, gradient)
                 .await?;
+            if output.components.len() != chunk.len() {
+                return Err(Error::Execution(format!(
+                    "GPU scoring returned {} component rows for {} poses",
+                    output.components.len(),
+                    chunk.len()
+                )));
+            }
+            if gradient {
+                let expected = chunk.len().saturating_mul(n);
+                let actual = output.gradients.as_ref().map_or(0, Vec::len);
+                if actual != expected {
+                    return Err(Error::Execution(format!(
+                        "GPU scoring returned {} gradient vectors for {} poses with {} atoms",
+                        actual,
+                        chunk.len(),
+                        n
+                    )));
+                }
+            }
             for (i, pose) in chunk.iter().enumerate() {
                 let mut terms = BTreeMap::new();
                 let mut total = 0.;

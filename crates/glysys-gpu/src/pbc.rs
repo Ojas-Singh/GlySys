@@ -590,8 +590,8 @@ impl ResidentPbc {
         }
         let reservation =
             context.reserve(heap.checked_add(3 * staging_bytes).ok_or(Error::Capacity)?)?;
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::OutOfMemory);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
         let storage = wgpu::BufferUsages::STORAGE;
         let buffer = |label: &str, size: u64, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -760,8 +760,8 @@ impl ResidentPbc {
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             )
         });
-        let validation = device.pop_error_scope().await;
-        let allocation = device.pop_error_scope().await;
+        let validation = crate::pop_error_scope(&device).await;
+        let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
             return Err(Error::Execution(e.to_string()));
         }
@@ -1173,11 +1173,11 @@ impl ResidentPbc {
     pub async fn neighbor_list(&self) -> Result<NeighborResult, Error> {
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         self.dispatch_chain(&[(0, workgroups(self.n))]);
         let count_bytes = self.readback(2, self.meta_count_off(), 4).await?;
         let directed = u32::from_le_bytes(count_bytes[0..4].try_into().unwrap());
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         if directed > 2 * self.max_pairs {
@@ -1233,7 +1233,7 @@ impl ResidentPbc {
         );
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let n = workgroups(self.n);
         self.dispatch_chain(&[
             (10, workgroups(self.n.max(self.ncells))),
@@ -1243,7 +1243,7 @@ impl ResidentPbc {
             (3, 1),
         ]);
         let result = self.read_dynamics_observables(gradients).await;
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         result
@@ -1336,7 +1336,7 @@ impl ResidentPbc {
         }
         self.queue
             .write_buffer(&self.buffers[0], 100, &1.0f32.to_le_bytes());
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let groups = workgroups(self.n.max(self.ncells));
         self.dispatch_repeated(
             &[
@@ -1353,7 +1353,7 @@ impl ResidentPbc {
             ],
             steps,
         );
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         Ok(())
@@ -1392,7 +1392,7 @@ impl ResidentPbc {
             return Err(Error::Input("NVT friction must be finite and non-negative"));
         }
         self.write_nvt_uniforms(temperature_k, friction_per_ps, 2.0);
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let groups = workgroups(self.n.max(self.ncells));
         self.dispatch_repeated(
             &[
@@ -1412,7 +1412,7 @@ impl ResidentPbc {
             ],
             steps,
         );
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         Ok(())

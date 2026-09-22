@@ -68,8 +68,8 @@ impl ResidentWaterProbe {
                 .and_then(|v| v.checked_add(capacity as u64 * 16))
                 .ok_or(Error::Capacity)?,
         )?;
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::OutOfMemory);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
         let buffer = |size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -154,8 +154,8 @@ impl ResidentWaterProbe {
             cache: None,
         });
         context.record_pipeline("hydration.evaluate");
-        let validation = device.pop_error_scope().await;
-        let allocation = device.pop_error_scope().await;
+        let validation = crate::pop_error_scope(&device).await;
+        let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
             return Err(Error::Execution(e.to_string()));
         }
@@ -211,7 +211,7 @@ impl ResidentWaterProbe {
             (cutoff.unwrap_or(0.) as f32).to_bits(),
             0,
         ];
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         self.queue
             .write_buffer(&self.buffers[0], 0, bytemuck::cast_slice(&config));
         self.queue
@@ -229,7 +229,7 @@ impl ResidentWaterProbe {
         let bytes = poses.len() as u64 * 16;
         encoder.copy_buffer_to_buffer(&self.buffers[3], 0, &self.staging, 0, bytes);
         self.queue.submit([encoder.finish()]);
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         let slice = self.staging.slice(..bytes);

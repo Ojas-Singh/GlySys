@@ -1,6 +1,7 @@
 //! Worker-owned resident compute resources. This module never starts Rayon work.
-use crate::context::{AllocationReservation, GpuContext};
+use crate::context::{AllocationReservation, GpuContext, PipelineSet};
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// The historical browser budget. It remains available as an explicit
@@ -132,7 +133,7 @@ pub struct ResidentEvaluator {
     pub(crate) queue: wgpu::Queue,
     pub(crate) buffers: Vec<wgpu::Buffer>,
     pub(crate) bind_group: wgpu::BindGroup,
-    pub(crate) pipelines: Vec<wgpu::ComputePipeline>,
+    pub(crate) pipeline_set: Arc<PipelineSet>,
     pub(crate) staging: wgpu::Buffer,
     pub(crate) atoms: u32,
     capacity: u32,
@@ -249,8 +250,8 @@ impl ResidentEvaluator {
                 .and_then(|v| v.checked_add(64))
                 .ok_or(Error::Capacity)?,
         )?;
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::OutOfMemory);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
         let buffer = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -294,33 +295,7 @@ impl ResidentEvaluator {
             count * 16 + u64::from(capacity) * 48,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
-        let entries: Vec<_> = (0..8)
-            .map(|binding| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: if binding == 0 {
-                        wgpu::BufferBindingType::Uniform
-                    } else {
-                        wgpu::BufferBindingType::Storage {
-                            read_only: binding < 6,
-                        }
-                    },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            })
-            .collect();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &entries,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
+        let (pipeline_set, _) = context.energy_pipeline_set()?;
         let entries: Vec<_> = buffers
             .iter()
             .enumerate()
@@ -331,89 +306,16 @@ impl ResidentEvaluator {
             .collect();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &layout,
+            layout: &pipeline_set.bind_group_layout,
             entries: &entries,
         });
-        // Separate error scopes per stage so a driver rejection names the
-        // exact kernel: shader-module failures (WGSL/Tint) and per-pipeline
-        // failures (backend translation, e.g. Metal library creation) need
-        // different fixes, and the adapter identity matters for both.
-        // The gradient on/off variants are baked as WGSL `const` modules
-        // instead of `override` pipeline constants: identical numerics with
-        // no override-specialization interaction on any backend.
-        fn energy_source(gradients: bool) -> String {
-            include_str!("energy.wgsl").replacen(
-                "const COMPUTE_GRADIENTS: bool = true;",
-                &format!("const COMPUTE_GRADIENTS: bool = {gradients};"),
-                1,
-            )
-        }
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GlySys energies"),
-            source: wgpu::ShaderSource::Wgsl(energy_source(true).into()),
-        });
-        if let Some(e) = device.pop_error_scope().await {
-            return Err(Error::Execution(format!(
-                "GlySys energy shader rejected on {}: {e}",
-                crate::adapter::describe(&adapter_info)
-            )));
-        }
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let shader_nograd = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GlySys energies (score-only)"),
-            source: wgpu::ShaderSource::Wgsl(energy_source(false).into()),
-        });
-        if let Some(e) = device.pop_error_scope().await {
-            return Err(Error::Execution(format!(
-                "GlySys energy score-only shader rejected on {}: {e}",
-                crate::adapter::describe(&adapter_info)
-            )));
-        }
-        let mut pipelines = Vec::with_capacity(5);
-        // Pipeline 4 reuses the `evaluate` entry with gradients baked off,
-        // matching the previous `COMPUTE_GRADIENTS=false` specialization.
-        for (module, entry, gradients) in [
-            (&shader, "born_radii", true),
-            (&shader, "born_adjoint", true),
-            (&shader, "evaluate", true),
-            (&shader, "reduce", true),
-            (&shader_nograd, "evaluate", false),
-        ] {
-            device.push_error_scope(wgpu::ErrorFilter::Validation);
-            pipelines.push(
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(entry),
-                    layout: Some(&pipeline_layout),
-                    module,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                }),
-            );
-            if let Some(e) = device.pop_error_scope().await {
-                return Err(Error::Execution(format!(
-                    "GlySys energy pipeline '{entry}' (gradients={gradients}) rejected on {}: {e}",
-                    crate::adapter::describe(&adapter_info)
-                )));
-            }
-        }
-        for (_, entry, gradients) in [
-            (&shader, "born_radii", true),
-            (&shader, "born_adjoint", true),
-            (&shader, "evaluate", true),
-            (&shader, "reduce", true),
-            (&shader_nograd, "evaluate", false),
-        ] {
-            context.record_pipeline(format!("energy.{entry}.gradients={gradients}"));
-        }
-        let validation = device.pop_error_scope().await;
-        let allocation = device.pop_error_scope().await;
+        let validation = crate::pop_error_scope(&device).await;
+        let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
             return Err(Error::Execution(e.to_string()));
         }
         if allocation.is_some() {
-            drop(pipelines);
+            drop(pipeline_set);
             drop(bind_group);
             drop(buffers);
             drop(staging);
@@ -428,7 +330,7 @@ impl ResidentEvaluator {
             queue,
             buffers,
             bind_group,
-            pipelines,
+            pipeline_set,
             staging,
             atoms,
             capacity,
@@ -473,7 +375,7 @@ impl ResidentEvaluator {
         if coordinates.iter().flatten().any(|v| !v.is_finite()) {
             return Err(Error::Input("nonfinite coordinate"));
         }
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         self.queue
             .write_buffer(&self.buffers[0], 0, bytemuck::bytes_of(&config));
         self.queue
@@ -483,7 +385,8 @@ impl ResidentEvaluator {
             if i == 1 && !gradients {
                 continue;
             }
-            let pipeline = &self.pipelines[if i == 2 && !gradients { 4 } else { i }];
+            let pipeline =
+                &self.pipeline_set.pipelines[if i == 2 && !gradients { 4 } else { i }];
             if i < 2 && (config.energy[2] == 0.0 || config.size[2] != 0) {
                 continue;
             }
@@ -516,7 +419,7 @@ impl ResidentEvaluator {
             );
         }
         self.queue.submit([encoder.finish()]);
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         let bytes = summary + if gradients { count * 16 } else { 0 };

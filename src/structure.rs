@@ -135,7 +135,7 @@ impl AppendMap {
 impl Structure {
     pub(crate) fn from_parsed(parsed: ParsedPdb) -> Self {
         let protein_chains = parsed.chains.clone();
-        let glycosylation_sites = parsed
+        let mut glycosylation_sites = parsed
             .links
             .iter()
             .filter_map(|link| {
@@ -170,6 +170,22 @@ impl Structure {
                 }
             })
             .collect::<Vec<_>>();
+        // A number of deposited glycoprotein PDBs (including GLYCAM output)
+        // encode the protein--sugar bond only in CONECT records.  The report
+        // parser can still identify those glycans, but attachment metadata must
+        // be promoted here as well so replacement, validation, and downstream
+        // geometry all agree on the occupied site.  Keep LINK-derived records
+        // authoritative and add only missing protein-to-glycan connections.
+        for site in conect_glycosylation_sites(&parsed) {
+            if !glycosylation_sites.iter().any(|existing| {
+                existing.protein_residue == site.protein_residue
+                    && existing.glycan_residue == site.glycan_residue
+                    && existing.protein_atom == site.protein_atom
+                    && existing.glycan_atom == site.glycan_atom
+            }) {
+                glycosylation_sites.push(site);
+            }
+        }
         let glycan_trees = glycosylation_sites
             .iter()
             .map(|site| {
@@ -860,6 +876,124 @@ fn linked_glycan_residues(parsed: &ParsedPdb, root: &ResidueId) -> BTreeSet<Resi
     visited
 }
 
+/// Infer protein--glycan attachment records from atom-level CONECT entries.
+///
+/// Only connections whose protein-side residue is identified by the
+/// crabWURCS glycan report or whose non-protein residue has a standard sugar
+/// name are promoted.  This avoids treating arbitrary covalent ligands, metals,
+/// or crosslinks as glycosylation sites.
+fn conect_glycosylation_sites(parsed: &ParsedPdb) -> Vec<GlycosylationSite> {
+    let atoms = parsed
+        .residues
+        .iter()
+        .flat_map(|residue| {
+            let residue_id = residue_id(&residue.reference);
+            let protein = crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str());
+            let residue_name = residue.reference.name.clone();
+            residue.atoms.iter().map(move |atom| {
+                (
+                    atom.serial,
+                    (
+                        residue_id.clone(),
+                        residue_name.clone(),
+                        atom.name.clone(),
+                        protein,
+                    ),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut sites = Vec::new();
+    for (first, second) in &parsed.conect {
+        let Some((first_residue, first_name, first_atom, first_protein)) = atoms.get(first) else {
+            continue;
+        };
+        let Some((second_residue, second_name, second_atom, second_protein)) = atoms.get(second)
+        else {
+            continue;
+        };
+        let (protein_residue, protein_name, protein_atom, glycan_residue, glycan_name, glycan_atom) =
+            if *first_protein && !*second_protein {
+                (
+                    first_residue,
+                    first_name,
+                    first_atom,
+                    second_residue,
+                    second_name,
+                    second_atom,
+                )
+            } else if *second_protein && !*first_protein {
+                (
+                    second_residue,
+                    second_name,
+                    second_atom,
+                    first_residue,
+                    first_name,
+                    first_atom,
+                )
+            } else {
+                continue;
+            };
+        if !reported_glycan_site(parsed, protein_residue, protein_name)
+            && !is_common_glycan_residue(glycan_name)
+        {
+            continue;
+        }
+        sites.push(GlycosylationSite {
+            protein_residue: protein_residue.clone(),
+            protein_atom: protein_atom.clone(),
+            glycan_residue: glycan_residue.clone(),
+            glycan_atom: glycan_atom.clone(),
+        });
+    }
+    sites
+}
+
+fn reported_glycan_site(parsed: &ParsedPdb, residue: &ResidueId, name: &str) -> bool {
+    parsed.glycans.iter().any(|glycan| {
+        let Some(site) = glycan.attachment_site.as_deref() else {
+            return false;
+        };
+        let mut fields = site.split('/');
+        fields.next() == Some(residue.chain.as_str())
+            && fields.next() == Some(name)
+            && fields
+                .next()
+                .and_then(|number| number.trim().parse::<i32>().ok())
+                == Some(residue.number)
+    })
+}
+
+fn is_common_glycan_residue(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "NAG"
+            | "NDG"
+            | "BMA"
+            | "MAN"
+            | "MAG"
+            | "GAL"
+            | "GLC"
+            | "GAM"
+            | "FUC"
+            | "XYS"
+            | "XYP"
+            | "SIA"
+            | "NEU"
+            | "KDO"
+            | "RIB"
+            | "ARA"
+            | "IDO"
+            | "GCU"
+            | "G6D"
+            | "GNA"
+            | "AMN"
+            | "NGA"
+            | "GLA"
+            | "NAN"
+    )
+}
+
 fn key_to_residue_id(key: &ResidueKey) -> ResidueId {
     ResidueId {
         chain: key.chain.clone(),
@@ -1092,5 +1226,23 @@ END
                 insertion_code: None,
             }
         );
+    }
+
+    #[test]
+    fn conect_only_protein_glycan_bond_populates_attachment_metadata() {
+        let input = "\
+ATOM      1  N   ASN A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  ND2 ASN A   1       1.000   0.000   0.000  1.00  0.00           N
+HETATM    3  C1  NAG B   1       2.400   0.000   0.000  1.00  0.00           C
+CONECT    2    3
+END
+";
+        let structure = read_pdb_str(input, &BuildOptions::default()).expect("parse fixture");
+        assert_eq!(structure.metadata().glycosylation_sites.len(), 1);
+        let attachment = &structure.metadata().glycosylation_sites[0];
+        assert_eq!(attachment.protein_atom, "ND2");
+        assert_eq!(attachment.glycan_atom, "C1");
+        assert_eq!(structure.metadata().glycan_trees.len(), 1);
+        assert_eq!(structure.metadata().glycan_trees[0].residue_ids.len(), 1);
     }
 }

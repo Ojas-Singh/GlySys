@@ -1,7 +1,8 @@
 //! Resident attachment library and batched traversal-compatible steric screening.
-use crate::context::{AllocationReservation, GpuContext};
+use crate::context::{AllocationReservation, GpuContext, PipelineSet};
 use crate::device::Error;
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -71,7 +72,7 @@ pub struct ResidentSteric {
     buffers: Vec<wgpu::Buffer>,
     staging: wgpu::Buffer,
     bind: wgpu::BindGroup,
-    pipelines: Vec<wgpu::ComputePipeline>,
+    pipeline_set: Arc<PipelineSet>,
     sites: u32,
     atoms: u32,
     protein: u32,
@@ -172,8 +173,8 @@ impl ResidentSteric {
                 .and_then(|v| v.checked_add(u64::from(capacity) * u64::from(library.sites) * 4))
                 .ok_or(Error::Capacity)?,
         )?;
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::OutOfMemory);
+        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
         let alloc = |name, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(name),
@@ -222,33 +223,7 @@ impl ResidentSteric {
             u64::from(capacity) * u64::from(library.sites) * 4,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         );
-        let entries = (0..9)
-            .map(|binding| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: if binding == 0 {
-                        wgpu::BufferBindingType::Uniform
-                    } else {
-                        wgpu::BufferBindingType::Storage {
-                            read_only: binding != 5 && binding != 6,
-                        }
-                    },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            })
-            .collect::<Vec<_>>();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &entries,
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
+        let (pipeline_set, _) = context.steric_pipeline_set()?;
         let entries = buffers
             .iter()
             .enumerate()
@@ -259,30 +234,11 @@ impl ResidentSteric {
             .collect::<Vec<_>>();
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &layout,
+            layout: &pipeline_set.bind_group_layout,
             entries: &entries,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("attachment transforms and sterics"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("steric.wgsl").into()),
-        });
-        let pipelines = ["transform", "evaluate"]
-            .iter()
-            .map(|name| {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(name),
-                    layout: Some(&pl),
-                    module: &shader,
-                    entry_point: Some(name),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            })
-            .collect();
-        context.record_pipeline("steric.transform");
-        context.record_pipeline("steric.evaluate");
-        let validation = device.pop_error_scope().await;
-        let allocation = device.pop_error_scope().await;
+        let validation = crate::pop_error_scope(&device).await;
+        let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
             return Err(Error::Execution(e.to_string()));
         }
@@ -296,7 +252,7 @@ impl ResidentSteric {
             buffers,
             staging,
             bind,
-            pipelines,
+            pipeline_set,
             sites: library.sites,
             atoms: library.candidate_atoms,
             protein: library.protein.len() as u32,
@@ -339,13 +295,13 @@ impl ResidentSteric {
             0,
             0,
         ];
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         self.queue
             .write_buffer(&self.buffers[0], 0, bytemuck::cast_slice(&config));
         self.queue
             .write_buffer(&self.buffers[4], 0, bytemuck::cast_slice(genes));
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for pipeline in &self.pipelines {
+        for pipeline in &self.pipeline_set.pipelines {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
@@ -354,7 +310,7 @@ impl ResidentSteric {
         let bytes = u64::from(count) * 4;
         encoder.copy_buffer_to_buffer(&self.buffers[6], 0, &self.staging, 0, bytes);
         self.queue.submit([encoder.finish()]);
-        if let Some(e) = self.device.pop_error_scope().await {
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
         let slice = self.staging.slice(..bytes);
