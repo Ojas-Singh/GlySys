@@ -40,22 +40,20 @@ fn cell_range(key:vec3<i32>)->vec2<u32> {
  return vec2<u32>(0u);
 }
 fn indexed_protein_score(p:vec3<f32>,candidate:u32,initial:f32)->f32 {
- var cursors:array<u32,28>;var ends:array<u32,28>;var stream=0u;
+ var score=initial;
  let key=vec3<i32>(floor(p/3.4));
  for(var x=-1;x<=1;x++){for(var y=-1;y<=1;y++){for(var z=-1;z<=1;z++){
-  let range=cell_range(key+vec3<i32>(x,y,z));cursors[stream]=range.x;ends[stream]=range.y;stream++;
+  let range=cell_range(key+vec3<i32>(x,y,z));
+  for(var cursor=range.x;cursor<range.y;cursor++){
+   let atom=grid[cursor].x;let delta=p-protein[atom].xyz;let d2=dot(delta,delta);
+   if(abs(d2-config.values.x)<0.002){return -1.;}
+   if(d2<config.values.x){score+=200.*exp(-d2);if(score>2.){return score;}}
+  }
  }}}
- cursors[27]=grid[0].y;ends[27]=grid[0].y+grid[0].z;
- var score=initial;
- loop {
-  var smallest=0xffffffffu;var selected=0u;
-  for(var k=0u;k<28u;k++){if(cursors[k]<ends[k]){let atom=grid[cursors[k]].x;if(atom<smallest){smallest=atom;selected=k;}}}
-  if(smallest==0xffffffffu){break;}
-  cursors[selected]++;
-  var q=protein[smallest].xyz;if(selected==27u){q=protein_point(candidate,smallest);}
-  let delta=p-q;let d2=dot(delta,delta);
+ for(var cursor=grid[0].y;cursor<grid[0].y+grid[0].z;cursor++){
+  let atom=grid[cursor].x;let delta=p-protein_point(candidate,atom);let d2=dot(delta,delta);
   if(abs(d2-config.values.x)<0.002){return -1.;}
-  if(d2<config.values.x){score+=200.*exp(-d2);if(score>2.){break;}}
+  if(d2<config.values.x){score+=200.*exp(-d2);if(score>2.){return score;}}
  }
  return score;
 }
