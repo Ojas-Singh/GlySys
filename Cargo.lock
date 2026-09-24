@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "glysys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-dynamics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glysys",
  "glysys-energy",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-energy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glysys",
  "pulp",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "futures-channel",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-md"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-opt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "glysys-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glysys",
  "glysys-dynamics",
