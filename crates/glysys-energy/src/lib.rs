@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use glysys::{Atom, ParameterizedSystem, Vec3};
 use pulp::{Arch, Simd, WithSimd};
+use rayon::prelude::*;
 
 const COULOMB_KCAL_ANGSTROM: f64 = 332.063_713_299;
 
@@ -191,40 +192,83 @@ impl SolventModel for Obc2Options {
     fn components(&self, atoms: &[Atom], coordinates: &[Vec3]) -> (f64, f64) {
         let born = obc2_born_radii(atoms, coordinates);
         let dielectric = 1.0 / self.solute_dielectric - 1.0 / self.solvent_dielectric;
-        let mut polar = 0.0;
-        for first in 0..atoms.len() {
-            for second in first..atoms.len() {
-                let distance2 = if first == second {
-                    0.0
-                } else {
-                    squared_distance(coordinates[first], coordinates[second])
-                };
-                let denominator = (distance2
-                    + born[first]
-                        * born[second]
-                        * (-distance2 / (4.0 * born[first] * born[second])).exp())
-                .sqrt()
-                .max(1.0e-8);
-                let factor = if first == second { 0.5 } else { 1.0 };
-                polar -= factor
-                    * COULOMB_KCAL_ANGSTROM
-                    * dielectric
-                    * atoms[first].charge()
-                    * atoms[second].charge()
-                    / denominator;
+        let (polar, surface) = if atoms.len() >= 128 {
+            let polar_rows: Vec<f64> = (0..atoms.len())
+                .into_par_iter()
+                .map(|first| {
+                    let mut row = 0.0;
+                    for second in first..atoms.len() {
+                        let distance2 = if first == second {
+                            0.0
+                        } else {
+                            squared_distance(coordinates[first], coordinates[second])
+                        };
+                        let denominator = (distance2
+                            + born[first]
+                                * born[second]
+                                * (-distance2 / (4.0 * born[first] * born[second])).exp())
+                        .sqrt()
+                        .max(1.0e-8);
+                        let factor = if first == second { 0.5 } else { 1.0 };
+                        row -= factor
+                            * COULOMB_KCAL_ANGSTROM
+                            * dielectric
+                            * atoms[first].charge()
+                            * atoms[second].charge()
+                            / denominator;
+                    }
+                    row
+                })
+                .collect();
+            let surface_rows: Vec<f64> = atoms
+                .par_iter()
+                .zip(&born)
+                .map(|(atom, born)| {
+                    let radius = atom.gb_radius();
+                    4.0 * std::f64::consts::PI
+                        * self.surface_tension
+                        * (radius + self.probe_radius).powi(2)
+                        * (radius / born).powi(6)
+                })
+                .collect();
+            (polar_rows.into_iter().sum(), surface_rows.into_iter().sum())
+        } else {
+            let mut polar = 0.0;
+            for first in 0..atoms.len() {
+                for second in first..atoms.len() {
+                    let distance2 = if first == second {
+                        0.0
+                    } else {
+                        squared_distance(coordinates[first], coordinates[second])
+                    };
+                    let denominator = (distance2
+                        + born[first]
+                            * born[second]
+                            * (-distance2 / (4.0 * born[first] * born[second])).exp())
+                    .sqrt()
+                    .max(1.0e-8);
+                    let factor = if first == second { 0.5 } else { 1.0 };
+                    polar -= factor
+                        * COULOMB_KCAL_ANGSTROM
+                        * dielectric
+                        * atoms[first].charge()
+                        * atoms[second].charge()
+                        / denominator;
+                }
             }
-        }
-        let surface = atoms
-            .iter()
-            .zip(&born)
-            .map(|(atom, born)| {
-                let radius = atom.gb_radius();
-                4.0 * std::f64::consts::PI
-                    * self.surface_tension
-                    * (radius + self.probe_radius).powi(2)
-                    * (radius / born).powi(6)
-            })
-            .sum();
+            let surface = atoms
+                .iter()
+                .zip(&born)
+                .map(|(atom, born)| {
+                    let radius = atom.gb_radius();
+                    4.0 * std::f64::consts::PI
+                        * self.surface_tension
+                        * (radius + self.probe_radius).powi(2)
+                        * (radius / born).powi(6)
+                })
+                .sum();
+            (polar, surface)
+        };
         (polar, surface)
     }
 }
@@ -507,6 +551,18 @@ impl<'a> EnergyEvaluator<'a> {
     /// forward automatic differentiation.
     pub fn energy_and_gradient(&self, coordinates: &[Vec3]) -> Result<EnergyResult> {
         let components = self.components(coordinates)?;
+        let gradients = self.gradient_only(coordinates)?;
+        Ok(EnergyResult {
+            components,
+            gradients: Some(gradients),
+        })
+    }
+
+    /// Evaluate only the Cartesian gradient. Dynamics uses this on ordinary
+    /// integration steps and requests full energy components at report and
+    /// checkpoint boundaries, avoiding a second OBC2 all-pairs energy pass.
+    pub fn gradient_only(&self, coordinates: &[Vec3]) -> Result<Vec<Vec3>> {
+        validate_coordinates(self.system.atom_count(), coordinates)?;
         let mut gradients = self.analytic_gradient(coordinates, &[1.0; 9])?;
         for (gradient, residual) in gradients
             .iter_mut()
@@ -516,10 +572,7 @@ impl<'a> EnergyEvaluator<'a> {
             gradient.y += residual.y;
             gradient.z += residual.z;
         }
-        Ok(EnergyResult {
-            components,
-            gradients: Some(gradients),
-        })
+        Ok(gradients)
     }
 
     /// Analytic derivative of an explicitly weighted component sum.
@@ -636,17 +689,24 @@ impl<'a> EnergyEvaluator<'a> {
             add_scaled(&mut gradient[center], third_derivative, -factor);
         }
         let exclusions = self.system.exclusions();
-        for (first, second) in self.nonbonded_pairs(coordinates) {
-            let vector = subtract(coordinates[first], coordinates[second]);
-            let radius = norm(vector).max(1.0e-8);
+        let atoms = self.system.atoms();
+        let mut apply_pair = |first: usize, second: usize| {
+            if self.active_terms_only
+                && !self.selection.is_movable(first)
+                && !self.selection.is_movable(second)
+            {
+                return;
+            }
             let pair = ordered(first, second);
             let scale_14 = self.one_four.get(&pair).copied();
             if exclusions[first].contains(&second) && scale_14.is_none() {
-                continue;
+                return;
             }
             let (scee, scnb) = scale_14.unwrap_or((1.0, 1.0));
-            let first_atom = &self.system.atoms()[first];
-            let second_atom = &self.system.atoms()[second];
+            let vector = subtract(coordinates[first], coordinates[second]);
+            let radius = norm(vector).max(1.0e-8);
+            let first_atom = &atoms[first];
+            let second_atom = &atoms[second];
             let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
             let epsilon =
                 (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
@@ -658,6 +718,20 @@ impl<'a> EnergyEvaluator<'a> {
                 - weights[5] * coulomb / radius;
             add_scaled(&mut gradient[first], vector, derivative / radius);
             add_scaled(&mut gradient[second], vector, -derivative / radius);
+        };
+        if self.options.cutoff.is_none() && !self.active_terms_only {
+            // The implicit OBC2 model is all-pairs. Walk the deterministic
+            // upper triangle directly instead of allocating and sorting a
+            // 206k-entry pair vector on every force evaluation.
+            for first in 0..coordinates.len() {
+                for second in first + 1..coordinates.len() {
+                    apply_pair(first, second);
+                }
+            }
+        } else {
+            for (first, second) in self.nonbonded_pairs(coordinates) {
+                apply_pair(first, second);
+            }
         }
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
@@ -690,9 +764,9 @@ impl<'a> EnergyEvaluator<'a> {
             };
             coordinates.len()
         ];
-        // Torsions are local four-atom terms. Differentiate each in its own
-        // fixed 12-dimensional space instead of allocating 3*N derivatives
-        // for every operation in every torsion.
+        // Torsions are local four-atom terms. Use the fixed-size derivative
+        // kernel shared with the periodic evaluator instead of allocating a
+        // heap-backed derivative vector for every scalar operation.
         for torsion in self.system.dihedrals() {
             let atoms = torsion.atoms();
             if self.active_terms_only
@@ -702,31 +776,17 @@ impl<'a> EnergyEvaluator<'a> {
             {
                 continue;
             }
-            let points = atoms.map(|atom| {
-                let point = coordinates[atom];
-                let local = atoms
-                    .iter()
-                    .position(|candidate| *candidate == atom)
-                    .unwrap();
-                DualVec3 {
-                    x: Dual::coordinate(point.x, 12, Some(local * 3)),
-                    y: Dual::coordinate(point.y, 12, Some(local * 3 + 1)),
-                    z: Dual::coordinate(point.z, 12, Some(local * 3 + 2)),
-                }
-            });
-            let phi = dual_dihedral(&points[0], &points[1], &points[2], &points[3]);
-            let argument = phi
-                .scale(torsion.periodicity() as f64)
-                .add_constant(-torsion.phase());
-            let term = argument
-                .cos()
-                .add_constant(1.0)
-                .scale(torsion.force() * weights[if torsion.is_improper() { 3 } else { 2 }]);
+            let points = atoms.map(|atom| coordinates[atom]);
+            let (phi, phi_gradient) =
+                pbc::dihedral_with_gradient(points[0], points[1], points[2], points[3]);
+            let periodicity = torsion.periodicity() as f64;
+            let derivative = -torsion.force()
+                * periodicity
+                * (periodicity * phi - torsion.phase()).sin()
+                * weights[if torsion.is_improper() { 3 } else { 2 }];
             for (local, atom) in atoms.iter().enumerate() {
                 if self.selection.is_movable(*atom) {
-                    gradients[*atom].x += term.gradient[local * 3];
-                    gradients[*atom].y += term.gradient[local * 3 + 1];
-                    gradients[*atom].z += term.gradient[local * 3 + 2];
+                    add_scaled(&mut gradients[*atom], phi_gradient[local], derivative);
                 }
             }
         }
@@ -874,12 +934,14 @@ impl<'a> EnergyEvaluator<'a> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct Dual {
     value: f64,
     gradient: Vec<f64>,
 }
 
+#[cfg(test)]
 impl Dual {
     fn constant(value: f64, dimension: usize) -> Self {
         Self {
@@ -1011,33 +1073,6 @@ impl Dual {
         }
     }
 
-    fn cos(self) -> Self {
-        let factor = -self.value.sin();
-        Self {
-            value: self.value.cos(),
-            gradient: self
-                .gradient
-                .into_iter()
-                .map(|gradient| gradient * factor)
-                .collect(),
-        }
-    }
-
-    fn atan2(self, x: Self) -> Self {
-        let denominator = self.value * self.value + x.value * x.value;
-        let y_value = self.value;
-        let x_value = x.value;
-        Self {
-            value: y_value.atan2(x_value),
-            gradient: self
-                .gradient
-                .into_iter()
-                .zip(x.gradient)
-                .map(|(dy, dx)| (x_value * dy - y_value * dx) / denominator.max(1.0e-30))
-                .collect(),
-        }
-    }
-
     #[cfg(test)]
     fn powi(self, exponent: usize) -> Self {
         if exponent == 0 {
@@ -1073,6 +1108,7 @@ impl Dual {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct DualVec3 {
     x: Dual,
@@ -1080,6 +1116,7 @@ struct DualVec3 {
     z: Dual,
 }
 
+#[cfg(test)]
 fn dual_subtract(first: &DualVec3, second: &DualVec3) -> DualVec3 {
     DualVec3 {
         x: first.x.clone().sub(second.x.clone()),
@@ -1088,14 +1125,7 @@ fn dual_subtract(first: &DualVec3, second: &DualVec3) -> DualVec3 {
     }
 }
 
-fn dual_scale(vector: &DualVec3, factor: Dual) -> DualVec3 {
-    DualVec3 {
-        x: vector.x.clone().mul(factor.clone()),
-        y: vector.y.clone().mul(factor.clone()),
-        z: vector.z.clone().mul(factor),
-    }
-}
-
+#[cfg(test)]
 fn dual_dot(first: &DualVec3, second: &DualVec3) -> Dual {
     first
         .x
@@ -1103,37 +1133,6 @@ fn dual_dot(first: &DualVec3, second: &DualVec3) -> Dual {
         .mul(second.x.clone())
         .add(first.y.clone().mul(second.y.clone()))
         .add(first.z.clone().mul(second.z.clone()))
-}
-
-fn dual_cross(first: &DualVec3, second: &DualVec3) -> DualVec3 {
-    DualVec3 {
-        x: first
-            .y
-            .clone()
-            .mul(second.z.clone())
-            .sub(first.z.clone().mul(second.y.clone())),
-        y: first
-            .z
-            .clone()
-            .mul(second.x.clone())
-            .sub(first.x.clone().mul(second.z.clone())),
-        z: first
-            .x
-            .clone()
-            .mul(second.y.clone())
-            .sub(first.y.clone().mul(second.x.clone())),
-    }
-}
-
-fn dual_dihedral(first: &DualVec3, second: &DualVec3, third: &DualVec3, fourth: &DualVec3) -> Dual {
-    let b0 = dual_subtract(first, second);
-    let b1 = dual_subtract(third, second);
-    let b2 = dual_subtract(fourth, third);
-    let inverse_norm = dual_dot(&b1, &b1).sqrt().floor(1.0e-30).reciprocal();
-    let normalized = dual_scale(&b1, inverse_norm);
-    let v = dual_subtract(&b0, &dual_scale(&normalized, dual_dot(&b0, &normalized)));
-    let w = dual_subtract(&b2, &dual_scale(&normalized, dual_dot(&b2, &normalized)));
-    dual_dot(&dual_cross(&normalized, &v), &w).atan2(dual_dot(&v, &w))
 }
 
 #[cfg(test)]
@@ -1297,40 +1296,48 @@ impl NeighborList {
 }
 
 fn obc2_born_radii(atoms: &[Atom], coordinates: &[Vec3]) -> Vec<f64> {
+    if atoms.len() >= 128 {
+        return (0..atoms.len())
+            .into_par_iter()
+            .map(|first| obc2_born_radius(first, atoms, coordinates))
+            .collect();
+    }
+    (0..atoms.len())
+        .map(|first| obc2_born_radius(first, atoms, coordinates))
+        .collect()
+}
+
+fn obc2_born_radius(first: usize, atoms: &[Atom], coordinates: &[Vec3]) -> f64 {
     const OFFSET: f64 = 0.09;
     const ALPHA: f64 = 1.0;
     const BETA: f64 = 0.8;
     const GAMMA: f64 = 4.85;
-    let mut born = Vec::with_capacity(atoms.len());
-    for first in 0..atoms.len() {
-        let radius = (atoms[first].gb_radius() - OFFSET).max(0.1);
-        let mut integral = 0.0;
-        for second in 0..atoms.len() {
-            if first == second {
-                continue;
-            }
-            let distance = distance(coordinates[first], coordinates[second]).max(1.0e-8);
-            let scaled = (atoms[second].gb_radius() - OFFSET).max(0.1) * atoms[second].gb_screen();
-            if distance + scaled <= radius {
-                continue;
-            }
-            let lower = radius.max((distance - scaled).abs());
-            let upper = distance + scaled;
-            if lower >= upper {
-                continue;
-            }
-            integral += 0.5
-                * (1.0 / lower - 1.0 / upper
-                    + 0.25
-                        * (distance - scaled * scaled / distance)
-                        * (1.0 / (upper * upper) - 1.0 / (lower * lower))
-                    + 0.5 / distance * (lower / upper).ln());
+    let radius = (atoms[first].gb_radius() - OFFSET).max(0.1);
+    let mut integral = 0.0;
+    for second in 0..atoms.len() {
+        if first == second {
+            continue;
         }
-        let psi = radius * integral;
-        let tanh = (ALPHA * psi - BETA * psi * psi + GAMMA * psi.powi(3)).tanh();
-        born.push(1.0 / (1.0 / radius - tanh / atoms[first].gb_radius()).max(1.0e-6));
+        let distance = distance(coordinates[first], coordinates[second]).max(1.0e-8);
+        let scaled = (atoms[second].gb_radius() - OFFSET).max(0.1) * atoms[second].gb_screen();
+        if distance + scaled <= radius {
+            continue;
+        }
+        let lower = radius.max((distance - scaled).abs());
+        let upper = distance + scaled;
+        if lower >= upper {
+            continue;
+        }
+        integral += 0.5
+            * (1.0 / lower - 1.0 / upper
+                + 0.25
+                    * (distance - scaled * scaled / distance)
+                    * (1.0 / (upper * upper) - 1.0 / (lower * lower))
+                + 0.5 / distance * (lower / upper).ln());
     }
-    born
+    let psi = radius * integral;
+    let tanh = (ALPHA * psi - BETA * psi * psi + GAMMA * psi.powi(3)).tanh();
+    1.0 / (1.0 / radius - tanh / atoms[first].gb_radius()).max(1.0e-6)
 }
 
 fn validate_coordinates(expected: usize, coordinates: &[Vec3]) -> Result<()> {

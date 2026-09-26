@@ -1,6 +1,6 @@
 [package]
 name = "glysys-energy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -8,7 +8,7 @@ description = "Amber and GLYCAM molecular mechanics energies for GlySys"
 repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
-glysys = { version = "0.1.0", path = "../.." }
+glysys = { version = "0.1.2", path = "../.." }
 pulp = "=0.22.3"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

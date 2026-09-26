@@ -158,6 +158,70 @@ fn evaluate(@builtin(global_invocation_id) id:vec3<u32>){
  output[index]=result.bonded;output[total+index]=result.nonbonded;output[2u*total+index]=result.extra;output[3u*total+index]=result.gradient;
 }
 
+// Dynamics variant: eight lanes cooperate on each target atom. The original
+// score kernels above remain unchanged; this variant increases occupancy for
+// medium-sized all-pairs systems such as solvated biomolecules in implicit
+// solvent while preserving the same pair and bonded expressions.
+var<workgroup> md_scalar:array<f32,64>;
+var<workgroup> md_bonded:array<vec4<f32>,64>;
+var<workgroup> md_nonbonded:array<vec4<f32>,64>;
+var<workgroup> md_extra:array<vec4<f32>,64>;
+var<workgroup> md_gradient:array<vec4<f32>,64>;
+const MD_LANES_PER_TARGET:u32=8u;
+const MD_WORKGROUP_SIZE:u32=64u;
+fn md_pair_scales(ranges:vec4<u32>,other:u32)->vec2<f32>{
+ var low=ranges.z;var high=ranges.w;
+ for(var iteration=0u;iteration<32u && low<high;iteration++){let middle=low+(high-low)/2u;if(specials[middle].other<other){low=middle+1u;}else{high=middle;}}
+ if(low<ranges.w && specials[low].other==other){return vec2<f32>(specials[low].scee,specials[low].scnb);}return vec2<f32>(1.0,1.0);
+}
+
+fn md_reduce_scalar(local:u32){
+ let base=(local/MD_LANES_PER_TARGET)*MD_LANES_PER_TARGET;let lane=local%MD_LANES_PER_TARGET;
+ var stride=MD_LANES_PER_TARGET/2u;loop{if(lane<stride){md_scalar[base+lane]+=md_scalar[base+lane+stride];}workgroupBarrier();if(stride==1u){break;}stride/=2u;}
+}
+fn md_reduce_outputs(local:u32){
+ let base=(local/MD_LANES_PER_TARGET)*MD_LANES_PER_TARGET;let lane=local%MD_LANES_PER_TARGET;
+ var stride=MD_LANES_PER_TARGET/2u;loop{if(lane<stride){md_bonded[base+lane]+=md_bonded[base+lane+stride];md_nonbonded[base+lane]+=md_nonbonded[base+lane+stride];md_extra[base+lane]+=md_extra[base+lane+stride];md_gradient[base+lane]+=md_gradient[base+lane+stride];}workgroupBarrier();if(stride==1u){break;}stride/=2u;}
+}
+
+@compute @workgroup_size(MD_WORKGROUP_SIZE)
+fn born_radii_md(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) local:u32){
+ let n=config.size.x;let total=n*config.size.y;let idx=group.x*(MD_WORKGROUP_SIZE/MD_LANES_PER_TARGET)+local/MD_LANES_PER_TARGET;let lane=local%MD_LANES_PER_TARGET;var sum=0.0;
+ if(idx<total){let i=idx%n;let base=idx-i;let r=max(atoms[i].ff.w-0.09,0.1);
+  for(var j=lane;j<n;j+=MD_LANES_PER_TARGET){if(i!=j){let d=max(distance(coordinates[idx].xyz,coordinates[base+j].xyz),1e-8);sum+=radial(r,max(atoms[j].ff.w-0.09,0.1)*atoms[j].more.x,d).x;}}
+ }
+ md_scalar[local]=sum;workgroupBarrier();md_reduce_scalar(local);
+ if(lane==0u && idx<total){let i=idx%n;let r=max(atoms[i].ff.w-0.09,0.1);let psi=r*md_scalar[local];let t=tanh(psi-0.8*psi*psi+4.85*psi*psi*psi);let denominator=1.0/r-t/atoms[i].ff.w;let b=1.0/max(denominator,1e-6);var derivative=0.0;if(denominator>=1e-6){derivative=b*b*(1.0-t*t)*(1.0-1.6*psi+14.55*psi*psi)*r/atoms[i].ff.w;}born[idx]=vec4<f32>(b,derivative,0.0,0.0);}
+}
+
+@compute @workgroup_size(MD_WORKGROUP_SIZE)
+fn born_adjoint_md(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) local:u32){
+ let n=config.size.x;let total=n*config.size.y;let idx=group.x*(MD_WORKGROUP_SIZE/MD_LANES_PER_TARGET)+local/MD_LANES_PER_TARGET;let lane=local%MD_LANES_PER_TARGET;var db=0.0;
+ if(idx<total){let i=idx%n;let base=idx-i;let bi=born[idx].x;let dielectric=1.0/config.solvent.x-1.0/config.solvent.y;
+  for(var j=lane;j<n;j+=MD_LANES_PER_TARGET){let delta=coordinates[idx].xyz-coordinates[base+j].xyz;let r2=dot(delta,delta);let bj=born[base+j].x;let p=bi*bj;let e=exp(-r2/(4.0*p));let f=sqrt(r2+p*e);if(f>=1e-8){let coefficient=-C*dielectric*atoms[i].ff.x*atoms[j].ff.x;db+=(-0.5*coefficient/(f*f*f))*e*(1.0+r2/(4.0*p))*bj;}}
+ }
+ md_scalar[local]=db;workgroupBarrier();md_reduce_scalar(local);
+ if(lane==0u && idx<total){let i=idx%n;let bi=born[idx].x;let radius=atoms[i].ff.w;let ratio=radius/bi;let ratio2=ratio*ratio;let surface=4.0*PI*config.solvent.w*(radius+config.solvent.z)*(radius+config.solvent.z)*ratio2*ratio2*ratio2;born[idx].z=md_scalar[local]-6.0*surface/bi;}
+}
+
+@compute @workgroup_size(MD_WORKGROUP_SIZE)
+fn evaluate_md(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) local:u32){
+ let n=config.size.x;let total=n*config.size.y;let idx=group.x*(MD_WORKGROUP_SIZE/MD_LANES_PER_TARGET)+local/MD_LANES_PER_TARGET;let lane=local%MD_LANES_PER_TARGET;let valid=idx<total;let i=idx%n;let batch=idx/n;let base=batch*n;
+ var bonded_energy=vec4<f32>(0.0);var nonbonded_energy=vec4<f32>(0.0);var extra_energy=vec4<f32>(0.0);var g=vec3<f32>(0.0);
+ if(valid && lane==0u && config.size.z==0u){let ai=atoms[i];for(var term_ref=ai.ranges.x;term_ref<ai.ranges.y;term_ref++){let t=terms[incidence[term_ref].x];if(!active_term(t,batch)){continue;}let value=term_value(t,batch,i);let kind=u32(t.parameters.w);g+=value.g;if(kind==4u){extra_energy.x+=value.v;}else{bonded_energy[kind]+=value.v/f32(arity(kind));}}}
+ if(valid){let ai=atoms[i];let ci=coordinates[idx];let dielectric=1.0/config.solvent.x-1.0/config.solvent.y;
+  for(var j=lane;j<n;j+=MD_LANES_PER_TARGET){let delta=ci.xyz-coordinates[base+j].xyz;let d2=dot(delta,delta);
+   if(config.energy.z!=0.0 && config.size.z==0u){let bi=born[idx].x;let bj=born[base+j].x;let p=bi*bj;let e=exp(-d2/(4.0*p));let f=max(sqrt(d2+p*e),1e-8);let coefficient=-C*dielectric*ai.ff.x*atoms[j].ff.x;nonbonded_energy.z+=0.5*coefficient/f;if(j!=i){g+=delta*(-coefficient/(f*f*f))*(1.0-0.25*e);let d=sqrt(d2);if(d>=1e-8){let dri=radial(max(ai.ff.w-0.09,0.1),max(atoms[j].ff.w-0.09,0.1)*atoms[j].more.x,d).y;let drj=radial(max(atoms[j].ff.w-0.09,0.1),max(ai.ff.w-0.09,0.1)*ai.more.x,d).y;g+=delta*(born[idx].z*born[idx].y*dri+born[base+j].z*born[base+j].y*drj)/d;}}}
+   if(j==i){continue;}if(config.size.z!=0u && !(ai.more.y*atoms[j].more.y==2.0)){continue;}if(config.size.w!=0u && ci.w==0.0 && coordinates[base+j].w==0.0){continue;}if(config.energy.x>0.0 && d2>config.energy.x*config.energy.x){continue;}
+   var scales=md_pair_scales(ai.ranges,j);if(config.spare.y!=0.0){let lookup_base=bitcast<u32>(config.spare.x);let pair=specials[lookup_base+i*n+j];scales=vec2<f32>(pair.scee,pair.scnb);}let scee=scales.x;let scnb=scales.y;if(scee==0.0){continue;}
+   let d=max(sqrt(d2),1e-8);let radius=ai.ff.y+atoms[j].ff.y;let epsilon=sqrt(ai.ff.z*atoms[j].ff.z);let ratio=radius/d;let ratio2=ratio*ratio;let ratio6=ratio2*ratio2*ratio2;let coulomb=C*ai.ff.x*atoms[j].ff.x/(config.energy.y*scee*d);nonbonded_energy.x+=0.5*epsilon*(ratio6*ratio6-2.0*ratio6)/scnb;nonbonded_energy.y+=0.5*coulomb;extra_energy.y+=0.5;if(COMPUTE_GRADIENTS){g+=delta*(12.0*epsilon*(ratio6-ratio6*ratio6)/(scnb*d)-coulomb/d)/d;}
+  }
+ }
+ if(valid && lane==0u && config.energy.z!=0.0 && config.size.z==0u){let ai=atoms[i];let ratio=ai.ff.w/born[idx].x;let ratio2=ratio*ratio;nonbonded_energy.w=4.0*PI*config.solvent.w*(ai.ff.w+config.solvent.z)*(ai.ff.w+config.solvent.z)*ratio2*ratio2*ratio2;}
+ md_bonded[local]=bonded_energy;md_nonbonded[local]=nonbonded_energy;md_extra[local]=extra_energy;md_gradient[local]=vec4<f32>(g,0.0);workgroupBarrier();md_reduce_outputs(local);
+ if(lane==0u && valid){let out_bonded=md_bonded[local];let out_nonbonded=md_nonbonded[local];let out_extra=md_extra[local];let out_gradient=md_gradient[local];output[idx]=out_bonded;output[total+idx]=out_nonbonded;output[2u*total+idx]=out_extra;output[3u*total+idx]=out_gradient;}
+}
+
 var<workgroup> partial_a:array<vec4<f32>,64>;
 var<workgroup> partial_b:array<vec4<f32>,64>;
 var<workgroup> partial_c:array<vec4<f32>,64>;

@@ -60,9 +60,18 @@ struct Special { other: u32, scee: f32, scnb: f32, spare: u32 }
 @group(0) @binding(7) var<storage, read_write> bcoords: array<vec4<f32>>;
 // state: [0..n) velocities xyz+w, [n..2n) positions at the start of a step.
 @group(0) @binding(8) var<storage, read_write> state: array<vec4<f32>>;
+// Scratch for the optional native explicit pair kernel. A workgroup owns one
+// target atom and cooperatively traverses its sorted neighbor range.
+var<workgroup> tiled_pair_energy: array<vec4<f32>, 64>;
+var<workgroup> tiled_pair_gradient: array<vec4<f32>, 64>;
+var<workgroup> tiled_neighbor_sort: array<u32, 512>;
+var<workgroup> tiled_sort_active: u32;
+var<workgroup> tiled_sort_start: u32;
+var<workgroup> tiled_sort_count: u32;
 const COULOMB: f32 = 332.063713299;
 const ACCEL: f32 = 418.4;
 const U32MAX: u32 = 4294967295u;
+const FIXED_NEIGHBOR_ROW_WIDTH: u32 = 640u;
 // A dense protein interior can legitimately have more than 512 atoms within
 // the Verlet radius at a 9 A cutoff.  Keep a bounded local gather, but leave
 // enough headroom for those valid systems; the resident host still reports a
@@ -138,7 +147,10 @@ fn rebuild_count_idx() -> u32 { return status_idx() + 2u; }
 fn reference_idx(i: u32) -> u32 { return status_idx() + 3u + 3u * i; }
 fn neighbor_count_idx(i: u32) -> u32 { return reference_idx(n_atoms()) + i; }
 fn neighbor_offset_idx(i: u32) -> u32 { return neighbor_count_idx(n_atoms()) + i; }
-fn block_idx(i: u32) -> u32 { return neighbor_offset_idx(n_atoms() + 1u) + i; }
+// Scan blocks and indirect-dispatch arguments remain in metadata in both
+// layouts; fixed neighbor rows live in the separate pair buffer.
+fn block_idx(i: u32) -> u32 { return neighbor_count_idx(n_atoms()) + n_atoms() + 1u + i; }
+fn indirect_base_idx() -> u32 { return block_idx((n_atoms() + 63u) / 64u); }
 
 @compute @workgroup_size(64)
 fn check_neighbors(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -155,9 +167,10 @@ fn check_neighbors(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // Count and fill traverse the same exact cell stencil. CSR capacity is
 // checked after prefix scan, before any index write is permitted.
-fn visit_neighbors(i: u32, write: bool) -> u32 {
+fn visit_neighbors(i: u32, write: bool, fixed_layout: bool) -> u32 {
   var count = 0u;
-  let start = atomicLoad(&aux[neighbor_offset_idx(i)]);
+  let csr_start = atomicLoad(&aux[neighbor_offset_idx(i)]);
+  let start = select(csr_start, i * FIXED_NEIGHBOR_ROW_WIDTH, fixed_layout);
   let pi = sys[2u * i + 1u].xyz;
   let c0 = cell_of(pi);
   let nx = config.dims.y;
@@ -178,7 +191,13 @@ fn visit_neighbors(i: u32, write: bool) -> u32 {
           if (j != i) {
             let d = min_image(pi, sys[2u * j + 1u].xyz);
             if (dot(d, d) <= limit2) {
-              if (write) { pairs[start + count] = j; }
+              if (write) {
+                if (!fixed_layout || count < FIXED_NEIGHBOR_ROW_WIDTH) {
+                  pairs[start + count] = j;
+                } else {
+                  atomicStore(&aux[status_idx()], 2u);
+                }
+              }
               count += 1u;
             }
           }
@@ -190,13 +209,13 @@ fn visit_neighbors(i: u32, write: bool) -> u32 {
   return count;
 }
 
+var<workgroup> scan_counts: array<u32, 64>;
 @compute @workgroup_size(64)
 fn count_neighbors(@builtin(global_invocation_id) id: vec3<u32>) {
   if (atomicLoad(&aux[rebuild_idx()]) == 0u || id.x >= n_atoms()) { return; }
-  atomicStore(&aux[neighbor_count_idx(id.x)], visit_neighbors(id.x, false));
+  atomicStore(&aux[neighbor_count_idx(id.x)], visit_neighbors(id.x, false, false));
 }
 
-var<workgroup> scan_counts: array<u32, 64>;
 @compute @workgroup_size(64)
 fn scan_neighbors(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32, @builtin(workgroup_id) group: vec3<u32>) {
   // No data-dependent exit before barriers; inactive jobs scan zeros.
@@ -246,7 +265,22 @@ fn apply_neighbor_offsets(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(64)
 fn fill_neighbors(@builtin(global_invocation_id) id: vec3<u32>) {
   if (atomicLoad(&aux[rebuild_idx()]) == 0u || atomicLoad(&aux[status_idx()]) != 0u || id.x >= n_atoms()) { return; }
-  let count = visit_neighbors(id.x, true);
+  let count = visit_neighbors(id.x, true, false);
+}
+
+// Tiled native MD writes a single bounded row per atom, avoiding the
+// separate CSR count/scan/fill passes. Sorting remains a later dispatch so
+// work order from the linked-cell traversal does not change force reductions.
+@compute @workgroup_size(64)
+fn fill_neighbors_fixed(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (atomicLoad(&aux[rebuild_idx()]) == 0u ||
+      atomicLoad(&aux[status_idx()]) != 0u || i >= n_atoms()) { return; }
+  let count = visit_neighbors(i, true, true);
+  let stored = min(count, FIXED_NEIGHBOR_ROW_WIDTH);
+  atomicStore(&aux[neighbor_count_idx(i)], stored);
+  atomicAdd(&aux[count_idx()], stored);
+  if (count > FIXED_NEIGHBOR_ROW_WIDTH) { atomicStore(&aux[status_idx()], 3u); }
 }
 
 fn sift_neighbors(start: u32, root_in: u32, length: u32) {
@@ -277,11 +311,114 @@ fn sort_neighbors(@builtin(global_invocation_id) id: vec3<u32>) {
   atomicStore(&aux[k], p.x); atomicStore(&aux[k + 1u], p.y); atomicStore(&aux[k + 2u], p.z);
 }
 
+// Cooperative deterministic bitonic sorting for the usual per-atom neighbor
+// range. Dense outliers above the shared-memory bound retain the proven serial
+// heapsort path instead of truncating or rejecting valid systems.
+fn sort_neighbors_tiled_impl(i: u32, lane: u32, fixed_layout: bool) {
+  // Read per-row metadata once, then broadcast it as workgroup-uniform values.
+  // An early return based on storage atomics is non-uniform in WGSL and makes
+  // barriers in the bitonic path illegal, even though every lane owns the
+  // same workgroup row.
+  if (lane == 0u) {
+    let is_active = atomicLoad(&aux[rebuild_idx()]) != 0u &&
+        atomicLoad(&aux[status_idx()]) == 0u && i < n_atoms();
+    tiled_sort_active = select(0u, 1u, is_active);
+    tiled_sort_start = 0u;
+    tiled_sort_count = 0u;
+    if (is_active) {
+      let csr_start = atomicLoad(&aux[neighbor_offset_idx(i)]);
+      tiled_sort_start = select(csr_start, i * FIXED_NEIGHBOR_ROW_WIDTH, fixed_layout);
+      tiled_sort_count = atomicLoad(&aux[neighbor_count_idx(i)]);
+    }
+  }
+  let is_active = workgroupUniformLoad(&tiled_sort_active) != 0u;
+  let start = workgroupUniformLoad(&tiled_sort_start);
+  let count = workgroupUniformLoad(&tiled_sort_count);
+  var sort_length = 1u;
+  while (sort_length < count) { sort_length *= 2u; }
+  if (is_active && count > 512u) {
+    if (lane == 0u) {
+      for (var root = count / 2u; root > 0u; root--) {
+        sift_neighbors(start, root - 1u, count);
+      }
+      for (var end = count; end > 1u; end--) {
+        let tmp = pairs[start];
+        pairs[start] = pairs[start + end - 1u];
+        pairs[start + end - 1u] = tmp;
+        sift_neighbors(start, 0u, end - 1u);
+      }
+    }
+  } else if (is_active) {
+    for (var slot = lane; slot < sort_length; slot += 64u) {
+      var value = U32MAX;
+      if (slot < count) { value = pairs[start + slot]; }
+      tiled_neighbor_sort[slot] = value;
+    }
+    workgroupBarrier();
+    if (sort_length > 1u) {
+      var width = 2u;
+      loop {
+        var distance = width / 2u;
+        loop {
+          for (var slot = lane; slot < sort_length; slot += 64u) {
+            let partner = slot ^ distance;
+            if (partner > slot) {
+              let left = tiled_neighbor_sort[slot];
+              let right = tiled_neighbor_sort[partner];
+              let ascending = (slot & width) == 0u;
+              if ((ascending && left > right) || (!ascending && left < right)) {
+                tiled_neighbor_sort[slot] = right;
+                tiled_neighbor_sort[partner] = left;
+              }
+            }
+          }
+          workgroupBarrier();
+          if (distance == 1u) { break; }
+          distance /= 2u;
+        }
+        if (width >= sort_length) { break; }
+        width *= 2u;
+      }
+    }
+    for (var slot = lane; slot < count; slot += 64u) {
+      pairs[start + slot] = tiled_neighbor_sort[slot];
+    }
+  }
+  if (is_active && lane == 0u) {
+    let p = bitcast<vec3<u32>>(sys[2u * i + 1u].xyz);
+    let k = reference_idx(i);
+    atomicStore(&aux[k], p.x);
+    atomicStore(&aux[k + 1u], p.y);
+    atomicStore(&aux[k + 2u], p.z);
+  }
+}
+
+@compute @workgroup_size(64)
+fn sort_neighbors_tiled(
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(local_invocation_index) lane: u32
+) {
+  sort_neighbors_tiled_impl(group.x, lane, false);
+}
+
+@compute @workgroup_size(64)
+fn sort_neighbors_fixed(
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(local_invocation_index) lane: u32
+) {
+  sort_neighbors_tiled_impl(group.x, lane, true);
+}
+
 @compute @workgroup_size(1)
 fn finish_neighbors() {
-  if (atomicLoad(&aux[rebuild_idx()]) != 0u && atomicLoad(&aux[status_idx()]) == 0u) {
-    atomicAdd(&aux[rebuild_count_idx()], 1u);
-    atomicStore(&aux[rebuild_idx()], 0u);
+  if (atomicLoad(&aux[rebuild_idx()]) != 0u) {
+    if (atomicLoad(&aux[status_idx()]) == 0u &&
+        atomicLoad(&aux[count_idx()]) <= 2u * u32(config.misc.y)) {
+      atomicAdd(&aux[rebuild_count_idx()], 1u);
+      atomicStore(&aux[rebuild_idx()], 0u);
+    } else if (atomicLoad(&aux[status_idx()]) == 0u) {
+      atomicStore(&aux[status_idx()], 2u);
+    }
   }
 }
 
@@ -322,11 +459,16 @@ fn eval(@builtin(global_invocation_id) id: vec3<u32>) {
   let overflow = atomicLoad(&aux[status_idx()]) != 0u;
   let count = select(end - start, 0u, overflow);
   var elj = 0.0;
+  var elj_comp = 0.0;
   var erf = 0.0;
+  var erf_comp = 0.0;
   var g = vec3<f32>(0.0);
+  var g_comp = vec3<f32>(0.0);
   var evaluated = 0.0;
   var virial = 0.0;
+  var virial_comp = 0.0;
   var pair_virial = 0.0;
+  var pair_virial_comp = 0.0;
   for (var k = 0u; k < count; k++) {
     let j = pairs[start + k];
     let aj = sys[2u * j];
@@ -338,18 +480,33 @@ fn eval(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = max(sqrt(r2), 1e-8);
     let t = pair_terms(ai, aj, d, r, sc.x, sc.y, sc.z);
     // Halving is exact in binary FP: symmetric split, no rounding asymmetry.
-    elj += 0.5 * t.x;
-    erf += 0.5 * t.y;
+    let lj_term = 0.5 * t.x - elj_comp;
+    let lj_next = elj + lj_term;
+    elj_comp = (lj_next - elj) - lj_term;
+    elj = lj_next;
+    let rf_term = 0.5 * t.y - erf_comp;
+    let rf_next = erf + rf_term;
+    erf_comp = (rf_next - erf) - rf_term;
+    erf = rf_next;
     // Keep the historical total virial in the gradient lane for CPU/GPU
     // force-parity consumers. A molecular volume move translates each
     // molecule as a rigid body, so its configurational derivative uses only
     // the separate intermolecular lane below.
-    virial -= 0.5 * t.z * r2;
+    let virial_term = -0.5 * t.z * r2 - virial_comp;
+    let virial_next = virial + virial_term;
+    virial_comp = (virial_next - virial) - virial_term;
+    virial = virial_next;
     if (bitcast<u32>(bcoords[i].w) != bitcast<u32>(bcoords[j].w)) {
-      pair_virial -= 0.5 * t.z * r2;
+      let pair_term = -0.5 * t.z * r2 - pair_virial_comp;
+      let pair_next = pair_virial + pair_term;
+      pair_virial_comp = (pair_next - pair_virial) - pair_term;
+      pair_virial = pair_next;
     }
     if (config.misc.x != 0.0) {
-      g += t.z * d;
+      let gradient_term = t.z * d - g_comp;
+      let gradient_next = g + gradient_term;
+      g_comp = (gradient_next - g) - gradient_term;
+      g = gradient_next;
     }
     evaluated += 1.0;
   }
@@ -360,14 +517,126 @@ fn eval(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }
 
+// Parallel explicit pair evaluation. Unlike eval(), which assigns one
+// invocation to an atom and serially walks its neighbors, this variant assigns
+// one workgroup to each target atom and partitions the sorted neighbor range
+// over 64 lanes. The fixed tree reduction is deterministic for a given device.
+fn eval_tiled_impl(i: u32, lane: u32, fixed_layout: bool) {
+  let pi = sys[2u * i + 1u].xyz;
+  let ai = sys[2u * i];
+  let cutoff2 = config.electro.y * config.electro.y;
+  let csr_start = atomicLoad(&aux[neighbor_offset_idx(i)]);
+  let start = select(csr_start, i * FIXED_NEIGHBOR_ROW_WIDTH, fixed_layout);
+  let csr_end = atomicLoad(&aux[neighbor_offset_idx(i + 1u)]);
+  let end = select(csr_end, (i + 1u) * FIXED_NEIGHBOR_ROW_WIDTH, fixed_layout);
+  let overflow = atomicLoad(&aux[status_idx()]) != 0u;
+  var active_count = end - start;
+  if (fixed_layout) { active_count = atomicLoad(&aux[neighbor_count_idx(i)]); }
+  if (overflow) { active_count = 0u; }
+  var elj = 0.0;
+  var elj_comp = 0.0;
+  var erf = 0.0;
+  var erf_comp = 0.0;
+  var g = vec3<f32>(0.0);
+  var g_comp = vec3<f32>(0.0);
+  var virial = 0.0;
+  var virial_comp = 0.0;
+  var pair_virial = 0.0;
+  var pair_virial_comp = 0.0;
+  var evaluated = 0.0;
+  for (var k = lane; k < active_count; k += 64u) {
+    let j = pairs[start + k];
+    let aj = sys[2u * j];
+    let sc = special_scale(i, j);
+    if (sc.x == 0.0) { continue; }
+    let d = min_image(pi, sys[2u * j + 1u].xyz);
+    let r2 = dot(d, d);
+    if (r2 > cutoff2) { continue; }
+    let r = max(sqrt(r2), 1e-8);
+    let t = pair_terms(ai, aj, d, r, sc.x, sc.y, sc.z);
+    let lj_term = 0.5 * t.x - elj_comp;
+    let lj_next = elj + lj_term;
+    elj_comp = (lj_next - elj) - lj_term;
+    elj = lj_next;
+    let rf_term = 0.5 * t.y - erf_comp;
+    let rf_next = erf + rf_term;
+    erf_comp = (rf_next - erf) - rf_term;
+    erf = rf_next;
+    let virial_term = -0.5 * t.z * r2 - virial_comp;
+    let virial_next = virial + virial_term;
+    virial_comp = (virial_next - virial) - virial_term;
+    virial = virial_next;
+    if (bitcast<u32>(bcoords[i].w) != bitcast<u32>(bcoords[j].w)) {
+      let pair_term = -0.5 * t.z * r2 - pair_virial_comp;
+      let pair_next = pair_virial + pair_term;
+      pair_virial_comp = (pair_next - pair_virial) - pair_term;
+      pair_virial = pair_next;
+    }
+    if (config.misc.x != 0.0) {
+      let gradient_term = t.z * d - g_comp;
+      let gradient_next = g + gradient_term;
+      g_comp = (gradient_next - g) - gradient_term;
+      g = gradient_next;
+    }
+    evaluated += 1.0;
+  }
+  tiled_pair_energy[lane] = vec4<f32>(elj, erf, evaluated, virial);
+  tiled_pair_gradient[lane] = vec4<f32>(g, pair_virial);
+  workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) {
+      tiled_pair_energy[lane] += tiled_pair_energy[lane + stride];
+      tiled_pair_gradient[lane] += tiled_pair_gradient[lane + stride];
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (lane == 0u) {
+    out[i] = vec4<f32>(
+      tiled_pair_energy[0].xyz,
+      select(0.0, 1.0, overflow)
+    );
+    if (config.misc.x != 0.0) {
+      out[n_atoms() + i] = vec4<f32>(tiled_pair_gradient[0].xyz, tiled_pair_energy[0].w);
+      out[2u * n_atoms() + i] = vec4<f32>(0.0, 0.0, 0.0, tiled_pair_gradient[0].w);
+    }
+  }
+}
+
+@compute @workgroup_size(64)
+fn eval_tiled(
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(local_invocation_index) lane: u32
+) {
+  eval_tiled_impl(group.x, lane, false);
+}
+
+@compute @workgroup_size(64)
+fn eval_tiled_fixed(
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(local_invocation_index) lane: u32
+) {
+  eval_tiled_impl(group.x, lane, true);
+}
+
+fn angle_value(a: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
+  let u = a - c;
+  let v = b - c;
+  // Avoid acos(dot(normalize(u), normalize(v))): the RX 7800 XT Vulkan
+  // implementation returned a materially biased angle for water geometry.
+  // atan2 of cross magnitude and dot remains accurate on the same inputs.
+  return atan2(length(cross(u, v)), dot(u, v));
+}
+
 fn angle_gradient(a: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> mat3x3<f32> {
   let u = a - c;
   let v = b - c;
   let ru = max(length(u), 1e-8);
   let rv = max(length(v), 1e-8);
   let cos_t = clamp(dot(u, v) / (ru * rv), -1.0, 1.0);
-  let theta = acos(cos_t);
-  let sin_t = max(sin(theta), 1e-8);
+  let sin_t = max(length(cross(u, v)) / (ru * rv), 1e-8);
   let f = -1.0 / sin_t;
   let gu = f * (v / (ru * rv) - cos_t * u / (ru * ru));
   let gv = f * (u / (ru * rv) - cos_t * v / (rv * rv));
@@ -525,26 +794,70 @@ fn refresh_bonded_coords(@builtin(global_invocation_id) id: vec3<u32>) {
 fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = n_atoms();
   let water_base = config.counts.x + 2u * config.counts.y + 2u * config.counts.z;
-  let solute_base = water_base + 2u * u32(config.dynamic_.x);
-  if (id.x == 0u) {
+  let component_offset = bitcast<u32>(config.misc.w);
+  let component_count = bitcast<u32>(config.thermo.w);
+  if (id.x < component_count) {
+    let component = bonded[component_offset + id.x];
+    let component_base = bitcast<u32>(component.x);
+    let component_bonds = bitcast<u32>(component.y);
     let inv_dt = config.thermo.y / max(config.dynamic_.z, 1e-12);
-    // Solute X-H bonds use bounded sequential SHAKE, matching the CPU path.
-    for (var iteration = 0u; iteration < 12u; iteration++) {
-      for (var k = 0u; k < u32(config.dynamic_.y); k++) {
-        let t = bonded[solute_base + k];
+    // Each invocation owns one connected X-H constraint component. The
+    // original bond order is retained within that component; disconnected
+    // components update disjoint atoms and run independently.
+    for (var iteration = 0u; iteration < 200u; iteration++) {
+      for (var local = 0u; local < component_bonds; local++) {
+        let t = bonded[component_base + local];
         let a = u32(t.x); let b = u32(t.y);
         let d = sys[2u * a + 1u].xyz - sys[2u * b + 1u].xyz;
         let r = max(length(d), 1e-12);
-      if (abs(r - t.z) < 1e-8) { continue; }
+        let relative_residual = abs(r - t.z) / max(t.z, 1e-8);
+        if (relative_residual < 1e-7) { continue; }
         let ia = 1.0 / max(sys[2u * a].w, 1e-12);
         let ib = 1.0 / max(sys[2u * b].w, 1e-12);
-        let lambda = (r - t.z) / (r * (ia + ib));
-        let da = -lambda * ia * d;
-        let db = lambda * ib * d;
+        var da: vec3<f32>;
+        var db: vec3<f32>;
+        if (config.thermo.y == 1.0) {
+          // LF-middle uses the previous-step bond direction for both the
+          // position impulse and its centered-velocity correction, matching
+          // OpenMM's reference-direction constraint update. Legacy BAOAB
+          // retains its established trial-direction SHAKE path.
+          let old_direction = state[n + a].xyz - state[n + b].xyz;
+          let projection = dot(d, old_direction);
+          if (abs(projection) < 1e-12) {
+            atomicStore(&aux[status_idx()], 0x50000000u | (id.x << 16u));
+            return;
+          }
+          let delta = 0.5 * (t.z * t.z - dot(d, d))
+              / ((ia + ib) * projection);
+          da = delta * ia * old_direction;
+          db = -delta * ib * old_direction;
+        } else {
+          let lambda = (r - t.z) / (r * (ia + ib));
+          da = -lambda * ia * d;
+          db = lambda * ib * d;
+        }
         sys[2u * a + 1u] = vec4<f32>(sys[2u * a + 1u].xyz + da, 0.0);
         sys[2u * b + 1u] = vec4<f32>(sys[2u * b + 1u].xyz + db, 0.0);
         state[a] = vec4<f32>(state[a].xyz + da * inv_dt, state[a].w);
         state[b] = vec4<f32>(state[b].xyz + db * inv_dt, state[b].w);
+      }
+      var max_relative_residual = 0.0;
+      for (var local = 0u; local < component_bonds; local++) {
+        let t = bonded[component_base + local];
+        let d = sys[2u * u32(t.x) + 1u].xyz - sys[2u * u32(t.y) + 1u].xyz;
+        max_relative_residual = max(
+            max_relative_residual,
+            abs(length(d) - t.z) / max(t.z, 1e-8));
+      }
+      if (max_relative_residual <= 1e-5) { break; }
+    }
+    for (var local = 0u; local < component_bonds; local++) {
+      let t = bonded[component_base + local];
+      let d = sys[2u * u32(t.x) + 1u].xyz - sys[2u * u32(t.y) + 1u].xyz;
+      let residual = abs(length(d) - t.z) / max(t.z, 1e-8);
+      if (residual > 2e-5) {
+        let encoded_residual = u32(clamp(residual * 1000000.0, 0.0, 65535.0));
+        atomicStore(&aux[status_idx()], 0x50000000u | (id.x << 16u) | encoded_residual);
       }
     }
   }
@@ -626,6 +939,13 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
   sys[2u * o + 1u] = vec4<f32>(qo + d_o, 0.0);
   sys[2u * h1 + 1u] = vec4<f32>(q1 + d_1, 0.0);
   sys[2u * h2 + 1u] = vec4<f32>(q2 + d_2, 0.0);
+  let final_oh1 = distance(sys[2u * o + 1u].xyz, sys[2u * h1 + 1u].xyz);
+  let final_oh2 = distance(sys[2u * o + 1u].xyz, sys[2u * h2 + 1u].xyz);
+  let final_hh = distance(sys[2u * h1 + 1u].xyz, sys[2u * h2 + 1u].xyz);
+  if (max(max(abs(final_oh1 - doh), abs(final_oh2 - doh)) / max(doh, 1e-8),
+      abs(final_hh - dhh) / max(dhh, 1e-8)) > 2e-5) {
+    atomicStore(&aux[status_idx()], 7u);
+  }
   state[o] = vec4<f32>(state[o].xyz + d_o * inv_dt, state[o].w);
   state[h1] = vec4<f32>(state[h1].xyz + d_1 * inv_dt, state[h1].w);
   state[h2] = vec4<f32>(state[h2].xyz + d_2 * inv_dt, state[h2].w);
@@ -644,22 +964,54 @@ fn kick_second(@builtin(global_invocation_id) id: vec3<u32>) {
 fn rattle(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = n_atoms();
   let water_base = config.counts.x + 2u * config.counts.y + 2u * config.counts.z;
-  let solute_base = water_base + 2u * u32(config.dynamic_.x);
-  if (id.x == 0u) {
-    for (var iteration = 0u; iteration < 12u; iteration++) {
-      for (var k = 0u; k < u32(config.dynamic_.y); k++) {
-        let t = bonded[solute_base + k];
+  let component_offset = bitcast<u32>(config.misc.w);
+  let component_count = bitcast<u32>(config.thermo.w);
+  if (id.x < component_count) {
+    let component = bonded[component_offset + id.x];
+    let component_base = bitcast<u32>(component.x);
+    let component_bonds = bitcast<u32>(component.y);
+    for (var iteration = 0u; iteration < 200u; iteration++) {
+      for (var local = 0u; local < component_bonds; local++) {
+        let t = bonded[component_base + local];
         let a = u32(t.x); let b = u32(t.y);
-        let d = sys[2u * a + 1u].xyz - sys[2u * b + 1u].xyz;
+        // Solute endpoints share a molecule-centered frame. Avoid subtracting
+        // their large lab-frame coordinates in f32 during the velocity solve.
+        let d = bcoords[a].xyz - bcoords[b].xyz;
         let r = max(length(d), 1e-12);
         let rel = state[a].xyz - state[b].xyz;
         let rv = dot(rel, d) / r;
-        if (abs(rv) < 1e-7) { continue; }
+        let velocity_scale = max(length(rel), 1.0);
+        if (abs(rv) < 1e-5 * velocity_scale) { continue; }
         let ia = 1.0 / max(sys[2u * a].w, 1e-12);
         let ib = 1.0 / max(sys[2u * b].w, 1e-12);
         let lambda = rv / (r * (ia + ib));
         state[a] = vec4<f32>(state[a].xyz - lambda * ia * d, state[a].w);
         state[b] = vec4<f32>(state[b].xyz + lambda * ib * d, state[b].w);
+      }
+      var max_relative_velocity_residual = 0.0;
+      for (var local = 0u; local < component_bonds; local++) {
+        let t = bonded[component_base + local];
+        let a = u32(t.x); let b = u32(t.y);
+        let d = bcoords[a].xyz - bcoords[b].xyz;
+        let r = max(length(d), 1e-12);
+        let relative_velocity = state[a].xyz - state[b].xyz;
+        let velocity_scale = max(length(relative_velocity), 1.0);
+        max_relative_velocity_residual = max(
+            max_relative_velocity_residual,
+            abs(dot(relative_velocity, d)) / (r * velocity_scale));
+      }
+      if (max_relative_velocity_residual <= 1e-5) { break; }
+    }
+    for (var local = 0u; local < component_bonds; local++) {
+      let t = bonded[component_base + local];
+      let a = u32(t.x); let b = u32(t.y);
+      let d = bcoords[a].xyz - bcoords[b].xyz;
+      let r = max(length(d), 1e-12);
+      let residual = abs(dot(state[a].xyz - state[b].xyz, d)) / r;
+      let velocity_scale = max(length(state[a].xyz - state[b].xyz), 1.0);
+      if (residual > 5e-5 * velocity_scale) {
+        let encoded_residual = u32(clamp(residual * 1000000.0, 0.0, 65535.0));
+        atomicStore(&aux[status_idx()], 0x60000000u | (id.x << 16u) | encoded_residual);
       }
     }
   }
@@ -709,6 +1061,41 @@ fn rattle(@builtin(global_invocation_id) id: vec3<u32>) {
   state[a] = vec4<f32>(va_new, state[a].w);
   state[b] = vec4<f32>(vb_new, state[b].w);
   state[c] = vec4<f32>(vc_new, state[c].w);
+  let r_ab = pb - pa; let r_bc = pc - pb; let r_ca = pa - pc;
+  let v_ab = vb_new - va_new; let v_bc = vc_new - vb_new; let v_ca = va_new - vc_new;
+  if (max(max(abs(dot(v_ab, r_ab)) / max(length(r_ab), 1e-8),
+      abs(dot(v_bc, r_bc)) / max(length(r_bc), 1e-8)),
+      abs(dot(v_ca, r_ca)) / max(length(r_ca), 1e-8)) > 5e-4) {
+    atomicStore(&aux[status_idx()], 8u);
+  }
+}
+
+// Build indirect group counts only after the parallel displacement check has
+// completed. Zero-width dispatches skip all rebuild kernels when the cached
+// Verlet list remains valid without inserting CPU/GPU synchronization.
+@compute @workgroup_size(1)
+fn prepare_neighbor_dispatch() {
+  let rebuild = atomicLoad(&aux[rebuild_idx()]) != 0u;
+  let n_groups = select(0u, (n_atoms() + 63u) / 64u, rebuild);
+  let wide_groups = select(
+    0u,
+    (max(n_atoms(), n_cells()) + 63u) / 64u,
+    rebuild
+  );
+  let base = indirect_base_idx();
+  for (var stage = 0u; stage < 10u; stage++) {
+    var groups = n_groups;
+    if (stage == 0u) { groups = wide_groups; }
+    if (stage == 4u || stage == 8u) {
+      groups = select(0u, 1u, rebuild);
+    }
+    if (stage == 9u) {
+      groups = select(0u, n_atoms(), rebuild);
+    }
+    atomicStore(&aux[base + 3u * stage], groups);
+    atomicStore(&aux[base + 3u * stage + 1u], 1u);
+    atomicStore(&aux[base + 3u * stage + 2u], 1u);
+  }
 }
 
 @compute @workgroup_size(64)
@@ -742,8 +1129,14 @@ fn bonded_energy(@builtin(global_invocation_id) id: vec3<u32>) {
     let theta0 = bonded[config.counts.x + 2u * k + 1u].x;
     let a = u32(head.x); let c = u32(head.y); let b = u32(head.z);
     if (i != a && i != c && i != b) { continue; }
-    let g = angle_gradient(bonded_position(a), bonded_position(c), bonded_position(b));
-    let delta = acos(clamp(dot(normalize(bonded_position(a) - bonded_position(c)), normalize(bonded_position(b) - bonded_position(c))), -1.0, 1.0)) - theta0;
+    let angle_a = bonded_position(a);
+    let angle_c = bonded_position(c);
+    let angle_b = bonded_position(b);
+    let angle_u = angle_a - angle_c;
+    let angle_v = angle_b - angle_c;
+    let g = angle_gradient(angle_a, angle_c, angle_b);
+    let theta = angle_value(angle_a, angle_c, angle_b);
+    let delta = theta - theta0;
     let e = head.w * delta * delta;
     let f = 2.0 * head.w * delta;
     partial.y += e / 3.0;
@@ -820,4 +1213,67 @@ fn reduce(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
     out[4u * n + group.x] = red[0];
     out[4u * n + 1u] = vec4<f32>(pair_red[0], 0.0, 0.0, 0.0);
   }
+}
+
+// Produce the two NVT scalars without exporting O(N) coordinates or
+// velocities. This runs only at explicitly requested observation boundaries.
+@compute @workgroup_size(1)
+fn reduce_dynamics_scalars() {
+  let n = n_atoms();
+  var potential = out[4u * n].x + out[4u * n].y;
+  var kinetic = 0.0;
+  var potential_compensation = 0.0;
+  var kinetic_compensation = 0.0;
+  for (var i = 0u; i < n; i++) {
+    let bonded = out[3u * n + i];
+    let bonded_value = bonded.x + bonded.y + bonded.z + bonded.w;
+    let potential_y = bonded_value - potential_compensation;
+    let potential_next = potential + potential_y;
+    potential_compensation = (potential_next - potential) - potential_y;
+    potential = potential_next;
+
+    let velocity = state[i].xyz;
+    let mass = max(sys[2u * i].w, 1e-12);
+    let kinetic_value = mass * dot(velocity, velocity) / (2.0 * 418.4);
+    let kinetic_y = kinetic_value - kinetic_compensation;
+    let kinetic_next = kinetic + kinetic_y;
+    kinetic_compensation = (kinetic_next - kinetic) - kinetic_y;
+    kinetic = kinetic_next;
+  }
+  out[4u * n + 2u] = vec4<f32>(potential, kinetic, 0.0, 0.0);
+}
+
+// LF-middle kernels are deliberately separate from the legacy BAOAB path so
+// its force-kick and velocity-centering conventions cannot be conflated.
+@compute @workgroup_size(64)
+fn lf_full_kick(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  let n = n_atoms();
+  if (i >= n) { return; }
+  let dt = config.dynamic_.z;
+  let mass = max(sys[2u * i].w, 1e-12);
+  state[i] = vec4<f32>(state[i].xyz - dt * ACCEL / mass * out[n + i].xyz, state[i].w);
+}
+
+@compute @workgroup_size(64)
+fn lf_first_half_drift(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= n_atoms()) { return; }
+  let old_position = sys[2u * i + 1u].xyz;
+  sys[2u * i + 1u] = vec4<f32>(old_position + 0.5 * config.dynamic_.z * state[i].xyz, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn lf_save_start(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= n_atoms()) { return; }
+  state[n_atoms() + i] = vec4<f32>(sys[2u * i + 1u].xyz, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn lf_second_half_drift(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= n_atoms()) { return; }
+  let position = sys[2u * i + 1u].xyz + 0.5 * config.dynamic_.z * state[i].xyz;
+  sys[2u * i + 1u] = vec4<f32>(position, 0.0);
 }

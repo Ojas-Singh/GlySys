@@ -1,0 +1,22 @@
+{
+  "temperatureK": 300.0,
+  "timestepFs": 0.25,
+  "frictionPerPs": 1.0,
+  "equilibrationSteps": 32000,
+  "productionSteps": 1200000,
+  "saveEvery": 20000,
+  "minimizationIterations": 100,
+  "seed": "7",
+  "solvent": "explicit",
+  "equilibrationEnsemble": "nvt",
+  "productionEnsemble": "nvt",
+  "constraints": "settle",
+  "thermostat": "langevin",
+  "electrostatics": "reaction-field",
+  "pressureCoupling": "monte-carlo",
+  "cutoffAngstrom": 9.0,
+  "rfDielectric": 78.5,
+  "barostatInterval": 25,
+  "restraintForce": 0.0,
+  "dispersionCorrection": false
+}

@@ -385,8 +385,7 @@ impl ResidentEvaluator {
             if i == 1 && !gradients {
                 continue;
             }
-            let pipeline =
-                &self.pipeline_set.pipelines[if i == 2 && !gradients { 4 } else { i }];
+            let pipeline = &self.pipeline_set.pipelines[if i == 2 && !gradients { 4 } else { i }];
             if i < 2 && (config.energy[2] == 0.0 || config.size[2] != 0) {
                 continue;
             }

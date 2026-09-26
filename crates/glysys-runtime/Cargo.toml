@@ -1,6 +1,6 @@
 [package]
 name = "glysys-runtime"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -8,13 +8,14 @@ description = "Backend-neutral execution sessions for GlySys native and browser 
 repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
-glysys = { version = "0.1.0", path = "../.." }
-glysys-energy = { version = "0.1.0", path = "../glysys-energy" }
-glysys-dynamics = { version = "0.1.0", path = "../glysys-dynamics" }
-glysys-gpu = { version = "0.1.0", path = "../glysys-gpu" }
+glysys = { version = "0.1.2", path = "../.." }
+glysys-energy = { version = "0.1.2", path = "../glysys-energy" }
+glysys-dynamics = { version = "0.1.2", path = "../glysys-dynamics" }
+glysys-gpu = { version = "0.1.2", path = "../glysys-gpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
+web-time = "1.1"
 
 [dev-dependencies]
 pollster = "0.4"

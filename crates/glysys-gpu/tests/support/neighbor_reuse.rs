@@ -65,6 +65,65 @@ fn resident_neighbors_rebuild_at_skin_and_preserve_periodic_forces() {
 }
 
 #[test]
+fn minimization_coordinate_upload_reuses_neighbors_until_the_skin_is_crossed() {
+    pollster::block_on(async {
+        let _guard = super::gpu_test_guard();
+        let system = solvated_system(6.0);
+        let coordinates = minimized_coords(&system);
+        let ctx = setup(&system, 4.0, 1.5).await;
+        ctx.gpu.set_coordinates(&coordinates, ctx.box_f32, true);
+        let initial = ctx.gpu.energy_and_forces(true).await.unwrap();
+        assert!(!initial.neighbor_overflow);
+        let first_rebuilds = ctx.gpu.neighbor_rebuild_count().await.unwrap();
+
+        // A small trial step is safely inside half the 1.5 A Verlet skin.
+        let mut trial = coordinates.clone();
+        trial[0].x += 0.1;
+        let flat: Vec<f64> = trial.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        ctx.gpu
+            .set_flat_coordinates_f64_reusing_neighbors(&flat, ctx.box_f32, true);
+        let reused = ctx.gpu.energy_and_forces(true).await.unwrap();
+        assert!(!reused.neighbor_overflow);
+        assert_eq!(
+            ctx.gpu.neighbor_rebuild_count().await.unwrap(),
+            first_rebuilds,
+            "a skin-safe minimization trial rebuilt the neighbor list"
+        );
+
+        // Force a fresh build at exactly the same coordinates and verify that
+        // the cached-list evaluation returns the same energy and gradients.
+        ctx.gpu.set_flat_coordinates_f64(&flat, ctx.box_f32, true);
+        let rebuilt = ctx.gpu.energy_and_forces(true).await.unwrap();
+        assert!((reused.lj - rebuilt.lj).abs() < 1e-5);
+        assert!((reused.rf - rebuilt.rf).abs() < 1e-5);
+        for (a, b) in reused
+            .gradients
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(rebuilt.gradients.as_ref().unwrap())
+        {
+            for axis in 0..3 {
+                assert!((a[axis] - b[axis]).abs() < 1e-5);
+            }
+        }
+
+        // Crossing half the skin must invalidate and rebuild before forces
+        // are evaluated, even through the reuse-oriented coordinate API.
+        trial[0].x += 1.0;
+        let crossed: Vec<f64> = trial.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        ctx.gpu
+            .set_flat_coordinates_f64_reusing_neighbors(&crossed, ctx.box_f32, true);
+        let refreshed = ctx.gpu.energy_and_forces(true).await.unwrap();
+        assert!(!refreshed.neighbor_overflow);
+        assert!(
+            ctx.gpu.neighbor_rebuild_count().await.unwrap() > first_rebuilds + 1,
+            "crossing half the neighbor skin did not rebuild"
+        );
+    });
+}
+
+#[test]
 fn failed_neighbor_build_remains_invalid_on_retry() {
     pollster::block_on(async {
         let _guard = super::gpu_test_guard();

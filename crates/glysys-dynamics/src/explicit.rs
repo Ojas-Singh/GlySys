@@ -8,7 +8,7 @@ use super::accumulators::{Accumulator, WaterOccupancy};
 use super::settle::SettleWaters;
 use super::{
     ACCEL, BAR_PER_KCAL_MOL_A3, ConstraintModel, ElectrostaticsModel, Ensemble, KB,
-    PressureCoupling, Thermostat, normal,
+    LangevinDiscretization, PressureCoupling, Thermostat, VelocityConvention, normal,
 };
 use super::{Error, Result, SimulationProtocol, SimulationState, SolventModel, TrajectoryChunk};
 use super::{frame_from_state_wrapped, invalid};
@@ -26,7 +26,7 @@ pub const SKIN_ANGSTROM: f64 = 1.5;
 pub fn max_timestep_fs(constraints: ConstraintModel) -> f64 {
     match constraints {
         ConstraintModel::None => 1.0,
-        ConstraintModel::Settle => 2.0,
+        ConstraintModel::Settle | ConstraintModel::HBonds => 2.0,
     }
 }
 
@@ -169,6 +169,32 @@ fn fingerprint(
             )
         );
     }
+    // LF-middle benchmark windows legitimately extend the production-stage
+    // length while retaining the exact step-zero state. The trajectory plan
+    // is not part of the physical state identity for this model; hash the
+    // physical recipe and integrator settings, but not stage lengths or
+    // coordinate-output cadence.
+    if model_version(protocol) == super::EXPLICIT_LF_MIDDLE_MODEL_VERSION {
+        return format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{}:{:?}:{:?}:{:?}:dt={}:T={}:friction={}:cutoff={:?}:rf={:?}:dispersion={}:restraints={restraints}:{system:?}",
+                    model_version(protocol),
+                    electrostatics_kind(protocol),
+                    protocol.constraints,
+                    protocol.thermostat,
+                    protocol.timestep_fs,
+                    protocol.temperature_k,
+                    protocol.friction_per_ps,
+                    protocol.cutoff_angstrom,
+                    protocol.rf_dielectric,
+                    protocol.dispersion_correction,
+                )
+                .as_bytes(),
+            )
+        );
+    }
     format!(
         "{:x}",
         Sha256::digest(
@@ -193,7 +219,9 @@ fn fingerprint(
 }
 
 pub fn model_version(protocol: &SimulationProtocol) -> &'static str {
-    if protocol.has_npt() || protocol.dispersion_correction || protocol.stages.is_some() {
+    if protocol.langevin_discretization == LangevinDiscretization::LfMiddle {
+        super::EXPLICIT_LF_MIDDLE_MODEL_VERSION
+    } else if protocol.has_npt() || protocol.dispersion_correction || protocol.stages.is_some() {
         super::EXPLICIT_NPT_MODEL_VERSION
     } else {
         super::EXPLICIT_MODEL_VERSION
@@ -490,6 +518,9 @@ pub fn degrees_of_freedom(
             &masses,
             system.atom_count(),
         )?),
+        ConstraintModel::HBonds => {
+            return Err(invalid("explicit solvent requires constraints=settle"));
+        }
     };
     Ok(dof_count(system.atom_count(), &settle))
 }
@@ -670,6 +701,9 @@ impl<'a> ExplicitSimulation<'a> {
                 )
                 .map_err(|e| invalid(format!("invalid constraint topology: {e}")))?,
             ),
+            ConstraintModel::HBonds => {
+                return Err(invalid("explicit solvent requires constraints=settle"));
+            }
         };
         if let Some(settle) = &settle {
             settle.constrain_positions(&mut coordinates)?;
@@ -689,16 +723,20 @@ impl<'a> ExplicitSimulation<'a> {
             )
             .map_err(Error::Energy)?;
         let mut rng = protocol.seed;
-        let velocities = masses
+        let mut velocities = masses
             .iter()
             .map(|m| random_velocity(&mut rng, (KB * protocol.temperature_k * ACCEL / m).sqrt()))
             .collect::<Vec<_>>();
+        if let Some(settle) = &settle {
+            settle.constrain_velocities(&coordinates, &mut velocities)?;
+        }
         let barostat_rng = protocol_seed_barostat(protocol_seed(&protocol));
         let has_npt = protocol.has_npt();
         let degrees_of_freedom = dof_count(system.atom_count(), &settle);
         let resident_rng = (protocol.thermostat == Thermostat::Langevin).then(|| {
             super::resident_rng::ResidentThermostatRng::seeded(protocol.seed, system.atom_count())
         });
+        let velocity_convention = VelocityConvention::for_protocol(&protocol);
         let mut sim = Self {
             field,
             masses,
@@ -716,6 +754,8 @@ impl<'a> ExplicitSimulation<'a> {
                     1
                 },
                 model_version: model_version(&protocol).into(),
+                velocity_convention,
+                degrees_of_freedom,
                 system_fingerprint: String::new(),
                 protocol,
                 step: 0,
@@ -777,6 +817,7 @@ impl<'a> ExplicitSimulation<'a> {
         };
         if state.schema_version != expected_schema
             || state.model_version != expected_model
+            || state.velocity_convention != VelocityConvention::for_protocol(&state.protocol)
             || state.integrator_phase != "ready"
             || state.coordinates.len() != system.atom_count()
             || state.velocities.len() != system.atom_count()
@@ -817,6 +858,9 @@ impl<'a> ExplicitSimulation<'a> {
                 &masses,
                 system.atom_count(),
             )?),
+            ConstraintModel::HBonds => {
+                return Err(invalid("explicit solvent requires constraints=settle"));
+            }
         };
         // Reference re-evaluation guards chemistry mismatches.
         let wrapped: Vec<Vec3> = state.coordinates.iter().map(|p| box_vec.wrap(*p)).collect();
@@ -1070,6 +1114,9 @@ impl<'a> ExplicitSimulation<'a> {
     /// unconstrained momenta, then the exact water projection restores the
     /// rigid manifold without a frame-rotation heuristic.
     fn nvt_step(&mut self) -> Result<()> {
+        if self.state.protocol.langevin_discretization == LangevinDiscretization::LfMiddle {
+            return self.nvt_lf_middle_step();
+        }
         let dt = self.state.protocol.timestep_fs * 0.001;
         let decay = (-self.state.protocol.friction_per_ps * dt).exp();
         let prev_coords = self.state.coordinates.clone();
@@ -1180,6 +1227,101 @@ impl<'a> ExplicitSimulation<'a> {
         }
         if let Some(settle) = &self.settle {
             settle.constrain_velocities(&next_coords, &mut next_vel)?;
+        }
+        self.state.rng_state = rng;
+        self.state.resident_rng = resident_rng;
+        self.commit(
+            next_coords,
+            next_vel,
+            energy.components.total(),
+            energy.gradients,
+            energy.virial,
+        )
+    }
+
+    /// OpenMM LangevinMiddle ordering for constrained NVT. Velocities are
+    /// centered at the committed positions and receive no legacy half-step
+    /// interpretation or final force kick.
+    fn nvt_lf_middle_step(&mut self) -> Result<()> {
+        let dt = self.state.protocol.timestep_fs * 0.001;
+        let decay = (-self.state.protocol.friction_per_ps * dt).exp();
+        let old_coords = self.state.coordinates.clone();
+        let mut trial_coords = old_coords.clone();
+        let mut next_vel = self.state.velocities.clone();
+        let mut rng = self.state.rng_state;
+        let mut resident_rng = self.state.resident_rng.clone();
+
+        // Full kick, followed by the velocity projection at the old positions.
+        for (i, mass) in self.masses.iter().enumerate() {
+            next_vel[i] = add(
+                next_vel[i],
+                scale(self.state.gradient[i], -dt * ACCEL / mass),
+            );
+        }
+        if let Some(constraints) = &self.settle {
+            constraints.constrain_velocities(&old_coords, &mut next_vel)?;
+        }
+
+        // First half drift, OU thermostat, second half drift.
+        for i in 0..trial_coords.len() {
+            trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
+        }
+        for (i, mass) in self.masses.iter().enumerate() {
+            let sigma = ((1. - decay * decay) * KB * self.state.protocol.temperature_k * ACCEL
+                / mass)
+                .sqrt();
+            let noise = if let Some(stream) = &mut resident_rng {
+                scale(stream.normal3(i), sigma)
+            } else {
+                random_velocity(&mut rng, sigma)
+            };
+            next_vel[i] = add(scale(next_vel[i], decay), noise);
+            trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
+        }
+
+        let mut next_coords = trial_coords.clone();
+        if let Some(constraints) = &self.settle {
+            constraints.settle_positions(
+                &old_coords,
+                &trial_coords,
+                &mut next_coords,
+                &self.masses,
+            )?;
+            constraints.shake_solute_positions_from_old(&old_coords, &mut next_coords)?;
+            // Add the constraint impulse to the trial velocity. This is the
+            // LF-middle centered-velocity convention (not BAOAB RATTLE).
+            for i in 0..next_vel.len() {
+                next_vel[i] = add(
+                    next_vel[i],
+                    scale(add(next_coords[i], scale(trial_coords[i], -1.)), 1. / dt),
+                );
+            }
+        }
+
+        self.refresh_pairs_for(&next_coords)?;
+        let box_vec = self.box_vectors()?;
+        let energy = self
+            .field
+            .evaluate_with_dispersion_coefficient(
+                &next_coords,
+                &box_vec,
+                &self.pairs.pairs,
+                &self.backend,
+                cutoff_angstrom(&self.state.protocol),
+                self.dispersion_coefficient,
+                self.state.protocol.dispersion_correction,
+            )
+            .map_err(Error::Energy)?;
+        if !energy.components.total().is_finite() {
+            return Err(invalid("nonfinite explicit energy; checkpoint retained"));
+        }
+        for i in 0..next_coords.len() {
+            let displacement = add(next_coords[i], scale(old_coords[i], -1.));
+            if !finite(&next_coords[i]) || !finite(&next_vel[i]) || norm2(displacement) > 1. {
+                return Err(invalid(
+                    "unstable LF-middle step (>1 A); checkpoint retained",
+                ));
+            }
         }
         self.state.rng_state = rng;
         self.state.resident_rng = resident_rng;
@@ -1355,10 +1497,12 @@ impl<'a> ExplicitSimulation<'a> {
             if !position_error.is_finite()
                 || !velocity_error.is_finite()
                 || position_error > 5e-4
-                || velocity_error > 5e-3
+                || (self.state.velocity_convention == VelocityConvention::LegacyFullStep
+                    && velocity_error > 5e-3)
             {
                 return Err(invalid(format!(
-                    "external constrained state residuals {position_error:.3e} A/{velocity_error:.3e} A/ps"
+                    "external constrained state residuals {position_error:.3e} A/{velocity_error:.3e} A/ps ({:?} velocity convention)",
+                    self.state.velocity_convention
                 )));
             }
         }
@@ -1949,5 +2093,33 @@ mod tests {
         let again = ExplicitSimulation::restore(&system, restored).unwrap();
         assert_eq!(again.state.coordinates, sim.state.coordinates);
         assert_eq!(again.state.box_angstrom, sim.state.box_angstrom);
+    }
+
+    #[test]
+    fn lf_middle_checkpoint_identity_allows_benchmark_schedule_extension_only() {
+        let system = solvated_dipeptide();
+        let protocol = SimulationProtocol {
+            solvent: SolventModel::Explicit,
+            constraints: ConstraintModel::Settle,
+            thermostat: Thermostat::Langevin,
+            langevin_discretization: LangevinDiscretization::LfMiddle,
+            timestep_fs: 2.0,
+            temperature_k: 300.0,
+            friction_per_ps: 1.0,
+            cutoff_angstrom: Some(9.0),
+            rf_dielectric: Some(78.5),
+            equilibration_steps: 4000,
+            production_steps: 150_000,
+            save_every: 2500,
+            ..Default::default()
+        };
+        let original = fingerprint(&system, &protocol, 0);
+        let mut extended = protocol.clone();
+        extended.equilibration_steps = 0;
+        extended.production_steps = super::super::MAX_NATIVE_STEPS;
+        extended.save_every = usize::MAX;
+        assert_eq!(original, fingerprint(&system, &extended, 0));
+        extended.temperature_k += 1.0;
+        assert_ne!(original, fingerprint(&system, &extended, 0));
     }
 }

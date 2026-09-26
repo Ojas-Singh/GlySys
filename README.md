@@ -75,6 +75,53 @@ models remain capability-gated until their independent parity tests pass.
 1–4 pairs, and SETTLE declarations with the lossless snapshot before a native
 run. It does not attempt to reconstruct chemistry from a text topology.
 
+## 1CRN dynamics qualification
+
+The current wrap-up target is about 240 ns/day for the explicit 1CRN GPU case;
+the earlier 0.80× OpenMM target is not met and is not claimed. Older short
+benchmarks used different measurement boundaries and 0.5 fs protocols, so they
+are not carried forward as current throughput claims.
+
+The new qualification uses the prepared 12,132-atom explicit TIP3P system
+(12 Å padding, 0.15 M salt, periodic reaction field, 9 Å cutoff) and the
+642-atom implicit OBC2 system. Both use NVT, 2 fs, hydrogen constraints,
+300 K, 1/ps friction, 8 ps equilibration, and 0.3 ns production. OpenMM 8.1.1
+is the pinned development/reference dependency; GlySys runtime remains Rust
+and wgpu. Primary targets are Vulkan for GlySys GPU and OpenCL mixed precision
+for OpenMM GPU, plus CPU at 1, 6, and 12 threads.
+
+| Model | GlySys CPU ns/day (1 / 6 / 12 threads) | GlySys Vulkan ns/day | OpenMM CPU ns/day (1 / 6 / 12 threads) | OpenMM OpenCL ns/day | Median ratio gate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Explicit TIP3P, reaction field | pending qualification | 219.77 (3×5 s diagnostic) | pending qualification | 600.53 (3×5 s diagnostic) | 36.6% diagnostic; not passed |
+| Implicit OBC2 | pending qualification | pending qualification | pending qualification | pending qualification | not passed |
+
+The latest explicit screen uses the opt-in cooperative kernel, fixed 640-entry
+neighbor rows, 2 fs LF-middle NVT, 2,000 warmup steps, and three synchronized
+5-second windows. Its median is 219.77 ns/day on the RX 7800 XT Vulkan backend;
+the paired OpenMM 8.1.1 OpenCL mixed-precision median is 600.53 ns/day (36.6%).
+An earlier fixed-row screen measured 247.28 versus 663.20 ns/day; these short
+screens vary with run conditions and are diagnostics, not the full matrix.
+
+A separate 0.308 ns explicit GPU trajectory completed all 154,000 steps with
+no CPU fallback. Including initialization and scheduled output, its measured
+rate was 198.82 ns/day. Static energy/force checks passed, but the predeclared
+production comparison did not: mean temperature differed by 3.86 K (3 K
+margin), and mean potential energy differed by 0.00891 kcal/mol/atom (0.005
+margin). This implementation therefore remains experimental for dynamics; the
+trajectory result is not described as OpenMM-equivalent. Raw data and the
+failed comparison are preserved under
+`D:\GlySys-performance-20260925\phase-e-explicit-fixed640-scalar-rerun`.
+
+Do not treat “pending” as zero or as an extrapolated result. The runner
+alternates engine order, starts repeats from the same step-zero
+coordinates/velocities, excludes setup and warmup from its timed window,
+records actual completed steps, and preserves raw JSON/logs plus binary,
+source-diff, protocol, and input hashes.
+See the qualification protocols and
+[`benchmark_1crn_matrix.py`](benchmarks/dynamics/benchmark_1crn_matrix.py),
+[`openmm_1crn_dynamics.py`](benchmarks/openmm_1crn_dynamics.py), and
+[`validate_1crn_dynamics.py`](benchmarks/validate_1crn_dynamics.py).
+
 Configuration can be saved as TOML or JSON and supplied with `--config`:
 
 ```toml

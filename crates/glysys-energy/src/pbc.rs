@@ -942,7 +942,7 @@ fn angle_with_gradient(a: Vec3, c: Vec3, b: Vec3) -> (f64, (Vec3, Vec3, Vec3)) {
 /// Dihedral value plus exact Cartesian gradients via forward dual numbers.
 /// The scalar matches the implicit engine's dihedral; derivatives are exact
 /// by construction, so only self-consistency needs testing.
-fn dihedral_with_gradient(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3; 4]) {
+pub(super) fn dihedral_with_gradient(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3; 4]) {
     #[derive(Clone, Copy)]
     struct D {
         v: f64,

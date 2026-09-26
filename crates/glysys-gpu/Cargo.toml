@@ -1,6 +1,6 @@
 [package]
 name = "glysys-gpu"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -8,18 +8,24 @@ description = "Optional WebGPU molecular-mechanics evaluator for GlySys"
 repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
-glysys = { version = "0.1.0", path = "../.." }
-glysys-energy = { version = "0.1.0", path = "../glysys-energy" }
+glysys = { version = "0.1.2", path = "../.." }
+glysys-energy = { version = "0.1.2", path = "../glysys-energy" }
 wgpu = { version = "26", default-features = false, features = ["std", "webgpu", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 futures-channel = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+web-time = "1.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "26", default-features = false, features = ["vulkan"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console"] }
+
 [dev-dependencies]
-glysys-dynamics = { version = "0.1.0", path = "../glysys-dynamics" }
+glysys-dynamics = { version = "0.1.2", path = "../glysys-dynamics" }
 pollster = "0.4"
 naga = { version = "26", features = ["wgsl-in"] }
+serde_json = "1"

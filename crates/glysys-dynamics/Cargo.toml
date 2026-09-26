@@ -1,15 +1,15 @@
 [package]
 name = "glysys-dynamics"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
 description = "Checkpointed implicit-solvent molecular dynamics for GlySys"
 repository = "https://github.com/Ojas-Singh/GlySys"
 [dependencies]
-glysys = { version = "0.1.0", path = "../.." }
-glysys-energy = { version = "0.1.0", path = "../glysys-energy" }
-glysys-opt = { version = "0.1.0", path = "../glysys-opt" }
+glysys = { version = "0.1.2", path = "../.." }
+glysys-energy = { version = "0.1.2", path = "../glysys-energy" }
+glysys-opt = { version = "0.1.2", path = "../glysys-opt" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"

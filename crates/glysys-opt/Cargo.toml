@@ -1,6 +1,6 @@
 [package]
 name = "glysys-opt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -15,4 +15,5 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 web-time = "1.1"

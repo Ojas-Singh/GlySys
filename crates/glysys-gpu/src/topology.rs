@@ -9,6 +9,7 @@ pub struct PreparedTopology {
     terms: Vec<Term>,
     incidence: Vec<[u32; 2]>,
     specials: Vec<Special>,
+    dense_special_lookup_base: Option<u32>,
     pub origin: Vec3,
 }
 impl PreparedTopology {
@@ -137,9 +138,64 @@ impl PreparedTopology {
             terms,
             incidence,
             specials,
+            dense_special_lookup_base: None,
             origin,
         })
     }
+
+    /// Append a dense symmetric pair-scale table when it fits the caller's
+    /// explicit allocation allowance. Rows are indexed by `(atom_i, atom_j)`.
+    /// `None` leaves the sorted sparse exception lists available as fallback.
+    pub fn append_dense_special_lookup(&mut self, max_bytes: u64) -> Result<Option<u32>, Error> {
+        if let Some(base) = self.dense_special_lookup_base {
+            return Ok(Some(base));
+        }
+        let n = self.atoms.len();
+        let entries = n.checked_mul(n).ok_or(Error::Capacity)?;
+        let bytes = (entries as u64)
+            .checked_mul(std::mem::size_of::<Special>() as u64)
+            .ok_or(Error::Capacity)?;
+        if bytes > max_bytes {
+            return Ok(None);
+        }
+        let base = u32::try_from(self.specials.len()).map_err(|_| Error::Capacity)?;
+        let end = usize::try_from(base)
+            .ok()
+            .and_then(|base| base.checked_add(entries))
+            .ok_or(Error::Capacity)?;
+        if end > u32::MAX as usize {
+            return Err(Error::Capacity);
+        }
+        let mut table = Vec::with_capacity(entries);
+        for _i in 0..n {
+            for j in 0..n {
+                table.push(Special {
+                    other: j as u32,
+                    scee: 1.0,
+                    scnb: 1.0,
+                    spare: 0,
+                });
+            }
+        }
+        for (atom_index, atom) in self.atoms.iter().enumerate() {
+            for entry in &self.specials[atom.ranges[2] as usize..atom.ranges[3] as usize] {
+                let other = entry.other as usize;
+                if other >= n {
+                    return Err(Error::Input("special pair atom index"));
+                }
+                table[atom_index * n + other].scee = entry.scee;
+                table[atom_index * n + other].scnb = entry.scnb;
+            }
+        }
+        self.specials.extend(table);
+        self.dense_special_lookup_base = Some(base);
+        Ok(Some(base))
+    }
+
+    pub fn dense_special_lookup_base(&self) -> Option<u32> {
+        self.dense_special_lookup_base
+    }
+
     pub fn view(&self) -> Topology<'_> {
         Topology {
             atoms: &self.atoms,

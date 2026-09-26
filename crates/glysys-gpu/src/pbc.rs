@@ -26,6 +26,15 @@ use glysys_energy::pbc::{
 use std::collections::BTreeMap;
 use wgpu::util::DeviceExt;
 
+// Keep each native/WebGPU command buffer bounded. A 64-step encoded chain
+// triggered wgpu out-of-memory on the RX 7800 XT. Matched 5-second samples
+// favored eight-step packets slightly over sixteen, while thirty-two was
+// slower, so retain the smaller measured winner.
+pub const MAX_ENCODED_DYNAMICS_STEPS: usize = 8;
+const MAX_SOLUTE_CONSTRAINT_COMPONENT_BONDS: usize = 8;
+pub const TILED_NEIGHBORS_PER_ATOM: u32 = 640;
+const INDIRECT_NEIGHBOR_DISPATCH: u32 = u32::MAX;
+
 /// Minimal PBC packing: per-atom parameters plus exclusion/1-4 specials.
 /// Mirrors `topology::PreparedTopology` conventions (scee == 0 skips).
 pub struct PbcPacking {
@@ -39,6 +48,8 @@ pub struct PbcPacking {
     pub molecules: Vec<Vec<usize>>,
     pub bonded_coords: Vec<[f32; 4]>,
     pub solute_constraint_count: u32,
+    pub solute_constraint_component_offset: u32,
+    pub solute_constraint_component_count: u32,
     pub dims: [u32; 4],
     pub limit: f64,
     pub cutoff: f64,
@@ -194,14 +205,30 @@ impl PbcPacking {
         }
         let solute_at = bonded.len();
         let in_water: std::collections::HashSet<usize> = waters.iter().flatten().copied().collect();
+        let mut solute_constraints = Vec::<[f32; 4]>::new();
+        let mut solute_constraint_edges = Vec::<[u32; 2]>::new();
         for bond in system.bonds() {
             let [a, b] = bond.atoms();
             if !in_water.contains(&a)
                 && !in_water.contains(&b)
                 && (system.atoms()[a].element() == 1 || system.atoms()[b].element() == 1)
             {
-                bonded.push([a as f32, b as f32, bond.length() as f32, 0.]);
+                solute_constraint_edges.push([a as u32, b as u32]);
+                solute_constraints.push([a as f32, b as f32, bond.length() as f32, 0.]);
             }
+        }
+        let constraint_components = solute_constraint_components(&solute_constraint_edges, n)?;
+        let mut constraint_component_ranges = Vec::with_capacity(constraint_components.len());
+        let mut local_constraint_offset = 0usize;
+        for component in &constraint_components {
+            constraint_component_ranges.push((
+                u32::try_from(solute_at + local_constraint_offset).map_err(|_| Error::Capacity)?,
+                u32::try_from(component.len()).map_err(|_| Error::Capacity)?,
+            ));
+            for &constraint in component {
+                bonded.push(solute_constraints[constraint]);
+            }
+            local_constraint_offset += component.len();
         }
         let ends = bonded.len();
         let water_count = ((solute_at - waters_at) / 2)
@@ -277,6 +304,18 @@ impl PbcPacking {
             }
             bonded.push(packed);
         }
+        let solute_constraint_component_offset =
+            u32::try_from(bonded.len()).map_err(|_| Error::Capacity)?;
+        for (first_bond, bond_count) in &constraint_component_ranges {
+            bonded.push([
+                f32::from_bits(*first_bond),
+                f32::from_bits(*bond_count),
+                0.0,
+                0.0,
+            ]);
+        }
+        let solute_constraint_component_count =
+            u32::try_from(constraint_component_ranges.len()).map_err(|_| Error::Capacity)?;
         Ok(Self {
             params,
             ranges,
@@ -288,6 +327,8 @@ impl PbcPacking {
             molecules,
             bonded_coords,
             solute_constraint_count,
+            solute_constraint_component_offset,
+            solute_constraint_component_count,
             dims: [n as u32, nx, ny, nz],
             limit,
             cutoff,
@@ -372,6 +413,16 @@ pub struct EnergyResult {
     pub pair_virial: Option<f64>,
 }
 
+/// Thermodynamic scalars read from a resident explicit GPU state. Coordinates,
+/// velocities, RNG, and force arrays stay on the device.
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicsScalars {
+    pub potential_energy: f64,
+    pub kinetic_energy: f64,
+    pub neighbor_rebuild_count: u64,
+    pub readback_bytes: u64,
+}
+
 /// A serializable sample of the resident integrator state.  The random words
 /// are part of the state, rather than an implementation detail: preserving
 /// them makes a checkpoint/restart continue the same Langevin stream.
@@ -380,15 +431,34 @@ pub struct ResidentDynamicsState {
     pub coordinates: Vec<Vec3>,
     pub velocities: Vec<Vec3>,
     pub rng_words: Vec<u32>,
+    #[serde(default)]
+    pub neighbor_rebuild_count: u64,
 }
 
-fn dynamics_error(value: u32) -> Option<&'static str> {
+fn dynamics_error(value: u32) -> Option<String> {
+    let constraint_kind = value & 0xf000_0000;
+    if constraint_kind == 0x5000_0000 || constraint_kind == 0x6000_0000 {
+        let index = (value >> 16) & 0x0fff;
+        let residual = (value & 0xffff) as f32 / 1_000_000.0;
+        let kind = if constraint_kind == 0x5000_0000 {
+            "solute position"
+        } else {
+            "solute velocity"
+        };
+        return Some(format!(
+            "GPU {kind}-constraint projection failed at packed bond index {index} (residual {residual:.6e})"
+        ));
+    }
     match value {
         0 => None,
-        1 => Some("SETTLE numerical branch"),
-        2 => Some("GPU pair-buffer capacity"),
-        3 => Some("GPU neighbor-list capacity"),
-        _ => Some("GPU dynamics numerical error"),
+        1 => Some("SETTLE numerical branch".into()),
+        2 => Some("GPU pair-buffer capacity".into()),
+        3 => Some("GPU neighbor-list capacity".into()),
+        5 => Some("GPU solute position-constraint projection failed to converge".into()),
+        6 => Some("GPU solute velocity-constraint projection failed to converge".into()),
+        7 => Some("GPU SETTLE position projection failed its geometry check".into()),
+        8 => Some("GPU SETTLE velocity projection failed its constraint check".into()),
+        _ => Some("GPU dynamics numerical error".into()),
     }
 }
 
@@ -414,6 +484,10 @@ pub struct ResidentPbc {
     molecules: Vec<Vec<usize>>,
     water_count: u32,
     solute_constraint_count: u32,
+    solute_constraint_component_offset: u32,
+    solute_constraint_component_count: u32,
+    tiled_nonbonded: bool,
+    gpu_stage_timings_ms: std::sync::Mutex<BTreeMap<String, f64>>,
     dt_ps: f32,
     params: Vec<[f32; 4]>,
     srange_image: Vec<u32>,
@@ -422,6 +496,96 @@ pub struct ResidentPbc {
 
 fn workgroups(n: u32) -> u32 {
     n.div_ceil(64).max(1)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pbc_stage_name(pipeline: usize) -> &'static str {
+    match pipeline {
+        0 => "neighborInsert",
+        1 => "neighborCount",
+        2 => "nonbondedForces",
+        3 => "reductions",
+        4 | 9 => "bondedForces",
+        6..=8 => "constraints",
+        10 => "neighborClear",
+        14 => "neighborCheck",
+        15 => "neighborScan",
+        16 => "neighborBlockScan",
+        17 => "neighborOffsetApply",
+        18 => "neighborFill",
+        19 => "neighborSort",
+        20 => "neighborFinish",
+        25 => "neighborDispatchPrepare",
+        26 => "neighborSort",
+        27 => "neighborFillFixed",
+        28 => "neighborSortFixed",
+        29 => "dynamicsScalarReduction",
+        _ => "integration",
+    }
+}
+
+fn solute_constraint_components(
+    edges: &[[u32; 2]],
+    atom_count: usize,
+) -> Result<Vec<Vec<usize>>, Error> {
+    let mut atom_edges = vec![Vec::<usize>::new(); atom_count];
+    for (edge_index, [a, b]) in edges.iter().copied().enumerate() {
+        let (a, b) = (a as usize, b as usize);
+        if a >= atom_count || b >= atom_count {
+            return Err(Error::Input("solute constraint atom index"));
+        }
+        atom_edges[a].push(edge_index);
+        atom_edges[b].push(edge_index);
+    }
+    let mut visited = vec![false; edges.len()];
+    let mut components = Vec::new();
+    for first in 0..edges.len() {
+        if visited[first] {
+            continue;
+        }
+        let mut stack = vec![first];
+        let mut component = Vec::new();
+        while let Some(edge_index) = stack.pop() {
+            if visited[edge_index] {
+                continue;
+            }
+            visited[edge_index] = true;
+            component.push(edge_index);
+            for atom in edges[edge_index] {
+                for &neighbor in &atom_edges[atom as usize] {
+                    if !visited[neighbor] {
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+        component.sort_unstable();
+        if component.len() > MAX_SOLUTE_CONSTRAINT_COMPONENT_BONDS {
+            return Err(Error::Input(
+                "GPU solute constraint component exceeds eight bonds",
+            ));
+        }
+        components.push(component);
+    }
+    Ok(components)
+}
+
+#[cfg(test)]
+mod constraint_component_tests {
+    use super::solute_constraint_components;
+
+    #[test]
+    fn shares_edges_only_within_connected_components_and_preserves_order() {
+        let components =
+            solute_constraint_components(&[[0, 1], [0, 2], [3, 4], [5, 6], [5, 7]], 8).unwrap();
+        assert_eq!(components, vec![vec![0, 1], vec![2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn rejects_oversized_components_for_the_gpu_solver() {
+        let edges: Vec<_> = (1..=9).map(|atom| [0, atom]).collect();
+        assert!(solute_constraint_components(&edges, 10).is_err());
+    }
 }
 
 /// Bytes needed for the combined resident dynamics snapshot.  Keep this
@@ -497,12 +661,26 @@ impl ResidentPbc {
         backend: &NonbondedElectrostatics,
         max_pairs: u32,
     ) -> Result<Self, Error> {
+        Self::with_context_variant(context, packing, backend, max_pairs, false).await
+    }
+
+    /// Construct a periodic evaluator and optionally select the cooperative
+    /// explicit pair kernel. The default constructor remains on the established
+    /// serial-per-atom path for browser and compatibility callers.
+    pub async fn with_context_variant(
+        context: &GpuContext,
+        packing: &PbcPacking,
+        backend: &NonbondedElectrostatics,
+        max_pairs: u32,
+        tiled_nonbonded: bool,
+    ) -> Result<Self, Error> {
         Self::with_budget_context(
             context,
             packing,
             backend,
             max_pairs,
             context.memory_profile().budget(),
+            tiled_nonbonded,
         )
         .await
     }
@@ -513,6 +691,7 @@ impl ResidentPbc {
         backend: &NonbondedElectrostatics,
         max_pairs: u32,
         budget: u64,
+        tiled_nonbonded: bool,
     ) -> Result<Self, Error> {
         let electro = electrostatics_uniform(backend)?;
         // The packing cutoff and the backend cutoff must agree: cells are
@@ -533,7 +712,13 @@ impl ResidentPbc {
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size as u64);
         let n64 = u64::from(n);
-        let pairs_bytes = u64::from(max_pairs).checked_mul(8).ok_or(Error::Capacity)?;
+        let pairs_bytes = if tiled_nonbonded {
+            n64.checked_mul(u64::from(TILED_NEIGHBORS_PER_ATOM))
+                .and_then(|words| words.checked_mul(4))
+                .ok_or(Error::Capacity)?
+        } else {
+            u64::from(max_pairs).checked_mul(8).ok_or(Error::Capacity)?
+        };
         let sys_bytes = n64.checked_mul(32).ok_or(Error::Capacity)?;
         // Cell heads, links, two range words/atom, pair counter, and a
         // single atomic numerical-status flag.
@@ -541,6 +726,7 @@ impl ResidentPbc {
             .checked_add(8u64.checked_mul(n64).ok_or(Error::Capacity)?)
             .and_then(|v| v.checked_add(5))
             .and_then(|v| v.checked_add(u64::from(workgroups(n))))
+            .and_then(|v| v.checked_add(30))
             .ok_or(Error::Capacity)?;
         let meta_bytes = meta_words.checked_mul(4).ok_or(Error::Capacity)?;
         let out_bytes = 6u64
@@ -584,7 +770,11 @@ impl ResidentPbc {
             || pairs_bytes > max_buffer
             || out_bytes > max_buffer
             || sys_bytes > max_buffer
-            || workgroups(n) > limits.max_compute_workgroups_per_dimension
+            || if tiled_nonbonded {
+                n > limits.max_compute_workgroups_per_dimension
+            } else {
+                workgroups(n) > limits.max_compute_workgroups_per_dimension
+            }
         {
             return Err(Error::Capacity);
         }
@@ -611,7 +801,7 @@ impl ResidentPbc {
         let buffers = vec![
             buffer(
                 "pbc config",
-                112,
+                128,
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ),
             buffer(
@@ -622,7 +812,10 @@ impl ResidentPbc {
             buffer(
                 "pbc meta",
                 meta_bytes,
-                storage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                storage
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::INDIRECT,
             ),
             immutable("pbc specials", bytemuck::cast_slice(&packing.specials)),
             buffer(
@@ -696,7 +889,11 @@ impl ResidentPbc {
         let pipelines = [
             "insert_atoms",
             "count_neighbors",
-            "eval",
+            if tiled_nonbonded {
+                "eval_tiled_fixed"
+            } else {
+                "eval"
+            },
             "reduce",
             "bonded_energy",
             "integrate_first",
@@ -715,6 +912,15 @@ impl ResidentPbc {
             "fill_neighbors",
             "sort_neighbors",
             "finish_neighbors",
+            "lf_full_kick",
+            "lf_first_half_drift",
+            "lf_save_start",
+            "lf_second_half_drift",
+            "prepare_neighbor_dispatch",
+            "sort_neighbors_tiled",
+            "fill_neighbors_fixed",
+            "sort_neighbors_fixed",
+            "reduce_dynamics_scalars",
         ]
         .iter()
         .map(|entry| {
@@ -731,7 +937,11 @@ impl ResidentPbc {
         for entry in [
             "insert_atoms",
             "count_neighbors",
-            "eval",
+            if tiled_nonbonded {
+                "eval_tiled_fixed"
+            } else {
+                "eval"
+            },
             "reduce",
             "bonded_energy",
             "integrate_first",
@@ -750,6 +960,15 @@ impl ResidentPbc {
             "fill_neighbors",
             "sort_neighbors",
             "finish_neighbors",
+            "lf_full_kick",
+            "lf_first_half_drift",
+            "lf_save_start",
+            "lf_second_half_drift",
+            "prepare_neighbor_dispatch",
+            "sort_neighbors_tiled",
+            "fill_neighbors_fixed",
+            "sort_neighbors_fixed",
+            "reduce_dynamics_scalars",
         ] {
             context.record_pipeline(format!("pbc.{entry}"));
         }
@@ -797,6 +1016,10 @@ impl ResidentPbc {
             molecules: packing.molecules.clone(),
             water_count: packing.bonded_counts[3],
             solute_constraint_count: packing.solute_constraint_count,
+            solute_constraint_component_offset: packing.solute_constraint_component_offset,
+            solute_constraint_component_count: packing.solute_constraint_component_count,
+            tiled_nonbonded,
+            gpu_stage_timings_ms: std::sync::Mutex::new(BTreeMap::new()),
             dt_ps: f64::NAN as f32,
             params: packing.params.clone(),
             srange_image,
@@ -814,12 +1037,70 @@ impl ResidentPbc {
         self.meta_count_off() + 4
     }
 
+    fn eval_dispatch_groups(&self) -> u32 {
+        if self.tiled_nonbonded {
+            self.n
+        } else {
+            workgroups(self.n)
+        }
+    }
+
     /// Upload interleaved params/coords, static specials ranges, a cleared
     /// cell-head table, and a zeroed pair counter. The uniform (dims, box,
     /// electrostatics, flags) is rewritten every call: box and coordinates
     /// change per frame, so nothing is cached across calls.
     pub fn set_coordinates(&self, unwrapped: &[Vec3], box_xyz: [f32; 3], gradients: bool) {
         assert_eq!(unwrapped.len() as u32, self.n);
+        self.set_coordinates_from(box_xyz, gradients, true, |i| {
+            [unwrapped[i].x, unwrapped[i].y, unwrapped[i].z]
+        });
+    }
+
+    /// Upload f64 xyz coordinates without first materializing a `Vec<Vec3>`.
+    /// This is used by the minimizer, whose working coordinates are already a
+    /// flat slice, to avoid one large allocation and an extra full-system copy
+    /// on every energy/gradient evaluation.
+    pub fn set_flat_coordinates_f64(&self, unwrapped: &[f64], box_xyz: [f32; 3], gradients: bool) {
+        assert_eq!(unwrapped.len(), self.n as usize * 3);
+        self.set_coordinates_from(box_xyz, gradients, true, |i| {
+            let offset = 3 * i;
+            [
+                unwrapped[offset],
+                unwrapped[offset + 1],
+                unwrapped[offset + 2],
+            ]
+        });
+    }
+
+    /// Upload minimization trial coordinates while retaining the cached
+    /// Verlet list. The subsequent force evaluation checks displacement
+    /// against the list's reference coordinates and rebuilds when the skin is
+    /// crossed. Use only after an initial successful force evaluation on this
+    /// evaluator, with the same topology and periodic box.
+    pub fn set_flat_coordinates_f64_reusing_neighbors(
+        &self,
+        unwrapped: &[f64],
+        box_xyz: [f32; 3],
+        gradients: bool,
+    ) {
+        assert_eq!(unwrapped.len(), self.n as usize * 3);
+        self.set_coordinates_from(box_xyz, gradients, false, |i| {
+            let offset = 3 * i;
+            [
+                unwrapped[offset],
+                unwrapped[offset + 1],
+                unwrapped[offset + 2],
+            ]
+        });
+    }
+
+    fn set_coordinates_from(
+        &self,
+        box_xyz: [f32; 3],
+        gradients: bool,
+        reset_neighbor_search: bool,
+        mut coordinate: impl FnMut(usize) -> [f64; 3],
+    ) {
         let mut config = [0u8; 112];
         for (i, v) in self.dims.iter().enumerate() {
             config[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
@@ -837,7 +1118,7 @@ impl ResidentPbc {
             if gradients { 1f32 } else { 0. },
             self.max_pairs as f32,
             self.ncells as f32,
-            0.,
+            f32::from_bits(self.solute_constraint_component_offset),
         ];
         for (i, v) in misc.iter().enumerate() {
             config[48 + 4 * i..52 + 4 * i].copy_from_slice(&v.to_le_bytes());
@@ -857,41 +1138,50 @@ impl ResidentPbc {
         // NVE defaults to a full drift interval and a harmless temperature;
         // the NVT entry point overwrites these three scalar fields before its
         // dispatch without touching resident coordinates or velocities.
-        let thermo = [300.0f32, 1.0, self.adjacency_offset as f32, 0.0];
+        let thermo = [
+            300.0f32,
+            1.0,
+            self.adjacency_offset as f32,
+            f32::from_bits(self.solute_constraint_component_count),
+        ];
         for (i, v) in thermo.iter().enumerate() {
             config[96 + 4 * i..100 + 4 * i].copy_from_slice(&v.to_le_bytes());
         }
         self.queue.write_buffer(&self.buffers[0], 0, &config);
-        let mut sys = Vec::with_capacity(unwrapped.len() * 2);
-        for (p, c) in self.params.iter().zip(unwrapped.iter()) {
+        let atom_count = self.n as usize;
+        let mut sys = Vec::with_capacity(atom_count * 2);
+        for (index, p) in self.params.iter().enumerate() {
+            let c = coordinate(index);
             sys.push(*p);
             // Centering before the f32 cast reduces cancellation in bonded
             // coordinate differences. It is a rigid translation: GPU cells
             // wrap the centered coordinate and minimum image is unchanged.
             sys.push([
-                (c.x - 0.5 * box_xyz[0] as f64) as f32,
-                (c.y - 0.5 * box_xyz[1] as f64) as f32,
-                (c.z - 0.5 * box_xyz[2] as f64) as f32,
+                (c[0] - 0.5 * box_xyz[0] as f64) as f32,
+                (c[1] - 0.5 * box_xyz[1] as f64) as f32,
+                (c[2] - 0.5 * box_xyz[2] as f64) as f32,
                 0.,
             ]);
         }
         self.queue
             .write_buffer(&self.buffers[1], 0, bytemuck::cast_slice(&sys));
-        let mut bonded_coords = vec![[0f32; 4]; unwrapped.len()];
+        let mut bonded_coords = vec![[0f32; 4]; atom_count];
         for group in &self.molecules {
             let mut center = [0f64; 3];
             for &atom in group {
-                center[0] += unwrapped[atom].x;
-                center[1] += unwrapped[atom].y;
-                center[2] += unwrapped[atom].z;
+                let c = coordinate(atom);
+                center[0] += c[0];
+                center[1] += c[1];
+                center[2] += c[2];
             }
             let count = group.len() as f64;
             let anchor = group[0];
             for &atom in group {
+                let c = coordinate(atom);
                 bonded_coords[atom] = [
-                    (unwrapped[atom].x - center[0] / count) as f32,
-                    (unwrapped[atom].y - center[1] / count) as f32,
-                    (unwrapped[atom].z - center[2] / count) as f32,
+                    (c[0] - center[0] / count) as f32,
+                    (c[1] - center[1] / count) as f32,
+                    (c[2] - center[2] / count) as f32,
                     f32::from_bits(anchor as u32),
                 ];
             }
@@ -903,20 +1193,22 @@ impl ResidentPbc {
             self.meta_srange_off(),
             bytemuck::cast_slice(&self.srange_image),
         );
-        self.queue
-            .write_buffer(&self.buffers[2], 0, &vec![0xFFu8; self.ncells as usize * 4]);
-        self.queue
-            .write_buffer(&self.buffers[2], self.meta_count_off(), &[0; 4]);
         // A coordinate upload starts a fresh evaluation session.  Dynamics
         // itself deliberately leaves the numerical-status word sticky until
         // the host polls it at a bounded checkpoint.
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
-        self.queue.write_buffer(
-            &self.buffers[2],
-            self.meta_status_off() + 4,
-            &1u32.to_le_bytes(),
-        );
+        if reset_neighbor_search {
+            self.queue
+                .write_buffer(&self.buffers[2], 0, &vec![0xFFu8; self.ncells as usize * 4]);
+            self.queue
+                .write_buffer(&self.buffers[2], self.meta_count_off(), &[0; 4]);
+            self.queue.write_buffer(
+                &self.buffers[2],
+                self.meta_status_off() + 4,
+                &1u32.to_le_bytes(),
+            );
+        }
     }
 
     /// Configure the resident integrator timestep in picoseconds. The value
@@ -991,6 +1283,24 @@ impl ResidentPbc {
         self.set_velocities(velocities)
     }
 
+    /// Initialize a fresh resident run with the stochastic stream already
+    /// recorded in its step-zero checkpoint.  The convenience initializer
+    /// above retains its historical per-atom seed convention for direct GPU
+    /// callers; runtime-managed simulations must use this method so a fresh
+    /// run and a resume from step zero start from the same RNG state.
+    pub fn initialize_dynamics_with_rng(
+        &mut self,
+        coordinates: &[Vec3],
+        velocities: &[Vec3],
+        box_xyz: [f32; 3],
+        dt_ps: f32,
+        rng_words: &[u32],
+    ) -> Result<(), Error> {
+        self.set_timestep(dt_ps)?;
+        self.set_coordinates(coordinates, box_xyz, true);
+        self.set_velocities_with_rng(velocities, rng_words)
+    }
+
     /// Restore coordinates, velocities, and stochastic state from a resident
     /// checkpoint.  The force buffer is intentionally not serialized here:
     /// call [`Self::energy_and_forces`] once after restoring, then resume the
@@ -1027,26 +1337,7 @@ impl ResidentPbc {
     }
 
     fn dispatch_repeated(&self, jobs: &[(usize, u32)], steps: usize) {
-        let mut expanded = Vec::with_capacity(jobs.len() + 10);
-        for &(pipeline, groups) in jobs {
-            if pipeline == 0 {
-                let n = workgroups(self.n);
-                expanded.extend_from_slice(&[
-                    (14, n),
-                    (10, workgroups(self.n.max(self.ncells))),
-                    (0, n),
-                    (1, n),
-                    (15, n),
-                    (16, 1),
-                    (17, n),
-                    (18, n),
-                    (19, n),
-                    (20, 1),
-                ]);
-            } else if pipeline != 10 {
-                expanded.push((pipeline, groups));
-            }
-        }
+        let expanded = self.expanded_jobs(jobs);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1058,10 +1349,229 @@ impl ResidentPbc {
                 });
                 pass.set_pipeline(&self.pipelines[pipeline]);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.dispatch_workgroups(groups, 1, 1);
+                if groups == INDIRECT_NEIGHBOR_DISPATCH {
+                    pass.dispatch_workgroups_indirect(
+                        &self.buffers[2],
+                        self.neighbor_indirect_offset(pipeline),
+                    );
+                } else {
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+                drop(pass);
             }
         }
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn expanded_jobs(&self, jobs: &[(usize, u32)]) -> Vec<(usize, u32)> {
+        let mut expanded = Vec::with_capacity(jobs.len() + 10);
+        for &(pipeline, groups) in jobs {
+            if pipeline == 0 {
+                let n = workgroups(self.n);
+                expanded.extend_from_slice(&[
+                    (14, n),
+                    (25, 1),
+                    (10, INDIRECT_NEIGHBOR_DISPATCH),
+                    (0, INDIRECT_NEIGHBOR_DISPATCH),
+                ]);
+                if self.tiled_nonbonded {
+                    expanded.extend_from_slice(&[
+                        (27, INDIRECT_NEIGHBOR_DISPATCH),
+                        (28, INDIRECT_NEIGHBOR_DISPATCH),
+                        (20, INDIRECT_NEIGHBOR_DISPATCH),
+                    ]);
+                } else {
+                    expanded.extend_from_slice(&[
+                        (1, INDIRECT_NEIGHBOR_DISPATCH),
+                        (15, INDIRECT_NEIGHBOR_DISPATCH),
+                        (16, INDIRECT_NEIGHBOR_DISPATCH),
+                        (17, INDIRECT_NEIGHBOR_DISPATCH),
+                        (18, INDIRECT_NEIGHBOR_DISPATCH),
+                        (19, INDIRECT_NEIGHBOR_DISPATCH),
+                        (20, INDIRECT_NEIGHBOR_DISPATCH),
+                    ]);
+                }
+            } else if pipeline != 10 {
+                expanded.push((pipeline, groups));
+            }
+        }
+        // WebGPU forbids using one buffer as both a writable storage binding
+        // and indirect-dispatch arguments in the same synchronization scope.
+        // Neighbor dispatch arguments are stored in `aux`, which is also the
+        // PBC metadata storage binding, so browsers must use bounded direct
+        // dispatches; each stage already checks the rebuild/status flags.
+        #[cfg(target_arch = "wasm32")]
+        for (pipeline, groups) in &mut expanded {
+            if *groups != INDIRECT_NEIGHBOR_DISPATCH {
+                continue;
+            }
+            *groups = match *pipeline {
+                10 => workgroups(self.n.max(self.ncells)),
+                16 | 20 => 1,
+                26 | 28 => self.n,
+                _ => workgroups(self.n),
+            };
+        }
+        expanded
+    }
+
+    fn neighbor_indirect_offset(&self, pipeline: usize) -> u64 {
+        let slot = match pipeline {
+            10 => 0u64,
+            0 => 1,
+            1 => 2,
+            15 => 3,
+            16 => 4,
+            17 => 5,
+            18 => 6,
+            19 => 7,
+            20 => 8,
+            26 => 9,
+            27 => 6,
+            28 => 9,
+            _ => unreachable!("only neighbor rebuild passes use indirect dispatch"),
+        };
+        let base =
+            u64::from(self.ncells) + 8 * u64::from(self.n) + 5 + u64::from(workgroups(self.n));
+        (base + 3 * slot) * std::mem::size_of::<u32>() as u64
+    }
+
+    pub fn take_gpu_stage_timings_ms(&self) -> BTreeMap<String, f64> {
+        self.gpu_stage_timings_ms
+            .lock()
+            .map(|mut timings| std::mem::take(&mut *timings))
+            .unwrap_or_default()
+    }
+
+    async fn dispatch_dynamics_bounded(
+        &self,
+        jobs: &[(usize, u32)],
+        steps: usize,
+    ) -> Result<(), Error> {
+        let mut remaining = steps;
+        while remaining > 0 {
+            let batch = remaining.min(MAX_ENCODED_DYNAMICS_STEPS);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self._context.gpu_timestamps_enabled() {
+                self.dispatch_repeated_profiled(jobs, batch).await?;
+            } else {
+                self.dispatch_repeated(jobs, batch);
+                self.device
+                    .poll(wgpu::PollType::Wait)
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.dispatch_repeated(jobs, batch);
+            }
+            remaining -= batch;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn dispatch_repeated_profiled(
+        &self,
+        jobs: &[(usize, u32)],
+        steps: usize,
+    ) -> Result<(), Error> {
+        let expanded = self.expanded_jobs(jobs);
+        let query_count = expanded
+            .len()
+            .checked_mul(steps)
+            .and_then(|passes| passes.checked_mul(2))
+            .and_then(|queries| u32::try_from(queries).ok())
+            .filter(|count| *count > 0)
+            .ok_or(Error::Capacity)?;
+        let byte_size = u64::from(query_count) * std::mem::size_of::<u64>() as u64;
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("GlySys explicit dynamics stage timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+        let resolved = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlySys timestamp resolve"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlySys timestamp readback"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GlySys profiled explicit dynamics"),
+            });
+        let mut query_index = 0u32;
+        let mut stages = Vec::with_capacity(expanded.len() * steps);
+        for _ in 0..steps {
+            for &(pipeline, groups) in &expanded {
+                let begin = query_index;
+                let end = begin + 1;
+                query_index += 2;
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("GlySys profiled PBC dynamics stage"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &query_set,
+                        beginning_of_pass_write_index: Some(begin),
+                        end_of_pass_write_index: Some(end),
+                    }),
+                });
+                pass.set_pipeline(&self.pipelines[pipeline]);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                if groups == INDIRECT_NEIGHBOR_DISPATCH {
+                    pass.dispatch_workgroups_indirect(
+                        &self.buffers[2],
+                        self.neighbor_indirect_offset(pipeline),
+                    );
+                } else {
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+                drop(pass);
+                stages.push((pbc_stage_name(pipeline), begin, end));
+            }
+        }
+        encoder.resolve_query_set(&query_set, 0..query_count, &resolved, 0);
+        encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, byte_size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(0..byte_size);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .map_err(|error| Error::Execution(error.to_string()))?;
+        rx.await
+            .map_err(|error| Error::Execution(error.to_string()))?
+            .map_err(|error| Error::Execution(error.to_string()))?;
+        let mapped = slice.get_mapped_range();
+        let values: &[u64] = bytemuck::cast_slice(&mapped);
+        let period_ns = self
+            ._context
+            .gpu_timestamp_period_ns()
+            .ok_or_else(|| Error::Execution("GPU timestamp period is unavailable".into()))?;
+        let mut elapsed_ms = BTreeMap::<String, f64>::new();
+        for (stage, begin, end) in stages {
+            let duration_ns =
+                values[end as usize].wrapping_sub(values[begin as usize]) as f64 * period_ns;
+            *elapsed_ms.entry(stage.to_owned()).or_default() += duration_ns / 1_000_000.0;
+        }
+        drop(mapped);
+        readback.unmap();
+        let mut accumulated = self
+            .gpu_stage_timings_ms
+            .lock()
+            .map_err(|_| Error::Execution("GPU timing accumulator was poisoned".into()))?;
+        for (stage, milliseconds) in elapsed_ms {
+            *accumulated.entry(stage).or_default() += milliseconds;
+        }
+        Ok(())
     }
 
     async fn readback(&self, src: usize, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
@@ -1152,21 +1662,48 @@ impl ResidentPbc {
                 (5, n, n),
                 (5, 3 * n, n),
                 (5, 4 * n, 32),
-                (2, self.meta_status_off(), 4),
+                (2, self.meta_status_off(), 12),
             ])
             .await?;
-        let status = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let status =
+            u32::from_le_bytes(bytes[bytes.len() - 12..bytes.len() - 8].try_into().unwrap());
         if let Some(error) = dynamics_error(status) {
-            return Err(Error::Execution(error.into()));
+            return Err(Error::Execution(error));
         }
         let n = n as usize;
-        let state = self.decode_checkpoint(&bytes[..2 * n], &bytes[2 * n..3 * n], box_xyz);
+        let mut state = self.decode_checkpoint(&bytes[..2 * n], &bytes[2 * n..3 * n], box_xyz);
+        state.neighbor_rebuild_count =
+            u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()) as u64;
         let energy = Self::decode_observables(
             &bytes[5 * n..5 * n + 32],
             Some(&bytes[3 * n..4 * n]),
             &bytes[4 * n..5 * n],
         );
         Ok((state, energy))
+    }
+
+    /// Reduce potential and kinetic energies on-device, then transfer only
+    /// those two scalars, the status word, and the neighbor rebuild counter.
+    pub async fn read_dynamics_scalars(&self) -> Result<DynamicsScalars, Error> {
+        self.dispatch_chain(&[(29, 1)]);
+        let scalar_offset = (4 * u64::from(self.n) + 2) * 16;
+        let bytes = self
+            .readback_ranges(&[(5, scalar_offset, 16), (2, self.meta_status_off(), 12)])
+            .await?;
+        let status = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        if let Some(error) = dynamics_error(status) {
+            return Err(Error::Execution(error));
+        }
+        let values: &[f32] = bytemuck::cast_slice(&bytes[..16]);
+        if !values[0].is_finite() || !values[1].is_finite() {
+            return Err(Error::Nonfinite);
+        }
+        Ok(DynamicsScalars {
+            potential_energy: values[0] as f64,
+            kinetic_energy: values[1] as f64,
+            neighbor_rebuild_count: u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as u64,
+            readback_bytes: 28,
+        })
     }
 
     /// Build cells and enumerate pairs within cutoff+skin.
@@ -1177,17 +1714,60 @@ impl ResidentPbc {
         self.dispatch_chain(&[(0, workgroups(self.n))]);
         let count_bytes = self.readback(2, self.meta_count_off(), 4).await?;
         let directed = u32::from_le_bytes(count_bytes[0..4].try_into().unwrap());
+        let status_bytes = self.readback(2, self.meta_status_off(), 4).await?;
+        let status = u32::from_le_bytes(status_bytes[0..4].try_into().unwrap());
         if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
+        }
+        if status != 0 {
+            return Err(if status == 2 || status == 3 {
+                Error::Capacity
+            } else {
+                Error::Execution(
+                    dynamics_error(status).unwrap_or_else(|| "GPU neighbor-list failure".into()),
+                )
+            });
         }
         if directed > 2 * self.max_pairs {
             return Err(Error::Capacity);
         }
-        let pair_bytes = if directed > 0 {
+        let pair_bytes = if self.tiled_nonbonded {
+            self.readback(
+                4,
+                0,
+                u64::from(self.n) * u64::from(TILED_NEIGHBORS_PER_ATOM) * 4,
+            )
+            .await?
+        } else if directed > 0 {
             self.readback(4, 0, u64::from(directed) * 4).await?
         } else {
             Vec::new()
         };
+        if self.tiled_nonbonded {
+            let count_bytes = self
+                .readback(
+                    2,
+                    (u64::from(self.ncells) + 6 * u64::from(self.n) + 4) * 4,
+                    u64::from(self.n) * 4,
+                )
+                .await?;
+            let counts: &[u32] = bytemuck::cast_slice(&count_bytes);
+            let indices: &[u32] = bytemuck::cast_slice(&pair_bytes);
+            let mut pairs = Vec::new();
+            for a in 0..self.n as usize {
+                let start = a * TILED_NEIGHBORS_PER_ATOM as usize;
+                for &b in &indices[start..start + counts[a] as usize] {
+                    if b as usize > a {
+                        pairs.push((a as u32, b));
+                    }
+                }
+            }
+            pairs.sort_unstable();
+            return Ok(NeighborResult {
+                count: pairs.len() as u32,
+                pairs,
+            });
+        }
         let offset_bytes = self
             .readback(
                 2,
@@ -1238,7 +1818,7 @@ impl ResidentPbc {
         self.dispatch_chain(&[
             (10, workgroups(self.n.max(self.ncells))),
             (0, n),
-            (2, n),
+            (2, self.eval_dispatch_groups()),
             (4, n),
             (3, 1),
         ]);
@@ -1325,11 +1905,25 @@ impl ResidentPbc {
         self.dynamics_steps(1).await
     }
 
+    async fn reduce_energy_once(&self) -> Result<(), Error> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self._context.gpu_timestamps_enabled() {
+            return self.dispatch_repeated_profiled(&[(3, 1)], 1).await;
+        }
+        // Force kernels overwrite the per-atom energy partials on every step,
+        // but no integrator consumes the scalar reduction. Reduce only once
+        // at the returned advance boundary, where snapshots may observe it.
+        self.dispatch_chain(&[(3, 1)]);
+        Ok(())
+    }
+
     /// Encode a bounded sequence without intermediate host synchronization.
     /// Callers split at output and protocol boundaries before using this API.
     pub async fn dynamics_steps(&self, steps: usize) -> Result<(), Error> {
-        if !(1..=128).contains(&steps) {
-            return Err(Error::Input("dynamics batch must contain 1–128 steps"));
+        if steps == 0 {
+            return Err(Error::Input(
+                "dynamics batch must contain at least one step",
+            ));
         }
         if !self.dt_ps.is_finite() || self.dt_ps <= 0.0 {
             return Err(Error::Input("dynamics timestep is not configured"));
@@ -1338,21 +1932,22 @@ impl ResidentPbc {
             .write_buffer(&self.buffers[0], 100, &1.0f32.to_le_bytes());
         crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let groups = workgroups(self.n.max(self.ncells));
-        self.dispatch_repeated(
+        self.dispatch_dynamics_bounded(
             &[
-                (10, groups),            // clear resident cells/counter
-                (5, workgroups(self.n)), // first half kick + drift
-                (6, groups),             // analytic SETTLE + SHAKE
-                (9, workgroups(self.n)), // update molecule-centered bonded data
-                (0, workgroups(self.n)), // cell insertion
-                (2, workgroups(self.n)), // nonbonded force
-                (4, workgroups(self.n)), // bonded force/energy
-                (3, 1),                  // deterministic reduction
-                (7, workgroups(self.n)), // second half kick
-                (8, groups),             // analytic water RATTLE + solute RATTLE
+                (10, groups),                     // clear resident cells/counter
+                (5, workgroups(self.n)),          // first half kick + drift
+                (6, groups),                      // analytic SETTLE + SHAKE
+                (9, workgroups(self.n)),          // update molecule-centered bonded data
+                (0, workgroups(self.n)),          // cell insertion
+                (2, self.eval_dispatch_groups()), // nonbonded force
+                (4, workgroups(self.n)),          // bonded force/energy
+                (7, workgroups(self.n)),          // second half kick
+                (8, groups),                      // analytic water RATTLE + solute RATTLE
             ],
             steps,
-        );
+        )
+        .await?;
+        self.reduce_energy_once().await?;
         if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
@@ -1379,8 +1974,10 @@ impl ResidentPbc {
         temperature_k: f32,
         friction_per_ps: f32,
     ) -> Result<(), Error> {
-        if !(1..=128).contains(&steps) {
-            return Err(Error::Input("dynamics batch must contain 1–128 steps"));
+        if steps == 0 {
+            return Err(Error::Input(
+                "dynamics batch must contain at least one step",
+            ));
         }
         if !self.dt_ps.is_finite() || self.dt_ps <= 0.0 {
             return Err(Error::Input("dynamics timestep is not configured"));
@@ -1394,24 +1991,79 @@ impl ResidentPbc {
         self.write_nvt_uniforms(temperature_k, friction_per_ps, 2.0);
         crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let groups = workgroups(self.n.max(self.ncells));
-        self.dispatch_repeated(
+        self.dispatch_dynamics_bounded(
             &[
                 (10, groups),
-                (11, workgroups(self.n)), // first A/2
-                (6, groups),              // SETTLE/SHAKE
-                (12, workgroups(self.n)), // OU thermostat
-                (13, workgroups(self.n)), // second A/2
-                (6, groups),              // SETTLE/SHAKE
-                (9, workgroups(self.n)),  // bonded frame
-                (0, workgroups(self.n)),  // cells
-                (2, workgroups(self.n)),  // forces
-                (4, workgroups(self.n)),  // bonded forces
-                (3, 1),                   // reduction
-                (7, workgroups(self.n)),  // second B/2
-                (8, groups),              // RATTLE
+                (11, workgroups(self.n)),         // first A/2
+                (6, groups),                      // SETTLE/SHAKE
+                (12, workgroups(self.n)),         // OU thermostat
+                (13, workgroups(self.n)),         // second A/2
+                (6, groups),                      // SETTLE/SHAKE
+                (9, workgroups(self.n)),          // bonded frame
+                (0, workgroups(self.n)),          // cells
+                (2, self.eval_dispatch_groups()), // forces
+                (4, workgroups(self.n)),          // bonded forces
+                (7, workgroups(self.n)),          // second B/2
+                (8, groups),                      // RATTLE
             ],
             steps,
-        );
+        )
+        .await?;
+        self.reduce_energy_once().await?;
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
+            return Err(Error::Execution(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Advance constrained explicit NVT using the OpenMM LF-middle sequence:
+    /// full kick and RATTLE, half drift, OU, half drift, SETTLE/SHAKE position
+    /// projection with velocity correction, then force refresh. There is no
+    /// final half-kick/RATTLE, preserving LF-middle's centered velocities.
+    pub async fn dynamics_steps_lf_middle(
+        &self,
+        steps: usize,
+        temperature_k: f32,
+        friction_per_ps: f32,
+    ) -> Result<(), Error> {
+        if steps == 0 {
+            return Err(Error::Input(
+                "LF-middle batch must contain at least one step",
+            ));
+        }
+        if !self.dt_ps.is_finite() || self.dt_ps <= 0.0 || self.dt_ps > 0.002 {
+            return Err(Error::Input("LF-middle timestep must be in (0, 2 fs]"));
+        }
+        if !temperature_k.is_finite() || temperature_k <= 0.0 {
+            return Err(Error::Input("NVT temperature must be finite and positive"));
+        }
+        if !friction_per_ps.is_finite() || friction_per_ps < 0.0 {
+            return Err(Error::Input("NVT friction must be finite and non-negative"));
+        }
+        self.write_nvt_uniforms(temperature_k, friction_per_ps, 1.0);
+        self.queue
+            .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
+        let atoms = workgroups(self.n);
+        let groups = workgroups(self.n.max(self.ncells));
+        self.dispatch_dynamics_bounded(
+            &[
+                (23, atoms),                      // preserve the start-of-step coordinates for SETTLE
+                (21, atoms),                      // full force kick
+                (8, groups),                      // velocity projection at current coordinates
+                (22, atoms),                      // first half drift
+                (12, atoms),                      // Ornstein-Uhlenbeck thermostat
+                (24, atoms), // second half drift without replacing start coordinates
+                (6, groups), // SETTLE/SHAKE plus velocity correction
+                (9, atoms),  // molecule-centered bonded coordinates
+                (0, atoms),  // neighbor maintenance
+                (2, self.eval_dispatch_groups()), // nonbonded forces at the new coordinates
+                (4, atoms),  // bonded forces
+            ],
+            steps,
+        )
+        .await?;
+        self.reduce_energy_once().await?;
         if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
@@ -1424,7 +2076,7 @@ impl ResidentPbc {
     /// encountered a constraint or bounded-neighbourhood error; the caller
     /// must restore the last committed CPU checkpoint rather than exporting
     /// resident coordinates.
-    pub async fn dynamics_status(&self) -> Result<Option<&'static str>, Error> {
+    pub async fn dynamics_status(&self) -> Result<Option<String>, Error> {
         let bytes = self.readback(2, self.meta_status_off(), 4).await?;
         let value = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         Ok(dynamics_error(value))
@@ -1472,6 +2124,7 @@ impl ResidentPbc {
             coordinates,
             velocities,
             rng_words,
+            neighbor_rebuild_count: 0,
         }
     }
 

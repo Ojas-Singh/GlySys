@@ -14,12 +14,12 @@
 //! forced software device: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
 use glysys::{BuildOptions, ParameterizedSystem, SystemBuilder, Vec3};
 use glysys_dynamics::explicit::{ExplicitSimulation, kinetic_energy};
-use glysys_dynamics::{ConstraintModel, Ensemble, SimulationProtocol, SolventModel};
+use glysys_dynamics::{ConstraintModel, Ensemble, SimulationProtocol, SolventModel, Thermostat};
 use glysys_energy::pbc::{
     BoxVectors, NonbondedElectrostatics, PbcForceField, PbcNeighborList, ReactionField,
     classify_waters, water_equilibrium,
 };
-use glysys_gpu::pbc::{PbcPacking, ResidentPbc};
+use glysys_gpu::pbc::{EnergyResult, PbcPacking, ResidentPbc};
 use glysys_gpu::{GpuContext, GpuContextOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -246,6 +246,15 @@ struct GpuCtx {
 }
 
 async fn setup(system: &ParameterizedSystem, cutoff: f64, skin: f64) -> GpuCtx {
+    setup_with_pair_kernel(system, cutoff, skin, false).await
+}
+
+async fn setup_with_pair_kernel(
+    system: &ParameterizedSystem,
+    cutoff: f64,
+    skin: f64,
+    tiled_nonbonded: bool,
+) -> GpuCtx {
     let packing = PbcPacking::new(system, cutoff, skin).unwrap();
     let backend = NonbondedElectrostatics::ReactionField {
         cutoff_angstrom: cutoff,
@@ -254,9 +263,10 @@ async fn setup(system: &ParameterizedSystem, cutoff: f64, skin: f64) -> GpuCtx {
     // Generous pair bound for validation sizes; overflow is asserted absent.
     let max_pairs = (system.atom_count() as u32 * 256).max(4096);
     let context = GpuContext::new(GpuContextOptions::default()).await.unwrap();
-    let gpu = ResidentPbc::with_context(&context, &packing, &backend, max_pairs)
-        .await
-        .unwrap();
+    let gpu =
+        ResidentPbc::with_context_variant(&context, &packing, &backend, max_pairs, tiled_nonbonded)
+            .await
+            .unwrap();
     let box_vec = BoxVectors::from_system(system).unwrap();
     let b = box_vec.as_array();
     GpuCtx {
@@ -314,6 +324,35 @@ fn check_pairs_exact(got: &[(u32, u32)], want: &[(u32, u32)], tag: &str) {
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         assert_eq!(g, w, "{tag}: pair {i} differs: {g:?} != {w:?}");
     }
+}
+
+fn check_pairs_with_float_margin(
+    got: &[(u32, u32)],
+    coords: &[Vec3],
+    box_vec: &BoxVectors,
+    cutoff: f64,
+    skin: f64,
+    margin: f64,
+    tag: &str,
+) {
+    // GPU coordinates and the search radius are f32. At the outer Verlet
+    // boundary, CPU-f64 and GPU-f32 may legitimately differ by a few ULPs.
+    // Require every pair safely inside the radius and reject any pair safely
+    // outside it, while leaving only this narrow boundary band unspecified.
+    let inside: BTreeSet<_> = cpu_list(coords, box_vec, cutoff - margin, skin)
+        .into_iter()
+        .collect();
+    let outside: BTreeSet<_> = cpu_list(coords, box_vec, cutoff + margin, skin)
+        .into_iter()
+        .collect();
+    let observed: BTreeSet<_> = got.iter().copied().collect();
+    assert_eq!(observed.len(), got.len(), "{tag}: duplicate GPU pairs");
+    let missing: Vec<_> = inside.difference(&observed).take(8).copied().collect();
+    let too_far: Vec<_> = observed.difference(&outside).take(8).copied().collect();
+    assert!(
+        inside.is_subset(&observed) && observed.is_subset(&outside),
+        "{tag}: pair-list mismatch outside {margin} Å f32 boundary margin; missing={missing:?}, too_far={too_far:?}"
+    );
 }
 
 fn e_tol(expected: f64) -> f64 {
@@ -621,6 +660,77 @@ fn pbc_eval_is_bitwise_deterministic() {
             a.gradients.unwrap(),
             b.gradients.unwrap(),
             "gradients differ"
+        );
+    });
+}
+
+#[test]
+fn cooperative_pbc_pair_kernel_matches_serial_force_results() {
+    pollster::block_on(async {
+        let _guard = gpu_test_guard();
+        let system = solvated_system(6.0);
+        let coordinates = minimized_coords(&system);
+        let serial = setup_with_pair_kernel(&system, 4.0, 1.5, false).await;
+        let tiled = setup_with_pair_kernel(&system, 4.0, 1.5, true).await;
+        serial
+            .gpu
+            .set_coordinates(&coordinates, serial.box_f32, true);
+        tiled.gpu.set_coordinates(&coordinates, tiled.box_f32, true);
+        let reference = serial.gpu.energy_and_forces(true).await.unwrap();
+        let candidate = tiled.gpu.energy_and_forces(true).await.unwrap();
+        assert!(!candidate.neighbor_overflow);
+        let candidate_lj = candidate.lj;
+        let candidate_rf = candidate.rf;
+        let candidate_gradient = candidate.gradients.as_ref().unwrap().clone();
+        let energy_delta = (candidate.lj - reference.lj).abs()
+            + (candidate.rf - reference.rf).abs()
+            + (candidate.bonds - reference.bonds).abs()
+            + (candidate.angles - reference.angles).abs()
+            + (candidate.proper_torsions - reference.proper_torsions).abs()
+            + (candidate.improper_torsions - reference.improper_torsions).abs();
+        assert!(
+            energy_delta <= 0.05,
+            "tiled/serial energy delta {energy_delta}"
+        );
+        let reference_gradient = reference.gradients.unwrap();
+        let mut error_squared = 0.0;
+        let mut reference_squared = 0.0;
+        for (atom, (actual, expected)) in candidate_gradient
+            .iter()
+            .zip(&reference_gradient)
+            .enumerate()
+        {
+            for axis in 0..3 {
+                let error = f64::from(actual[axis] - expected[axis]);
+                let expected = f64::from(expected[axis]);
+                assert!(
+                    error.abs() <= 0.02 + 0.001 * expected.abs(),
+                    "tiled/serial force delta {error} at {atom}/{axis}"
+                );
+                error_squared += error * error;
+                reference_squared += expected * expected;
+            }
+        }
+        let normalized_rms = (error_squared / reference_squared.max(1e-30)).sqrt();
+        assert!(
+            normalized_rms <= 1e-3,
+            "tiled/serial force RMS {normalized_rms}"
+        );
+        let serial_neighbors = serial.gpu.neighbor_list().await.unwrap();
+        let tiled_neighbors = tiled.gpu.neighbor_list().await.unwrap();
+        assert_eq!(
+            tiled_neighbors.pairs, serial_neighbors.pairs,
+            "fixed-stride cooperative neighbor build must preserve the exact sorted pair list"
+        );
+
+        tiled.gpu.set_coordinates(&coordinates, tiled.box_f32, true);
+        let repeated = tiled.gpu.energy_and_forces(true).await.unwrap();
+        assert_eq!(candidate_lj.to_bits(), repeated.lj.to_bits());
+        assert_eq!(candidate_rf.to_bits(), repeated.rf.to_bits());
+        assert_eq!(
+            candidate_gradient,
+            repeated.gradients.unwrap(),
+            "cooperative pair/sort variant must retain deterministic reductions"
         );
     });
 }
@@ -1150,5 +1260,300 @@ fn resident_nvt_checkpoint_restart_reproduces_rng_stream() {
             max_velocity < 1e-3,
             "restart velocity error {max_velocity:.3e}"
         );
+    });
+}
+
+#[test]
+fn resident_lf_middle_refreshes_full_nonbonded_and_bonded_forces() {
+    pollster::block_on(async {
+        let _guard = gpu_test_guard();
+        let system = solvated_system(6.0);
+        let protocol = SimulationProtocol {
+            solvent: SolventModel::Explicit,
+            constraints: ConstraintModel::Settle,
+            langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+            timestep_fs: 2.0,
+            minimization_iterations: 20,
+            equilibration_ensemble: Ensemble::Nvt,
+            production_ensemble: Ensemble::Nvt,
+            equilibration_steps: 0,
+            production_steps: 2,
+            save_every: 1,
+            thermostat: Thermostat::Langevin,
+            friction_per_ps: 1.0,
+            cutoff_angstrom: Some(4.0),
+            rf_dielectric: Some(78.5),
+            seed: 23,
+            ..Default::default()
+        };
+        let cpu = ExplicitSimulation::new(&system, protocol).unwrap();
+        let coordinates = cpu.state.coordinates.clone();
+        let velocities = cpu.state.velocities.clone();
+        let box_xyz = system.box_angstrom().map(|v| v as f32);
+        let mut gpu = setup(&system, 4.0, 1.5).await.gpu;
+        gpu.initialize_dynamics(&coordinates, &velocities, box_xyz, 0.002)
+            .unwrap();
+        gpu.energy_and_forces(true).await.unwrap();
+        gpu.dynamics_steps_lf_middle(1, 300.0, 1.0).await.unwrap();
+
+        let (advanced_state, advanced) = gpu.read_dynamics_snapshot(box_xyz).await.unwrap();
+        let max_coordinate_change = coordinates
+            .iter()
+            .zip(&advanced_state.coordinates)
+            .map(|(before, after)| {
+                (before.x - after.x)
+                    .abs()
+                    .max((before.y - after.y).abs())
+                    .max((before.z - after.z).abs())
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_coordinate_change > 1e-5,
+            "LF-middle explicit NVT did not move any atom (max delta {max_coordinate_change:.3e} A)"
+        );
+        let refreshed = gpu.energy_and_forces(true).await.unwrap();
+        let total = |energy: &EnergyResult| {
+            energy.lj
+                + energy.rf
+                + energy.bonds
+                + energy.angles
+                + energy.proper_torsions
+                + energy.improper_torsions
+        };
+        let energy_error = (total(&advanced) - total(&refreshed)).abs();
+        let advanced_gradient = advanced.gradients.as_ref().unwrap();
+        let refreshed_gradient = refreshed.gradients.as_ref().unwrap();
+        let mut max_gradient_error = 0.0f64;
+        for (a, b) in advanced_gradient.iter().zip(refreshed_gradient) {
+            for axis in 0..3 {
+                max_gradient_error =
+                    max_gradient_error.max((f64::from(a[axis]) - f64::from(b[axis])).abs());
+            }
+        }
+        assert!(
+            energy_error <= 0.01,
+            "resident force energy delta {energy_error}"
+        );
+        assert!(
+            max_gradient_error <= 1e-3,
+            "resident force maximum gradient delta {max_gradient_error}"
+        );
+    });
+}
+
+#[test]
+fn fresh_lf_middle_initialization_uses_checkpoint_rng_words() {
+    pollster::block_on(async {
+        let _guard = gpu_test_guard();
+        let system = solvated_system(6.0);
+        let protocol = SimulationProtocol {
+            solvent: SolventModel::Explicit,
+            constraints: ConstraintModel::Settle,
+            langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+            timestep_fs: 2.0,
+            minimization_iterations: 20,
+            equilibration_ensemble: Ensemble::Nvt,
+            production_ensemble: Ensemble::Nvt,
+            equilibration_steps: 0,
+            production_steps: 1,
+            save_every: 1,
+            thermostat: Thermostat::Langevin,
+            friction_per_ps: 1.0,
+            cutoff_angstrom: Some(4.0),
+            rf_dielectric: Some(78.5),
+            seed: 71,
+            ..Default::default()
+        };
+        let simulation = ExplicitSimulation::new(&system, protocol.clone()).unwrap();
+        let coordinates = simulation.state.coordinates.clone();
+        let velocities = simulation.state.velocities.clone();
+        let mut rng = glysys_dynamics::resident_rng::ResidentThermostatRng::seeded(
+            protocol.seed,
+            system.atom_count(),
+        );
+        let box_xyz = system.box_angstrom().map(|value| value as f32);
+        let mut gpu = setup(&system, 4.0, 1.5).await.gpu;
+        gpu.initialize_dynamics_with_rng(&coordinates, &velocities, box_xyz, 0.002, &rng.words)
+            .unwrap();
+        gpu.energy_and_forces(true).await.unwrap();
+        gpu.dynamics_steps_lf_middle(1, 300.0, 1.0).await.unwrap();
+
+        for atom in 0..system.atom_count() {
+            rng.normal3(atom);
+        }
+        let state = gpu.read_dynamics_checkpoint(box_xyz).await.unwrap();
+        assert_eq!(state.rng_words, rng.words);
+    });
+}
+
+/// Machine-local full-protein force qualification used while debugging the
+/// resident explicit kernel. Set both paths to the prepared 1CRN inputs and
+/// run this ignored test on the target GPU; the compact fixtures above do not
+/// exercise the full Amber protein topology.
+#[test]
+#[ignore = "requires GLYSYS_1CRN_SNAPSHOT and GLYSYS_1CRN_STEP1_CHECKPOINT"]
+fn full_explicit_1crn_step1_force_parity() {
+    pollster::block_on(async {
+        let _guard = gpu_test_guard();
+        let snapshot_path = std::env::var("GLYSYS_1CRN_SNAPSHOT")
+            .expect("set GLYSYS_1CRN_SNAPSHOT to the prepared 1CRN snapshot");
+        let checkpoint_path = std::env::var("GLYSYS_1CRN_STEP1_CHECKPOINT")
+            .expect("set GLYSYS_1CRN_STEP1_CHECKPOINT to a minimized step-1 checkpoint");
+        let snapshot = std::fs::read_to_string(snapshot_path).unwrap();
+        let system = ParameterizedSystem::from_snapshot_json(&snapshot).unwrap();
+        let checkpoint: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(checkpoint_path).unwrap()).unwrap();
+        let coordinates: Vec<Vec3> =
+            serde_json::from_value(checkpoint["state"]["coordinates"].clone()).unwrap();
+        let checkpoint_gradient: Vec<Vec3> =
+            serde_json::from_value(checkpoint["state"]["gradient"].clone()).unwrap();
+        let checkpoint_energy = checkpoint["state"]["potentialEnergy"]
+            .as_f64()
+            .expect("checkpoint potentialEnergy");
+        assert_eq!(coordinates.len(), system.atom_count());
+
+        let cutoff = 9.0;
+        let skin = 1.5;
+        let tiled = std::env::var_os("GLYSYS_PBC_TILED_NONBONDED").is_some();
+        let ctx = setup_with_pair_kernel(&system, cutoff, skin, tiled).await;
+        ctx.gpu.set_coordinates(&coordinates, ctx.box_f32, true);
+        let got = ctx.gpu.energy_and_forces(true).await.unwrap();
+
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        // Validate the full-size GPU neighbor list independently of the force
+        // comparison. A missing/extra water pair can otherwise masquerade as
+        // a floating-point accumulation error in a dense solvent fixture.
+        let gpu_pairs = ctx.gpu.neighbor_list().await.unwrap();
+        check_pairs_with_float_margin(
+            &gpu_pairs.pairs,
+            &coordinates,
+            &box_vec,
+            cutoff,
+            skin,
+            1e-3,
+            "full 1CRN",
+        );
+        let pairs: Vec<(usize, usize)> = cpu_list(&coordinates, &box_vec, cutoff, skin)
+            .into_iter()
+            .map(|(a, b)| (a as usize, b as usize))
+            .collect();
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let backend = ReactionField::new(cutoff, 78.5).unwrap();
+        let expected = field
+            .evaluate(&coordinates, &box_vec, &pairs, &backend, cutoff)
+            .unwrap();
+        let bonded_baseline = field
+            .evaluate(&coordinates, &box_vec, &[], &backend, cutoff)
+            .unwrap();
+        let expected_total = expected.components.total();
+        let observed_total =
+            got.lj + got.rf + got.bonds + got.angles + got.proper_torsions + got.improper_torsions;
+        let energy_error = (observed_total - expected_total).abs();
+
+        let actual = got.gradients.unwrap();
+        if let Ok(path) = std::env::var("GLYSYS_1CRN_GPU_FORCE_OUTPUT") {
+            let gpu_force_rows: Vec<[f32; 3]> = actual
+                .iter()
+                .map(|row| [-row[0], -row[1], -row[2]])
+                .collect();
+            let cpu_force_rows: Vec<[f64; 3]> = expected
+                .gradients
+                .iter()
+                .map(|row| [-row.x, -row.y, -row.z])
+                .collect();
+            let cpu_bonded_force_rows: Vec<[f64; 3]> = bonded_baseline
+                .gradients
+                .iter()
+                .map(|row| [-row.x, -row.y, -row.z])
+                .collect();
+            let cpu_nonbonded_force_rows: Vec<[f64; 3]> = expected
+                .gradients
+                .iter()
+                .zip(&bonded_baseline.gradients)
+                .map(|(full, bonded)| {
+                    [
+                        -(full.x - bonded.x),
+                        -(full.y - bonded.y),
+                        -(full.z - bonded.z),
+                    ]
+                })
+                .collect();
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "atoms": system.atom_count(),
+                    "checkpointStep": checkpoint["state"]["step"],
+                    "potentialEnergyKcalMol": got.lj + got.rf + got.bonds + got.angles
+                        + got.proper_torsions + got.improper_torsions,
+                    "gpuForcesKcalMolAngstrom": gpu_force_rows,
+                    "glysysCpuForcesKcalMolAngstrom": cpu_force_rows,
+                    "glysysCpuBondedForcesKcalMolAngstrom": cpu_bonded_force_rows,
+                    "glysysCpuNonbondedForcesKcalMolAngstrom": cpu_nonbonded_force_rows,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let checkpoint_gradient_rms = actual
+            .iter()
+            .zip(&checkpoint_gradient)
+            .map(|(a, b)| {
+                let dx = f64::from(a[0]) - b.x;
+                let dy = f64::from(a[1]) - b.y;
+                let dz = f64::from(a[2]) - b.z;
+                dx * dx + dy * dy + dz * dz
+            })
+            .sum::<f64>();
+        let checkpoint_gradient_rms =
+            (checkpoint_gradient_rms / (3.0 * actual.len() as f64)).sqrt();
+
+        let mut sum_error_squared = 0.0;
+        let mut sum_reference_squared = 0.0;
+        let mut worst_component = 0.0f64;
+        let mut bad_components = 0usize;
+        let mut worst_cases = Vec::new();
+        for (atom, (gpu, cpu)) in actual.iter().zip(&expected.gradients).enumerate() {
+            for (axis, (g, r)) in [gpu[0], gpu[1], gpu[2]]
+                .into_iter()
+                .zip([cpu.x, cpu.y, cpu.z])
+                .enumerate()
+            {
+                let delta = f64::from(g) - r;
+                let error = delta.abs();
+                sum_error_squared += delta * delta;
+                sum_reference_squared += r * r;
+                worst_component = worst_component.max(error);
+                if error > 0.02 + 0.001 * r.abs() {
+                    bad_components += 1;
+                    worst_cases.push((error, atom, axis, g, r));
+                }
+            }
+        }
+        let force_rms = (sum_error_squared / sum_reference_squared.max(1e-30)).sqrt();
+        worst_cases.sort_by(|a, b| b.0.total_cmp(&a.0));
+        eprintln!(
+            "full 1CRN energy components GPU/CPU: LJ {:.6}/{:.6}, RF {:.6}/{:.6}, bond {:.6}/{:.6}, angle {:.6}/{:.6}, proper {:.6}/{:.6}, improper {:.6}/{:.6}; totals GPU {observed_total:.6}, checkpoint {checkpoint_energy:.6}, CPU {expected_total:.6}, delta {energy_error:.6}; force RMS {force_rms:.6e}, checkpoint-gradient RMS {checkpoint_gradient_rms:.6}, max {worst_component:.6}, failures {bad_components}; top {:?}",
+            got.lj,
+            expected.components.van_der_waals,
+            got.rf,
+            expected.components.electrostatics,
+            got.bonds,
+            expected.components.bonds,
+            got.angles,
+            expected.components.angles,
+            got.proper_torsions,
+            expected.components.proper_torsions,
+            got.improper_torsions,
+            expected.components.improper_torsions,
+            &worst_cases[..worst_cases.len().min(10)]
+        );
+
+        assert!(
+            energy_error <= 0.05f64.max(1e-5 * system.atom_count() as f64),
+            "full-system potential energy error {energy_error:.6} kcal/mol"
+        );
+        assert!(force_rms <= 1e-3, "normalized force RMS {force_rms:.6e}");
+        assert_eq!(bad_components, 0, "per-component force tolerance failures");
     });
 }

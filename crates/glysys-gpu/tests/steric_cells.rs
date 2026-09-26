@@ -1,4 +1,36 @@
 use glysys_gpu::steric::{AttachmentLibrary, AttachmentPose, ReceptorUpdate, ResidentSteric};
+
+fn ordered_reference_score(library: &AttachmentLibrary, flexible: bool, cutoff: f32) -> f32 {
+    let query = [0.0f32, 0.0, 0.0];
+    let cutoff2 = cutoff * cutoff;
+    let mut score = 1.0;
+    for (index, original) in library.protein.iter().enumerate() {
+        let point = if flexible {
+            library
+                .updates
+                .iter()
+                .find(|update| update.indices[0] == index as u32)
+                .map(|update| &update.value)
+                .unwrap_or(original)
+        } else {
+            original
+        };
+        let d2 = (0..3)
+            .map(|axis| (query[axis] - point[axis]).powi(2))
+            .sum::<f32>();
+        if (d2 - cutoff2).abs() < 0.002 {
+            return -1.0;
+        }
+        if d2 < cutoff2 {
+            score += 200.0 * (-d2).exp();
+            if score > 2.0 {
+                break;
+            }
+        }
+    }
+    score
+}
+
 #[test]
 fn cell_streams_preserve_first_contact_and_flexible_updates() {
     pollster::block_on(async {
@@ -42,8 +74,7 @@ fn cell_streams_preserve_first_contact_and_flexible_updates() {
                     )
                     .await
                     .unwrap()[0];
-                let d2: f32 = if flexible { 1. } else { 2.25 };
-                let expected = 1. + 200. * (-d2).exp();
+                let expected = ordered_reference_score(&library, flexible, cutoff);
                 assert!((score - expected).abs() < 1e-3, "{score} != {expected}");
             }
         }

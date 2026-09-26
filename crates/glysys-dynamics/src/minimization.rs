@@ -86,14 +86,14 @@ impl PreparationMinimizer {
             return Err(invalid("minimization gradient dimensions"));
         }
         self.evaluations += 1;
-        let maximum = gradient.iter().map(|x| x.abs()).fold(0., f64::max);
         let mut events = Vec::new();
         match self.phase {
             Phase::PrePoint => {
                 let max_norm = gradient
                     .chunks_exact(3)
-                    .map(|g| (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt())
-                    .fold(0., f64::max);
+                    .map(|g| g[0] * g[0] + g[1] * g[1] + g[2] * g[2])
+                    .fold(0., f64::max)
+                    .sqrt();
                 if !value.is_finite() || gradient.iter().any(|g| !g.is_finite()) {
                     return Err(invalid("nonfinite gradient during minimization"));
                 }
@@ -115,6 +115,7 @@ impl PreparationMinimizer {
                 }
             }
             Phase::PreTrial => {
+                let maximum = gradient.iter().map(|x| x.abs()).fold(0., f64::max);
                 self.trials += 1;
                 events.push(MinimizationProgress {
                     stage: "minimize-pre-trial",
@@ -142,6 +143,7 @@ impl PreparationMinimizer {
                 }
             }
             Phase::Lbfgs => {
+                let maximum = gradient.iter().map(|x| x.abs()).fold(0., f64::max);
                 events.push(MinimizationProgress {
                     stage: "minimize-trial",
                     completed: self.evaluations,

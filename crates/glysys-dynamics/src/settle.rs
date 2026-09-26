@@ -380,6 +380,63 @@ pub fn shake_positions(
     )))
 }
 
+/// Project trial solute coordinates using the previous-step constraint
+/// directions. This is the impulse convention used by OpenMM's LF-middle
+/// constraint update: correction directions remain fixed at the old
+/// constrained coordinates while the trial positions are iterated.
+pub fn shake_positions_with_reference_directions(
+    reference_coords: &[Vec3],
+    trial_coords: &mut [Vec3],
+    constraints: &[(usize, usize, f64, f64, f64)],
+    relative_tolerance: f64,
+    max_iterations: usize,
+) -> Result<f64> {
+    if reference_coords.len() != trial_coords.len()
+        || !relative_tolerance.is_finite()
+        || relative_tolerance <= 0.0
+        || max_iterations == 0
+    {
+        return Err(invalid("invalid reference-direction SHAKE inputs"));
+    }
+    for _ in 0..max_iterations {
+        for &(a, b, target, inverse_mass_a, inverse_mass_b) in constraints {
+            let reference = sub(reference_coords[a], reference_coords[b]);
+            let displacement = sub(trial_coords[a], trial_coords[b]);
+            let direction_projection = dot(displacement, reference);
+            if direction_projection.abs() < 1.0e-14 {
+                return Err(invalid(
+                    "reference-direction SHAKE encountered a singular constraint",
+                ));
+            }
+            let delta = 0.5 * (target * target - dot(displacement, displacement))
+                / ((inverse_mass_a + inverse_mass_b) * direction_projection);
+            trial_coords[a] = add(trial_coords[a], scale(reference, delta * inverse_mass_a));
+            trial_coords[b] = add(trial_coords[b], scale(reference, -delta * inverse_mass_b));
+        }
+
+        let worst_relative = constraints
+            .iter()
+            .map(|&(a, b, target, _, _)| {
+                let displacement = sub(trial_coords[a], trial_coords[b]);
+                (dot(displacement, displacement).sqrt() - target).abs() / target.max(1.0e-12)
+            })
+            .fold(0.0, f64::max);
+        if worst_relative <= relative_tolerance {
+            return Ok(worst_relative);
+        }
+    }
+    let worst_relative = constraints
+        .iter()
+        .map(|&(a, b, target, _, _)| {
+            let displacement = sub(trial_coords[a], trial_coords[b]);
+            (dot(displacement, displacement).sqrt() - target).abs() / target.max(1.0e-12)
+        })
+        .fold(0.0, f64::max);
+    Err(invalid(format!(
+        "reference-direction solute constraints did not converge (relative residual {worst_relative:.3e})"
+    )))
+}
+
 /// RATTLE-style velocity projection: remove bond-parallel relative velocity.
 pub fn rattle_velocities(
     coords: &[Vec3],
@@ -598,6 +655,26 @@ impl SettleWaters {
             return Ok(0.);
         }
         shake_positions(coords, &self.solute_bonds, 1e-8, 200)
+    }
+
+    /// OpenMM-compatible solute position projection for LF-middle. The
+    /// correction (and therefore its velocity impulse) is directed along the
+    /// old bond vectors rather than the evolving trial bond vectors.
+    pub fn shake_solute_positions_from_old(
+        &self,
+        old_coords: &[Vec3],
+        trial_coords: &mut [Vec3],
+    ) -> Result<f64> {
+        if self.solute_bonds.is_empty() {
+            return Ok(0.0);
+        }
+        shake_positions_with_reference_directions(
+            old_coords,
+            trial_coords,
+            &self.solute_bonds,
+            1e-5,
+            200,
+        )
     }
 
     /// Rigid-body position update for waters: analytic SETTLE per water

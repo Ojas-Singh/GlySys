@@ -41,22 +41,32 @@ fn cell_range(key:vec3<i32>)->vec2<u32> {
  return vec2<u32>(0u);
 }
 fn indexed_protein_score(p:vec3<f32>,candidate:u32,initial:f32)->f32 {
- var score=initial;
+ // The cell stream is ordered by spatial key, not by receptor atom. Track the
+ // first original atom that would affect the ordered traversal so the broad
+ // phase cannot change the first-contact score.
+ var first_atom=config.sizes.w;
+ var first_d2=0.0;
  let key=vec3<i32>(floor(p/3.4));
  for(var x=-1;x<=1;x++){for(var y=-1;y<=1;y++){for(var z=-1;z<=1;z++){
   let range=cell_range(key+vec3<i32>(x,y,z));
   for(var cursor=range.x;cursor<range.y;cursor++){
    let atom=grid[cursor].x;let delta=p-protein[atom].xyz;let d2=dot(delta,delta);
-   if(abs(d2-config.values.x)<0.002){return -1.;}
-   if(d2<config.values.x){score+=200.*exp(-d2);if(score>2.){return score;}}
+   if((abs(d2-config.values.x)<0.002 || d2<config.values.x) && atom<first_atom){
+    first_atom=atom;first_d2=d2;
+   }
   }
  }}}
  for(var cursor=grid[0].y;cursor<grid[0].y+grid[0].z;cursor++){
   let atom=grid[cursor].x;let delta=p-protein_point(candidate,atom);let d2=dot(delta,delta);
-  if(abs(d2-config.values.x)<0.002){return -1.;}
-  if(d2<config.values.x){score+=200.*exp(-d2);if(score>2.){return score;}}
+  if((abs(d2-config.values.x)<0.002 || d2<config.values.x) && atom<first_atom){
+   first_atom=atom;first_d2=d2;
+  }
  }
- return score;
+ if(first_atom==config.sizes.w){return initial;}
+ if(abs(first_d2-config.values.x)<0.002){return -1.;}
+ // This indexed path is selected only for cutoffs <= 1.7 A, so every contact
+ // crosses the legacy score>2 early-exit threshold on its first contribution.
+ return initial+200.*exp(-first_d2);
 }
 fn site_bounds(candidate:u32,site:u32)->StericBounds {
  let gene=genes[candidate*config.sizes.x+site];let pose=poses[gene.x];

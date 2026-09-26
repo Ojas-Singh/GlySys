@@ -18,6 +18,7 @@ use glysys_energy::pbc::NonbondedElectrostatics;
 use glysys_energy::scoring::{
     EvaluationRequest, EvaluationResult, PoseBatch, PreparedEvaluator, PreparedScene, ScoreModel,
 };
+use glysys_gpu::dynamics::{DynamicsBatch, ResidentDynamics};
 use glysys_gpu::hydration::ResidentWaterProbe;
 use glysys_gpu::pbc::ResidentPbc;
 use glysys_gpu::scoring::PreparedGpuEvaluator;
@@ -25,6 +26,10 @@ use glysys_gpu::steric::ResidentSteric;
 use glysys_gpu::{GpuContext, GpuContextOptions, MemoryProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 pub const RUNTIME_SCHEMA_VERSION: u32 = 2;
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
@@ -68,7 +73,12 @@ pub struct ExecutionOptions {
     pub cpu_thread_limit: Option<usize>,
     pub validation: ValidationMode,
     pub max_submission_steps: usize,
+    pub implicit_gpu_lanes_per_target: usize,
+    pub implicit_gpu_packet_steps: usize,
+    pub explicit_gpu_tiled_nonbonded: bool,
+    pub explicit_gpu_neighbor_skin_angstrom: f64,
     pub cancellation_enabled: bool,
+    pub profile_gpu_timing: bool,
 }
 
 impl Default for ExecutionOptions {
@@ -80,7 +90,12 @@ impl Default for ExecutionOptions {
             cpu_thread_limit: None,
             validation: ValidationMode::None,
             max_submission_steps: 128,
+            implicit_gpu_lanes_per_target: 8,
+            implicit_gpu_packet_steps: glysys_gpu::dynamics::LF_MIDDLE_PACKET_STEPS,
+            explicit_gpu_tiled_nonbonded: false,
+            explicit_gpu_neighbor_skin_angstrom: 1.5,
             cancellation_enabled: true,
+            profile_gpu_timing: false,
         }
     }
 }
@@ -100,12 +115,14 @@ impl ExecutionOptions {
         GpuContextOptions {
             memory_profile: self.gpu_memory_profile(),
             label: label.into(),
+            gpu_timestamps: self.profile_gpu_timing,
+            pbc_tiled_nonbonded: self.explicit_gpu_tiled_nonbonded,
         }
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct ExecutionDiagnostics {
     pub requested_backend: BackendPreference,
     pub actual_backend: String,
@@ -115,6 +132,15 @@ pub struct ExecutionDiagnostics {
     pub allocation_budget_bytes: u64,
     pub peak_allocation_bytes: u64,
     pub stage_timings_ms: BTreeMap<String, f64>,
+    pub submission_count: u64,
+    pub full_state_readback_count: u64,
+    pub full_state_readback_bytes: u64,
+    pub scalar_readback_count: u64,
+    pub scalar_readback_bytes: u64,
+    pub neighbor_rebuild_count: Option<u64>,
+    pub checkpoint_write_count: u64,
+    pub selected_kernel_variants: Vec<String>,
+    pub gpu_stage_timing_status: Option<String>,
     pub fallback_reason: Option<String>,
     pub validation_mode: ValidationMode,
     pub reference_call_count: u64,
@@ -146,9 +172,68 @@ impl ExecutionDiagnostics {
             )),
             allocation_budget_bytes: stats.budget,
             peak_allocation_bytes: stats.peak_bytes,
+            gpu_stage_timing_status: Some(if !options.profile_gpu_timing {
+                "not-requested".into()
+            } else if !context.gpu_timestamps_enabled() {
+                "unavailable: adapter does not support Vulkan timestamp queries inside compute passes".into()
+            } else {
+                "enabled: GPU timestamp queries available".into()
+            }),
             validation_mode: options.validation,
             ..Self::default()
         }
+    }
+
+    fn gpu_dynamics(
+        options: &ExecutionOptions,
+        context: &GpuContext,
+        protocol: &SimulationProtocol,
+    ) -> Self {
+        let mut diagnostics = Self::gpu(options, context);
+        if options.profile_gpu_timing && context.gpu_timestamps_enabled() {
+            diagnostics.gpu_stage_timing_status = Some(match protocol.solvent {
+                SolventModel::Explicit => "enabled: explicit PBC GPU stages".into(),
+                SolventModel::Implicit => "enabled: implicit OBC2/LF-middle GPU stages".into(),
+            });
+        }
+        diagnostics.selected_kernel_variants = vec![
+            format!("integrator:{:?}", protocol.langevin_discretization),
+            format!("solvent:{:?}", protocol.solvent),
+            "force-precision:f32".into(),
+            match protocol.solvent {
+                SolventModel::Explicit => "force-kernel:pbc-cutoff-rf".into(),
+                SolventModel::Implicit => "force-kernel:obc2-all-pairs".into(),
+            },
+        ];
+        if protocol.solvent == SolventModel::Implicit {
+            diagnostics.selected_kernel_variants.push(format!(
+                "obc2-lanes-per-target:{}",
+                options.implicit_gpu_lanes_per_target
+            ));
+            diagnostics.selected_kernel_variants.push(format!(
+                "integrator-packet-steps:{}",
+                options.implicit_gpu_packet_steps
+            ));
+        } else if options.explicit_gpu_tiled_nonbonded {
+            diagnostics
+                .selected_kernel_variants
+                .push("pbc-pair-kernel:cooperative-64-lane".into());
+            diagnostics.selected_kernel_variants.push(format!(
+                "pbc-neighbor-layout:fixed-{}",
+                glysys_gpu::pbc::TILED_NEIGHBORS_PER_ATOM
+            ));
+        } else {
+            diagnostics
+                .selected_kernel_variants
+                .push("pbc-pair-kernel:serial-per-atom".into());
+        }
+        if protocol.solvent == SolventModel::Explicit {
+            diagnostics.selected_kernel_variants.push(format!(
+                "pbc-neighbor-skin:{:.2}A",
+                options.explicit_gpu_neighbor_skin_angstrom
+            ));
+        }
+        diagnostics
     }
 }
 
@@ -333,12 +418,29 @@ pub struct AdvanceResult {
     pub diagnostics: ExecutionDiagnostics,
 }
 
+/// Scalar observation returned without synchronizing resident coordinates or
+/// velocities to the host.
+#[derive(Clone, Copy, Debug)]
+pub struct ScalarObservation {
+    pub step: usize,
+    pub potential_energy_kcal_mol: f64,
+    pub kinetic_energy_kcal_mol: f64,
+    pub temperature_k: f64,
+    pub readback_bytes: u64,
+}
+
 enum SimulationDriver {
     ExplicitCpu(ExplicitSimulation<'static>),
     ImplicitCpu(CpuSimulation<'static>),
+    ImplicitGpu {
+        simulation: CpuSimulation<'static>,
+        gpu: ResidentDynamics,
+        device_step: usize,
+    },
     ExplicitGpu {
         simulation: ExplicitSimulation<'static>,
         gpu: ResidentPbc,
+        device_step: usize,
     },
 }
 
@@ -347,6 +449,7 @@ impl SimulationDriver {
         match self {
             Self::ExplicitCpu(sim) => &sim.state,
             Self::ImplicitCpu(sim) => &sim.state,
+            Self::ImplicitGpu { simulation, .. } => &simulation.state,
             Self::ExplicitGpu { simulation, .. } => &simulation.state,
         }
     }
@@ -380,12 +483,90 @@ pub struct SimulationSession {
 }
 
 fn gpu_compatible(protocol: &SimulationProtocol) -> bool {
-    protocol.solvent == SolventModel::Explicit
-        && protocol.constraints == glysys_dynamics::ConstraintModel::Settle
-        && protocol.thermostat == glysys_dynamics::Thermostat::Langevin
-        && !protocol.has_npt()
+    !protocol.has_npt()
         && protocol.restraint_force == 0.0
         && !protocol.dispersion_correction
+        && match protocol.solvent {
+            SolventModel::Explicit => {
+                protocol.constraints == glysys_dynamics::ConstraintModel::Settle
+                    && protocol.thermostat == glysys_dynamics::Thermostat::Langevin
+                    && matches!(
+                        protocol.langevin_discretization,
+                        glysys_dynamics::LangevinDiscretization::Baoab
+                            | glysys_dynamics::LangevinDiscretization::LfMiddle
+                    )
+            }
+            SolventModel::Implicit => match protocol.langevin_discretization {
+                glysys_dynamics::LangevinDiscretization::Baoab => {
+                    protocol.constraints == glysys_dynamics::ConstraintModel::None
+                        && protocol.timestep_fs <= 1.0
+                }
+                glysys_dynamics::LangevinDiscretization::LfMiddle => {
+                    protocol.constraints == glysys_dynamics::ConstraintModel::HBonds
+                        && protocol.thermostat == glysys_dynamics::Thermostat::Langevin
+                        && protocol.timestep_fs <= 2.0
+                }
+            },
+        }
+}
+
+fn implicit_total(batch: &DynamicsBatch) -> Result<f64, SessionError> {
+    if batch.gradients.is_empty()
+        || batch
+            .gradients
+            .iter()
+            .any(|g| !g.x.is_finite() || !g.y.is_finite() || !g.z.is_finite())
+        || batch.components.iter().any(|value| !value.is_finite())
+    {
+        return Err(SessionError::new(
+            SessionErrorKind::Nonfinite,
+            "GPU returned nonfinite implicit-solvent forces or energy",
+            true,
+        ));
+    }
+    // ResidentEvaluator's component layout is bonds, angles, proper and
+    // improper torsions, LJ, electrostatics, GB, surface area, restraint,
+    // followed by pair count and padding.
+    let total: f64 = batch.components[..9]
+        .iter()
+        .map(|&value| value as f64)
+        .sum();
+    if !total.is_finite() {
+        return Err(SessionError::new(
+            SessionErrorKind::Nonfinite,
+            "GPU returned nonfinite implicit-solvent energy",
+            true,
+        ));
+    }
+    Ok(total)
+}
+
+fn host_scalar_observation(
+    system: &ParameterizedSystem,
+    state: &SimulationState,
+    step: usize,
+) -> ScalarObservation {
+    let masses: Vec<_> = system.atoms().iter().map(|atom| atom.mass()).collect();
+    let kinetic = glysys_dynamics::explicit::kinetic_energy(&masses, &state.velocities);
+    let dof = if state.degrees_of_freedom == 0 {
+        3 * masses.len()
+    } else {
+        state.degrees_of_freedom
+    };
+    ScalarObservation {
+        step,
+        potential_energy_kcal_mol: state.potential_energy,
+        kinetic_energy_kcal_mol: kinetic,
+        temperature_k: glysys_dynamics::explicit::kinetic_temperature(kinetic, dof),
+        readback_bytes: 0,
+    }
+}
+
+fn add_stage_timing(diagnostics: &mut ExecutionDiagnostics, stage: &str, milliseconds: f64) {
+    *diagnostics
+        .stage_timings_ms
+        .entry(stage.to_owned())
+        .or_default() += milliseconds;
 }
 
 fn gpu_total(
@@ -441,6 +622,17 @@ impl SimulationSession {
         shared_context: Option<GpuContext>,
     ) -> Result<Self, SessionError> {
         protocol.validate_for_native()?;
+        if !matches!(
+            options.implicit_gpu_lanes_per_target,
+            4 | 8 | 16 | 32 | 64 | 128
+        ) || !matches!(options.implicit_gpu_packet_steps, 8 | 16 | 32 | 64 | 128)
+        {
+            return Err(SessionError::new(
+                SessionErrorKind::InvalidInput,
+                "implicit GPU lane variant must be 4, 8, 16, 32, 64, or 128 and packet size 8, 16, 32, 64, or 128",
+                false,
+            ));
+        }
         let requested = options.backend;
         let cpu_driver = || -> Result<SimulationDriver, SessionError> {
             if protocol.solvent == SolventModel::Explicit {
@@ -469,130 +661,294 @@ impl SimulationSession {
             });
         }
 
-        // Build the CPU state once because it owns the validated preparation
-        // and initial forces. The resident evaluator receives the same state;
-        // no CPU reference calls occur during normal GPU advancement.
-        let cpu = cpu_driver()?;
-        let SimulationDriver::ExplicitCpu(simulation) = cpu else {
-            unreachable!("GPU compatibility implies explicit solvent");
-        };
-        let cutoff = protocol.cutoff_angstrom.unwrap_or(9.0);
-        let electro = NonbondedElectrostatics::ReactionField {
-            cutoff_angstrom: cutoff,
-            solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
-        };
-        let packing = glysys_gpu::pbc::PbcPacking::new(&system, cutoff, 1.5)
-            .map_err(|e| SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false))?;
-        let max_pairs = simulation
-            .pair_count()
-            .saturating_mul(2)
-            .saturating_add(1024)
-            .max(4096)
-            .min(u32::MAX as usize) as u32;
-        let context_result = match shared_context {
-            Some(context) => Ok(context),
-            None => GpuContext::new(options.context_options("GlySys simulation")).await,
-        };
-        let context = match context_result {
-            Ok(context) => context,
-            Err(error) if requested == BackendPreference::Auto => {
-                return Ok(Self {
-                    system,
-                    driver: SimulationDriver::ExplicitCpu(simulation),
-                    diagnostics: ExecutionDiagnostics::cpu(
-                        &options,
-                        Some(format!("GPU context unavailable: {error}")),
-                    ),
-                    options,
-                    cancelled: false,
-                    gpu_advances: 0,
-                    cpu_advances: 0,
-                });
+        if protocol.solvent == SolventModel::Implicit {
+            let cpu = cpu_driver()?;
+            let SimulationDriver::ImplicitCpu(mut simulation) = cpu else {
+                unreachable!("implicit protocol constructs the implicit CPU reference");
+            };
+            let context_result = match shared_context {
+                Some(context) => Ok(context),
+                None => GpuContext::new(options.context_options("GlySys implicit dynamics")).await,
+            };
+            let context = match context_result {
+                Ok(context) => context,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some(format!("GPU context unavailable: {error}")),
+                        ),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let mut gpu = match context
+                .create_dynamics_with_tuning(
+                    &system,
+                    options.implicit_gpu_lanes_per_target,
+                    options.implicit_gpu_packet_steps,
+                )
+                .await
+            {
+                Ok(gpu) => gpu,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let Some(rng_words) = simulation
+                .state
+                .resident_rng
+                .as_ref()
+                .map(|rng| rng.words.clone())
+            else {
+                if requested == BackendPreference::Auto {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some(
+                                "implicit GPU dynamics requires a resident thermostat stream"
+                                    .into(),
+                            ),
+                        ),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                return Err(SessionError::new(
+                    SessionErrorKind::InvalidInput,
+                    "implicit GPU dynamics requires a resident thermostat stream",
+                    false,
+                ));
+            };
+            let initial = match gpu
+                .initialize_resident(
+                    &simulation.state.coordinates,
+                    &simulation.state.velocities,
+                    &rng_words,
+                )
+                .await
+            {
+                Ok(initial) => initial,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let potential = match implicit_total(&initial) {
+                Ok(value) if initial.gradients.len() == system.atom_count() => value,
+                Ok(_) => {
+                    return Err(SessionError::new(
+                        SessionErrorKind::Output,
+                        "GPU returned the wrong implicit-solvent gradient count",
+                        true,
+                    ));
+                }
+                Err(error) if requested == BackendPreference::Auto && error.cpu_fallback_valid => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            simulation.state.potential_energy = potential;
+            simulation.state.gradient = initial.gradients;
+            let diagnostics =
+                ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
+            Ok(Self {
+                system,
+                driver: SimulationDriver::ImplicitGpu {
+                    device_step: simulation.state.step,
+                    simulation,
+                    gpu,
+                },
+                diagnostics,
+                options,
+                cancelled: false,
+                gpu_advances: 1,
+                cpu_advances: 0,
+            })
+        } else {
+            // Build the CPU state once because it owns the validated preparation
+            // and initial forces. The resident evaluator receives the same state;
+            // no CPU reference calls occur during normal GPU advancement.
+            let cpu = cpu_driver()?;
+            let SimulationDriver::ExplicitCpu(simulation) = cpu else {
+                unreachable!("GPU compatibility implies explicit solvent");
+            };
+            let cutoff = protocol.cutoff_angstrom.unwrap_or(9.0);
+            let electro = NonbondedElectrostatics::ReactionField {
+                cutoff_angstrom: cutoff,
+                solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
+            };
+            let neighbor_skin = options.explicit_gpu_neighbor_skin_angstrom;
+            let packing = glysys_gpu::pbc::PbcPacking::new(&system, cutoff, neighbor_skin)
+                .map_err(|e| {
+                    SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false)
+                })?;
+            let pair_capacity_scale = ((cutoff + neighbor_skin) / (cutoff + 1.5)).powi(3);
+            let max_pairs = ((simulation
+                .pair_count()
+                .saturating_mul(2)
+                .saturating_add(1024)
+                .max(4096) as f64
+                * pair_capacity_scale.max(1.0))
+            .ceil()
+            .min(f64::from(u32::MAX))) as u32;
+            let context_result = match shared_context {
+                Some(context) => Ok(context),
+                None => GpuContext::new(options.context_options("GlySys simulation")).await,
+            };
+            let context = match context_result {
+                Ok(context) => context,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ExplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some(format!("GPU context unavailable: {error}")),
+                        ),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let mut gpu = match context.create_pbc(&packing, &electro, max_pairs).await {
+                Ok(gpu) => gpu,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ExplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let box_xyz = simulation.state.box_angstrom.map(|value| value as f32);
+            let initialize_result = if let Some(rng) = &simulation.state.resident_rng {
+                gpu.initialize_dynamics_with_rng(
+                    &simulation.state.coordinates,
+                    &simulation.state.velocities,
+                    box_xyz,
+                    (protocol.timestep_fs * 0.001) as f32,
+                    &rng.words,
+                )
+            } else {
+                gpu.initialize_dynamics(
+                    &simulation.state.coordinates,
+                    &simulation.state.velocities,
+                    box_xyz,
+                    (protocol.timestep_fs * 0.001) as f32,
+                )
+            };
+            if let Err(error) = initialize_result {
+                let error = SessionError::from_gpu(error);
+                if requested == BackendPreference::Auto && error.cpu_fallback_valid {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ExplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                return Err(error);
             }
-            Err(error) => return Err(SessionError::from_gpu(error)),
-        };
-        let mut gpu = match context.create_pbc(&packing, &electro, max_pairs).await {
-            Ok(gpu) => gpu,
-            Err(error) if requested == BackendPreference::Auto => {
-                return Ok(Self {
-                    system,
-                    driver: SimulationDriver::ExplicitCpu(simulation),
-                    diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
-                    options,
-                    cancelled: false,
-                    gpu_advances: 0,
-                    cpu_advances: 0,
-                });
-            }
-            Err(error) => return Err(SessionError::from_gpu(error)),
-        };
-        let box_xyz = simulation.state.box_angstrom.map(|value| value as f32);
-        if let Err(error) = gpu.initialize_dynamics(
-            &simulation.state.coordinates,
-            &simulation.state.velocities,
-            box_xyz,
-            (protocol.timestep_fs * 0.001) as f32,
-        ) {
-            let error = SessionError::from_gpu(error);
-            if requested == BackendPreference::Auto && error.cpu_fallback_valid {
-                return Ok(Self {
-                    system,
-                    driver: SimulationDriver::ExplicitCpu(simulation),
-                    diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
-                    options,
-                    cancelled: false,
-                    gpu_advances: 0,
-                    cpu_advances: 0,
-                });
-            }
-            return Err(error);
+            let initial = match gpu.energy_and_forces(true).await {
+                Ok(initial) => initial,
+                Err(error) if requested == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ExplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some(SessionError::from_gpu(error).message),
+                        ),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let (energy, gradients, virial) = match gpu_total(&initial) {
+                Ok(values) => values,
+                Err(error) if requested == BackendPreference::Auto && error.cpu_fallback_valid => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ExplicitCpu(simulation),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
+                        options,
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let mut simulation = simulation;
+            let coords = simulation.state.coordinates.clone();
+            let velocities = simulation.state.velocities.clone();
+            simulation.install_evaluated_state(coords, velocities, 0, energy, gradients, virial)?;
+            let diagnostics =
+                ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
+            Ok(Self {
+                system,
+                driver: SimulationDriver::ExplicitGpu {
+                    device_step: simulation.state.step,
+                    simulation,
+                    gpu,
+                },
+                diagnostics,
+                options,
+                cancelled: false,
+                gpu_advances: 1,
+                cpu_advances: 0,
+            })
         }
-        let initial = match gpu.energy_and_forces(true).await {
-            Ok(initial) => initial,
-            Err(error) if requested == BackendPreference::Auto => {
-                return Ok(Self {
-                    system,
-                    driver: SimulationDriver::ExplicitCpu(simulation),
-                    diagnostics: ExecutionDiagnostics::cpu(
-                        &options,
-                        Some(SessionError::from_gpu(error).message),
-                    ),
-                    options,
-                    cancelled: false,
-                    gpu_advances: 0,
-                    cpu_advances: 0,
-                });
-            }
-            Err(error) => return Err(SessionError::from_gpu(error)),
-        };
-        let (energy, gradients, virial) = match gpu_total(&initial) {
-            Ok(values) => values,
-            Err(error) if requested == BackendPreference::Auto && error.cpu_fallback_valid => {
-                return Ok(Self {
-                    system,
-                    driver: SimulationDriver::ExplicitCpu(simulation),
-                    diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
-                    options,
-                    cancelled: false,
-                    gpu_advances: 0,
-                    cpu_advances: 0,
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let mut simulation = simulation;
-        let coords = simulation.state.coordinates.clone();
-        let velocities = simulation.state.velocities.clone();
-        simulation.install_evaluated_state(coords, velocities, 0, energy, gradients, virial)?;
-        Ok(Self {
-            system,
-            driver: SimulationDriver::ExplicitGpu { simulation, gpu },
-            diagnostics: ExecutionDiagnostics::gpu(&options, &context),
-            options,
-            cancelled: false,
-            gpu_advances: 1,
-            cpu_advances: 0,
-        })
     }
 
     pub async fn from_checkpoint(
@@ -622,10 +978,7 @@ impl SimulationSession {
         }
         let state = checkpoint.state;
         let protocol = state.protocol.clone();
-        if options.backend == BackendPreference::Cpu
-            || protocol.solvent != SolventModel::Explicit
-            || !gpu_compatible(&protocol)
-        {
+        if options.backend == BackendPreference::Cpu || !gpu_compatible(&protocol) {
             let reason = (options.backend != BackendPreference::Cpu).then(|| {
                 "checkpoint restored on the CPU reference session because this protocol is not GPU-compatible".into()
             });
@@ -637,6 +990,148 @@ impl SimulationSession {
                 diagnostics: ExecutionDiagnostics::cpu(&options, reason),
                 cancelled: false,
                 gpu_advances: 0,
+                cpu_advances: 0,
+            });
+        }
+
+        if protocol.solvent == SolventModel::Implicit {
+            let cpu = restore_cpu_driver(&system, &state)?;
+            let SimulationDriver::ImplicitCpu(mut simulation) = cpu else {
+                unreachable!("implicit checkpoint restores to the implicit CPU reference");
+            };
+            let Some(rng_words) = simulation
+                .state
+                .resident_rng
+                .as_ref()
+                .map(|rng| rng.words.clone())
+            else {
+                if options.backend == BackendPreference::Auto {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        options: options.clone(),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some("checkpoint lacks the implicit resident thermostat stream".into()),
+                        ),
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                return Err(SessionError::new(
+                    SessionErrorKind::InvalidInput,
+                    "checkpoint lacks the implicit resident thermostat stream",
+                    false,
+                ));
+            };
+            let context_result = match shared_context {
+                Some(context) => Ok(context),
+                None => GpuContext::new(options.context_options("GlySys implicit restart")).await,
+            };
+            let context = match context_result {
+                Ok(context) => context,
+                Err(error) if options.backend == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        options: options.clone(),
+                        diagnostics: ExecutionDiagnostics::cpu(
+                            &options,
+                            Some(format!(
+                                "GPU context unavailable while restoring checkpoint: {error}"
+                            )),
+                        ),
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let mut gpu = match context
+                .create_dynamics_with_tuning(
+                    &system,
+                    options.implicit_gpu_lanes_per_target,
+                    options.implicit_gpu_packet_steps,
+                )
+                .await
+            {
+                Ok(gpu) => gpu,
+                Err(error) if options.backend == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        options: options.clone(),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let initial = match gpu
+                .initialize_resident(
+                    &simulation.state.coordinates,
+                    &simulation.state.velocities,
+                    &rng_words,
+                )
+                .await
+            {
+                Ok(initial) => initial,
+                Err(error) if options.backend == BackendPreference::Auto => {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        options: options.clone(),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.to_string())),
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(SessionError::from_gpu(error)),
+            };
+            let potential = match implicit_total(&initial) {
+                Ok(value) if initial.gradients.len() == system.atom_count() => value,
+                Ok(_) => {
+                    return Err(SessionError::new(
+                        SessionErrorKind::Output,
+                        "GPU returned the wrong implicit-solvent gradient count",
+                        true,
+                    ));
+                }
+                Err(error)
+                    if options.backend == BackendPreference::Auto && error.cpu_fallback_valid =>
+                {
+                    return Ok(Self {
+                        system,
+                        driver: SimulationDriver::ImplicitCpu(simulation),
+                        options: options.clone(),
+                        diagnostics: ExecutionDiagnostics::cpu(&options, Some(error.message)),
+                        cancelled: false,
+                        gpu_advances: 0,
+                        cpu_advances: 0,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            simulation.state.potential_energy = potential;
+            simulation.state.gradient = initial.gradients;
+            let diagnostics =
+                ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
+            return Ok(Self {
+                system,
+                driver: SimulationDriver::ImplicitGpu {
+                    device_step: simulation.state.step,
+                    simulation,
+                    gpu,
+                },
+                options: options.clone(),
+                diagnostics,
+                cancelled: false,
+                gpu_advances: 1,
                 cpu_advances: 0,
             });
         }
@@ -653,17 +1148,23 @@ impl SimulationSession {
             cutoff_angstrom: cutoff,
             solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
         };
-        let packing =
-            glysys_gpu::pbc::PbcPacking::new_with_box(&system, state.box_angstrom, cutoff, 1.5)
-                .map_err(|e| {
-                    SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false)
-                })?;
-        let max_pairs = simulation
+        let neighbor_skin = options.explicit_gpu_neighbor_skin_angstrom;
+        let packing = glysys_gpu::pbc::PbcPacking::new_with_box(
+            &system,
+            state.box_angstrom,
+            cutoff,
+            neighbor_skin,
+        )
+        .map_err(|e| SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false))?;
+        let pair_capacity_scale = ((cutoff + neighbor_skin) / (cutoff + 1.5)).powi(3);
+        let max_pairs = ((simulation
             .pair_count()
             .saturating_mul(2)
             .saturating_add(1024)
-            .max(4096)
-            .min(u32::MAX as usize) as u32;
+            .max(4096) as f64
+            * pair_capacity_scale.max(1.0))
+        .ceil()
+        .min(f64::from(u32::MAX))) as u32;
         let context_result = match shared_context {
             Some(context) => Ok(context),
             None => GpuContext::new(options.context_options("GlySys simulation restart")).await,
@@ -726,6 +1227,7 @@ impl SimulationSession {
                     coordinates: state.coordinates.clone(),
                     velocities: state.velocities.clone(),
                     rng_words: rng.words.clone(),
+                    neighbor_rebuild_count: 0,
                 },
                 box_xyz,
                 true,
@@ -804,10 +1306,16 @@ impl SimulationSession {
             gradients,
             virial,
         )?;
+        let diagnostics =
+            ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
         Ok(Self {
             system,
-            driver: SimulationDriver::ExplicitGpu { simulation, gpu },
-            diagnostics: ExecutionDiagnostics::gpu(&options, &context),
+            driver: SimulationDriver::ExplicitGpu {
+                device_step: simulation.state.step,
+                simulation,
+                gpu,
+            },
+            diagnostics,
             options,
             cancelled: false,
             gpu_advances: 1,
@@ -819,7 +1327,24 @@ impl SimulationSession {
         self.driver.state()
     }
 
+    /// Step reached by the resident device. During scalar-only observations,
+    /// the public host state deliberately remains at the last full snapshot.
+    pub fn current_step(&self) -> usize {
+        match &self.driver {
+            SimulationDriver::ExplicitGpu { device_step, .. }
+            | SimulationDriver::ImplicitGpu { device_step, .. } => *device_step,
+            _ => self.state().step,
+        }
+    }
+
     pub fn checkpoint(&self) -> Result<RuntimeCheckpoint, SessionError> {
+        if self.current_step() != self.state().step {
+            return Err(SessionError::new(
+                SessionErrorKind::Output,
+                "GPU checkpoint requested before a full resident-state synchronization",
+                false,
+            ));
+        }
         Ok(RuntimeCheckpoint::from_state(
             self.state().clone(),
             self.diagnostics.clone(),
@@ -884,78 +1409,411 @@ impl SimulationSession {
                 "CPU advance requested while the GPU driver is active",
                 false,
             )),
+            SimulationDriver::ImplicitGpu { .. } => Err(SessionError::new(
+                SessionErrorKind::Output,
+                "CPU advance requested while the GPU driver is active",
+                false,
+            )),
         }
     }
 
     fn gpu_step_count(&self, requested: usize) -> usize {
-        let SimulationDriver::ExplicitGpu { simulation, .. } = &self.driver else {
-            return requested;
+        let state = match &self.driver {
+            SimulationDriver::ExplicitGpu { simulation, .. } => &simulation.state,
+            SimulationDriver::ImplicitGpu { simulation, .. } => &simulation.state,
+            _ => return requested,
         };
-        let stage_index = simulation
-            .state
-            .protocol
-            .stage_info(simulation.state.step)
-            .0;
-        let (_, _, _, _, local_step) = simulation.state.protocol.stage_info(simulation.state.step);
-        let stage = &simulation.state.protocol.execution_stages()[stage_index];
+        let current_step = self.current_step();
+        let stage_index = state.protocol.stage_info(current_step).0;
+        let (_, _, _, _, local_step) = state.protocol.stage_info(current_step);
+        let stage = &state.protocol.execution_stages()[stage_index];
+        let internal_limit = match &self.driver {
+            SimulationDriver::ImplicitGpu { simulation, .. }
+                if simulation.state.protocol.langevin_discretization
+                    == glysys_dynamics::LangevinDiscretization::Baoab =>
+            {
+                glysys_gpu::dynamics::MAX_STEPS
+            }
+            _ => usize::MAX,
+        };
         requested
-            .min(stage.steps.saturating_sub(local_step).max(1))
-            .min(128)
+            .min(stage.steps.saturating_sub(local_step))
+            .min(internal_limit)
     }
 
     async fn advance_gpu_steps(&mut self, count: usize) -> Result<TrajectoryChunk, SessionError> {
-        let SimulationDriver::ExplicitGpu { simulation, gpu } = &mut self.driver else {
-            return Err(SessionError::new(
+        match &mut self.driver {
+            SimulationDriver::ExplicitGpu {
+                simulation,
+                gpu,
+                device_step,
+            } => {
+                let first = *device_step;
+                let (_, _, ensemble, _, _) = simulation.state.protocol.stage_info(first);
+                let integration_started = Instant::now();
+                match ensemble {
+                    Ensemble::Nve => gpu.dynamics_steps(count).await,
+                    Ensemble::Nvt => match simulation.state.protocol.langevin_discretization {
+                        glysys_dynamics::LangevinDiscretization::Baoab => {
+                            gpu.dynamics_steps_nvt(
+                                count,
+                                simulation.state.protocol.temperature_k as f32,
+                                simulation.state.protocol.friction_per_ps as f32,
+                            )
+                            .await
+                        }
+                        glysys_dynamics::LangevinDiscretization::LfMiddle => {
+                            gpu.dynamics_steps_lf_middle(
+                                count,
+                                simulation.state.protocol.temperature_k as f32,
+                                simulation.state.protocol.friction_per_ps as f32,
+                            )
+                            .await
+                        }
+                    },
+                    Ensemble::Npt => Err(glysys_gpu::device::Error::Input(
+                        "GPU NPT is not enabled in this cleanup",
+                    )),
+                }
+                .map_err(SessionError::from_gpu)?;
+                for (stage, milliseconds) in gpu.take_gpu_stage_timings_ms() {
+                    add_stage_timing(&mut self.diagnostics, &format!("gpu.{stage}"), milliseconds);
+                }
+                add_stage_timing(
+                    &mut self.diagnostics,
+                    "productionIntegrationAndQueueWait",
+                    integration_started.elapsed().as_secs_f64() * 1000.0,
+                );
+                let box_xyz = simulation.state.box_angstrom.map(|value| value as f32);
+                let readback_started = Instant::now();
+                let (resident, energy) = gpu
+                    .read_dynamics_snapshot(box_xyz)
+                    .await
+                    .map_err(SessionError::from_gpu)?;
+                add_stage_timing(
+                    &mut self.diagnostics,
+                    "readbackAndDecode",
+                    readback_started.elapsed().as_secs_f64() * 1000.0,
+                );
+                self.diagnostics.neighbor_rebuild_count = Some(resident.neighbor_rebuild_count);
+                let (potential, gradients, virial) = gpu_total(&energy)?;
+                let next_step = first + count;
+                simulation.install_evaluated_state(
+                    resident.coordinates,
+                    resident.velocities,
+                    next_step,
+                    potential,
+                    gradients,
+                    virial,
+                )?;
+                *device_step = next_step;
+                if let Some(rng) = &mut simulation.state.resident_rng {
+                    if resident.rng_words.len() == rng.words.len() {
+                        rng.words.clone_from(&resident.rng_words);
+                    }
+                }
+                self.gpu_advances = self.gpu_advances.saturating_add(1);
+                let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
+                    || simulation.state.protocol.is_stage_boundary(next_step)
+                    || next_step == simulation.state.protocol.total_steps();
+                Ok(TrajectoryChunk {
+                    first_step: first,
+                    last_step: next_step,
+                    frames: save.then(|| simulation.frame()).into_iter().collect(),
+                })
+            }
+            SimulationDriver::ImplicitGpu {
+                simulation,
+                gpu,
+                device_step,
+            } => {
+                let first = *device_step;
+                let Some(rng_words) = simulation
+                    .state
+                    .resident_rng
+                    .as_ref()
+                    .map(|rng| rng.words.clone())
+                else {
+                    return Err(SessionError::new(
+                        SessionErrorKind::InvalidInput,
+                        "implicit GPU state lost its resident thermostat stream",
+                        false,
+                    ));
+                };
+                let batch = match simulation.state.protocol.langevin_discretization {
+                    glysys_dynamics::LangevinDiscretization::Baoab => {
+                        gpu.advance_resident(
+                            &simulation.state.coordinates,
+                            &simulation.state.velocities,
+                            &rng_words,
+                            count,
+                            simulation.state.protocol.timestep_fs * 0.001,
+                            simulation.state.protocol.temperature_k,
+                            simulation.state.protocol.friction_per_ps,
+                        )
+                        .await
+                    }
+                    glysys_dynamics::LangevinDiscretization::LfMiddle => {
+                        gpu.advance_resident_lf_middle(
+                            &simulation.state.coordinates,
+                            &simulation.state.velocities,
+                            &rng_words,
+                            count,
+                            simulation.state.protocol.timestep_fs * 0.001,
+                            simulation.state.protocol.temperature_k,
+                            simulation.state.protocol.friction_per_ps,
+                        )
+                        .await
+                    }
+                }
+                .map_err(SessionError::from_gpu)?;
+                let potential = implicit_total(&batch)?;
+                for (stage, milliseconds) in gpu.take_gpu_stage_timings_ms() {
+                    add_stage_timing(&mut self.diagnostics, &format!("gpu.{stage}"), milliseconds);
+                }
+                add_stage_timing(
+                    &mut self.diagnostics,
+                    "productionIntegrationAndQueueWait",
+                    batch.host_enqueue_wait_ms,
+                );
+                add_stage_timing(
+                    &mut self.diagnostics,
+                    "readbackAndDecode",
+                    batch.host_readback_ms,
+                );
+                let next_step = first + count;
+                simulation.state.coordinates = batch.coordinates;
+                simulation.state.velocities = batch.velocities;
+                simulation.state.gradient = batch.gradients;
+                simulation.state.potential_energy = potential;
+                simulation.state.step = next_step;
+                *device_step = next_step;
+                if let (Some(state_rng), Some(batch_rng)) =
+                    (&mut simulation.state.resident_rng, batch.rng_words)
+                {
+                    if batch_rng.len() == state_rng.words.len() {
+                        state_rng.words = batch_rng;
+                    }
+                }
+                self.gpu_advances = self.gpu_advances.saturating_add(1);
+                let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
+                    || simulation.state.protocol.is_stage_boundary(next_step)
+                    || next_step == simulation.state.protocol.total_steps();
+                Ok(TrajectoryChunk {
+                    first_step: first,
+                    last_step: next_step,
+                    frames: save.then(|| simulation.frame()).into_iter().collect(),
+                })
+            }
+            _ => Err(SessionError::new(
                 SessionErrorKind::Output,
                 "GPU advance requested while the CPU driver is active",
                 false,
-            ));
-        };
-        let first = simulation.state.step;
-        let (_, _, ensemble, _, _) = simulation.state.protocol.stage_info(first);
-        match ensemble {
-            Ensemble::Nve => gpu.dynamics_steps(count).await,
-            Ensemble::Nvt => {
-                gpu.dynamics_steps_nvt(
-                    count,
-                    simulation.state.protocol.temperature_k as f32,
-                    simulation.state.protocol.friction_per_ps as f32,
-                )
-                .await
-            }
-            Ensemble::Npt => Err(glysys_gpu::device::Error::Input(
-                "GPU NPT is not enabled in this cleanup",
             )),
         }
-        .map_err(SessionError::from_gpu)?;
-        let box_xyz = simulation.state.box_angstrom.map(|value| value as f32);
-        let (resident, energy) = gpu
-            .read_dynamics_snapshot(box_xyz)
-            .await
-            .map_err(SessionError::from_gpu)?;
-        let (potential, gradients, virial) = gpu_total(&energy)?;
-        let next_step = first + count;
-        simulation.install_evaluated_state(
-            resident.coordinates,
-            resident.velocities,
-            next_step,
-            potential,
-            gradients,
-            virial,
-        )?;
-        if let Some(rng) = &mut simulation.state.resident_rng {
-            if resident.rng_words.len() == rng.words.len() {
-                rng.words.clone_from(&resident.rng_words);
-            }
+    }
+
+    /// Advance to a scalar-observation boundary. GPU LF-middle paths reduce
+    /// energy and kinetic energy on-device and retain the full state there;
+    /// CPU and legacy implicit paths preserve the existing full-advance
+    /// behavior. Callers must request a full advance at frame/checkpoint
+    /// boundaries before exporting state.
+    pub async fn advance_with_scalar_observation(
+        &mut self,
+        steps: usize,
+    ) -> Result<ScalarObservation, SessionError> {
+        if self.cancelled {
+            return Err(SessionError::new(
+                SessionErrorKind::Cancellation,
+                "simulation cancelled",
+                false,
+            ));
         }
+        if steps == 0 {
+            return Err(SessionError::new(
+                SessionErrorKind::InvalidInput,
+                "advance steps must be positive",
+                false,
+            ));
+        }
+        let first = self.current_step();
+        if first >= self.state().protocol.total_steps() {
+            return Ok(host_scalar_observation(&self.system, self.state(), first));
+        }
+        let requested = steps.min(self.options.max_submission_steps.max(1));
+        let count = self.gpu_step_count(requested);
+        if count == 0 {
+            return Err(SessionError::new(
+                SessionErrorKind::InvalidInput,
+                "scalar observation cannot advance across an empty protocol stage",
+                false,
+            ));
+        }
+        let endpoint = first.saturating_add(count);
+        let protocol = &self.state().protocol;
+        if endpoint.is_multiple_of(protocol.save_every.max(1))
+            || protocol.is_stage_boundary(endpoint)
+            || endpoint == protocol.total_steps()
+        {
+            return Err(SessionError::new(
+                SessionErrorKind::InvalidInput,
+                "a full-state advance is required at frame, stage, or final boundaries",
+                false,
+            ));
+        }
+
+        let gpu_scalar_supported = match &self.driver {
+            SimulationDriver::ExplicitGpu { simulation, .. } => {
+                simulation.state.protocol.langevin_discretization
+                    == glysys_dynamics::LangevinDiscretization::LfMiddle
+            }
+            SimulationDriver::ImplicitGpu { simulation, .. } => {
+                simulation.state.protocol.langevin_discretization
+                    == glysys_dynamics::LangevinDiscretization::LfMiddle
+            }
+            _ => false,
+        };
+        if !gpu_scalar_supported {
+            self.advance(AdvanceRequest {
+                steps: count,
+                include_checkpoint: false,
+                max_frames: Some(0),
+            })
+            .await?;
+            return Ok(host_scalar_observation(
+                &self.system,
+                self.state(),
+                self.current_step(),
+            ));
+        }
+
+        let masses: Vec<_> = self.system.atoms().iter().map(|atom| atom.mass()).collect();
+        let dof = if self.state().degrees_of_freedom == 0 {
+            3 * masses.len()
+        } else {
+            self.state().degrees_of_freedom
+        };
+        let integration_started = Instant::now();
+        let (potential, kinetic, readback_ms, readback_bytes) = match &mut self.driver {
+            SimulationDriver::ExplicitGpu {
+                simulation,
+                gpu,
+                device_step,
+            } => {
+                let (_, _, ensemble, _, _) = simulation.state.protocol.stage_info(first);
+                match ensemble {
+                    Ensemble::Nve => gpu.dynamics_steps(count).await,
+                    Ensemble::Nvt => {
+                        gpu.dynamics_steps_lf_middle(
+                            count,
+                            simulation.state.protocol.temperature_k as f32,
+                            simulation.state.protocol.friction_per_ps as f32,
+                        )
+                        .await
+                    }
+                    Ensemble::Npt => Err(glysys_gpu::device::Error::Input(
+                        "GPU NPT is not enabled in this cleanup",
+                    )),
+                }
+                .map_err(SessionError::from_gpu)?;
+                for (stage, milliseconds) in gpu.take_gpu_stage_timings_ms() {
+                    add_stage_timing(&mut self.diagnostics, &format!("gpu.{stage}"), milliseconds);
+                }
+                let readback_started = Instant::now();
+                let scalars = gpu
+                    .read_dynamics_scalars()
+                    .await
+                    .map_err(SessionError::from_gpu)?;
+                let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
+                self.diagnostics.neighbor_rebuild_count = Some(scalars.neighbor_rebuild_count);
+                *device_step = endpoint;
+                (
+                    scalars.potential_energy,
+                    scalars.kinetic_energy,
+                    readback_ms,
+                    scalars.readback_bytes,
+                )
+            }
+            SimulationDriver::ImplicitGpu {
+                simulation,
+                gpu,
+                device_step,
+            } => {
+                let Some(rng_words) = simulation
+                    .state
+                    .resident_rng
+                    .as_ref()
+                    .map(|rng| rng.words.clone())
+                else {
+                    return Err(SessionError::new(
+                        SessionErrorKind::InvalidInput,
+                        "implicit GPU state lost its resident thermostat stream",
+                        false,
+                    ));
+                };
+                let observation = gpu
+                    .advance_resident_lf_middle_observation(
+                        &simulation.state.coordinates,
+                        &simulation.state.velocities,
+                        &rng_words,
+                        count,
+                        simulation.state.protocol.timestep_fs * 0.001,
+                        simulation.state.protocol.temperature_k,
+                        simulation.state.protocol.friction_per_ps,
+                    )
+                    .await
+                    .map_err(SessionError::from_gpu)?;
+                for (stage, milliseconds) in gpu.take_gpu_stage_timings_ms() {
+                    add_stage_timing(&mut self.diagnostics, &format!("gpu.{stage}"), milliseconds);
+                }
+                *device_step = endpoint;
+                (
+                    observation.potential_energy,
+                    observation.kinetic_energy,
+                    observation.host_readback_ms,
+                    observation.readback_bytes,
+                )
+            }
+            _ => unreachable!("scalar GPU support was checked above"),
+        };
+        add_stage_timing(
+            &mut self.diagnostics,
+            "productionIntegrationAndQueueWait",
+            integration_started.elapsed().as_secs_f64() * 1000.0 - readback_ms,
+        );
+        add_stage_timing(&mut self.diagnostics, "readbackAndDecode", readback_ms);
         self.gpu_advances = self.gpu_advances.saturating_add(1);
-        let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
-            || simulation.state.protocol.is_stage_boundary(next_step)
-            || next_step == simulation.state.protocol.total_steps();
-        Ok(TrajectoryChunk {
-            first_step: first,
-            last_step: next_step,
-            frames: save.then(|| simulation.frame()).into_iter().collect(),
+        self.diagnostics.submission_count =
+            self.diagnostics
+                .submission_count
+                .saturating_add(match &self.driver {
+                    SimulationDriver::ExplicitGpu { .. } => {
+                        count.div_ceil(glysys_gpu::pbc::MAX_ENCODED_DYNAMICS_STEPS) as u64 + 1
+                    }
+                    SimulationDriver::ImplicitGpu { .. } => {
+                        count.div_ceil(self.options.implicit_gpu_packet_steps) as u64 + 1
+                    }
+                    _ => 0,
+                });
+        self.diagnostics.scalar_readback_count =
+            self.diagnostics.scalar_readback_count.saturating_add(1);
+        self.diagnostics.scalar_readback_bytes = self
+            .diagnostics
+            .scalar_readback_bytes
+            .saturating_add(readback_bytes);
+        if !potential.is_finite() || !kinetic.is_finite() {
+            return Err(SessionError::new(
+                SessionErrorKind::Nonfinite,
+                "GPU returned nonfinite thermodynamic observation scalars",
+                true,
+            ));
+        }
+        Ok(ScalarObservation {
+            step: endpoint,
+            potential_energy_kcal_mol: potential,
+            kinetic_energy_kcal_mol: kinetic,
+            temperature_k: glysys_dynamics::explicit::kinetic_temperature(kinetic, dof),
+            readback_bytes,
         })
     }
 
@@ -977,10 +1835,36 @@ impl SimulationSession {
                 false,
             ));
         }
+        if self.current_step() >= self.state().protocol.total_steps() {
+            let step = self.current_step();
+            let checkpoint = request
+                .include_checkpoint
+                .then(|| self.checkpoint())
+                .transpose()?;
+            return Ok(AdvanceResult {
+                chunk: TrajectoryChunk {
+                    first_step: step,
+                    last_step: step,
+                    frames: Vec::new(),
+                },
+                checkpoint,
+                diagnostics: self.diagnostics.clone(),
+            });
+        }
         let limit = request.steps.min(self.options.max_submission_steps.max(1));
-        let gpu_active = matches!(&self.driver, SimulationDriver::ExplicitGpu { .. });
+        let gpu_active = matches!(
+            &self.driver,
+            SimulationDriver::ExplicitGpu { .. } | SimulationDriver::ImplicitGpu { .. }
+        );
         let chunk = if !gpu_active {
-            self.advance_cpu_steps(limit)?
+            let integration_started = Instant::now();
+            let chunk = self.advance_cpu_steps(limit)?;
+            add_stage_timing(
+                &mut self.diagnostics,
+                "productionIntegration",
+                integration_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            chunk
         } else {
             let gpu_steps = self.gpu_step_count(limit);
             match self.advance_gpu_steps(gpu_steps).await {
@@ -1001,6 +1885,42 @@ impl SimulationSession {
             }
         };
         let mut chunk = chunk;
+        let completed_steps = chunk.last_step.saturating_sub(chunk.first_step);
+        let gpu_committed = matches!(
+            &self.driver,
+            SimulationDriver::ExplicitGpu { .. } | SimulationDriver::ImplicitGpu { .. }
+        );
+        if gpu_committed && completed_steps > 0 {
+            let atom_count = self.system.atom_count() as u64;
+            let (submissions, bytes_read) = match &self.driver {
+                SimulationDriver::ExplicitGpu { .. } => (
+                    completed_steps.div_ceil(glysys_gpu::pbc::MAX_ENCODED_DYNAMICS_STEPS) as u64
+                        + 1,
+                    atom_count * 80 + 44,
+                ),
+                SimulationDriver::ImplicitGpu { simulation, .. }
+                    if simulation.state.protocol.langevin_discretization
+                        == glysys_dynamics::LangevinDiscretization::LfMiddle =>
+                {
+                    (
+                        completed_steps.div_ceil(self.options.implicit_gpu_packet_steps) as u64 + 1,
+                        atom_count * 64 + 52,
+                    )
+                }
+                SimulationDriver::ImplicitGpu { .. } => (1, atom_count * 64 + 52),
+                _ => (0, 0),
+            };
+            self.diagnostics.submission_count = self
+                .diagnostics
+                .submission_count
+                .saturating_add(submissions);
+            self.diagnostics.full_state_readback_count =
+                self.diagnostics.full_state_readback_count.saturating_add(1);
+            self.diagnostics.full_state_readback_bytes = self
+                .diagnostics
+                .full_state_readback_bytes
+                .saturating_add(bytes_read);
+        }
         if let Some(max_frames) = request.max_frames {
             chunk.frames.truncate(max_frames);
         }
@@ -1446,6 +2366,19 @@ impl ExecutionSession {
         self.simulation.advance(request).await
     }
 
+    /// Advance to a scalar observation boundary without exporting a complete
+    /// resident GPU state when the active LF-middle backend supports it.
+    pub async fn advance_with_scalar_observation(
+        &mut self,
+        steps: usize,
+    ) -> Result<ScalarObservation, SessionError> {
+        self.simulation.advance_with_scalar_observation(steps).await
+    }
+
+    pub fn current_step(&self) -> usize {
+        self.simulation.current_step()
+    }
+
     pub async fn from_checkpoint(
         system: ParameterizedSystem,
         checkpoint: RuntimeCheckpoint,
@@ -1516,6 +2449,615 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(options.gpu_memory_profile().budget(), 1024);
+    }
+
+    #[test]
+    fn implicit_gpu_capability_includes_one_femtosecond_but_not_two() {
+        let protocol = SimulationProtocol {
+            solvent: SolventModel::Implicit,
+            constraints: glysys_dynamics::ConstraintModel::None,
+            timestep_fs: 1.0,
+            ..Default::default()
+        };
+        assert!(gpu_compatible(&protocol));
+        assert!(!gpu_compatible(&SimulationProtocol {
+            timestep_fs: 2.0,
+            ..protocol
+        }));
+    }
+
+    #[test]
+    fn lf_middle_implicit_uses_only_the_constrained_resident_kernels() {
+        let protocol = SimulationProtocol {
+            solvent: SolventModel::Implicit,
+            constraints: glysys_dynamics::ConstraintModel::HBonds,
+            thermostat: glysys_dynamics::Thermostat::Langevin,
+            langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+            timestep_fs: 2.0,
+            ..Default::default()
+        };
+        protocol.validate().unwrap();
+        assert!(gpu_compatible(&protocol));
+        let explicit = SimulationProtocol {
+            solvent: SolventModel::Explicit,
+            constraints: glysys_dynamics::ConstraintModel::Settle,
+            thermostat: glysys_dynamics::Thermostat::Langevin,
+            langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+            timestep_fs: 2.0,
+            ..Default::default()
+        };
+        assert!(gpu_compatible(&explicit));
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn implicit_gpu_runs_at_one_femtosecond_and_restores_rng_checkpoint() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Implicit,
+                constraints: glysys_dynamics::ConstraintModel::None,
+                timestep_fs: 1.0,
+                equilibration_steps: 0,
+                production_steps: 8,
+                minimization_iterations: 0,
+                save_every: 1,
+                seed: 17,
+                ..Default::default()
+            };
+            let mut cpu = CpuSimulation::new(&system, protocol.clone())
+                .unwrap()
+                .into_owned();
+            let options = ExecutionOptions {
+                backend: BackendPreference::Gpu,
+                ..Default::default()
+            };
+            let mut gpu = SimulationSession::new(system.clone(), protocol, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(gpu.diagnostics().actual_backend, "GPU");
+            assert_eq!(gpu.state().step, 0);
+            assert_eq!(gpu.gpu_step_count(4), 4);
+
+            let expected = cpu.advance(4).unwrap();
+            let actual = gpu
+                .advance(AdvanceRequest {
+                    steps: 4,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(actual.chunk.last_step, 4);
+            assert_eq!(actual.chunk.frames.len(), 1);
+            let gpu_frame = &actual.chunk.frames[0];
+            let cpu_frame = expected.frames.last().unwrap();
+            assert_eq!(gpu_frame.step, cpu_frame.step);
+            for (gpu_pos, cpu_pos) in gpu_frame.coordinates.iter().zip(&cpu_frame.coordinates) {
+                assert!((gpu_pos.x - cpu_pos.x).abs() < 2e-3);
+                assert!((gpu_pos.y - cpu_pos.y).abs() < 2e-3);
+                assert!((gpu_pos.z - cpu_pos.z).abs() < 2e-3);
+            }
+            assert!((gpu_frame.potential_energy - cpu_frame.potential_energy).abs() < 0.05);
+
+            let checkpoint = gpu.checkpoint().unwrap();
+            let mut restored = SimulationSession::from_checkpoint(system, checkpoint, options)
+                .await
+                .unwrap();
+            assert_eq!(restored.diagnostics().actual_backend, "GPU");
+            let uninterrupted = gpu
+                .advance(AdvanceRequest {
+                    steps: 2,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let replayed = restored
+                .advance(AdvanceRequest {
+                    steps: 2,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(uninterrupted.chunk.last_step, replayed.chunk.last_step);
+            for (a, b) in gpu
+                .state()
+                .coordinates
+                .iter()
+                .zip(&restored.state().coordinates)
+            {
+                assert!((a.x - b.x).abs() < 1e-5);
+                assert!((a.y - b.y).abs() < 1e-5);
+                assert!((a.z - b.z).abs() < 1e-5);
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn explicit_gpu_lf_middle_advances_at_two_femtoseconds_with_settle() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: true,
+                add_ions: false,
+                padding_angstrom: 8.0,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Explicit,
+                constraints: glysys_dynamics::ConstraintModel::Settle,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                equilibration_steps: 0,
+                production_steps: 4,
+                minimization_iterations: 100,
+                save_every: 2,
+                seed: 71,
+                cutoff_angstrom: Some(5.0),
+                rf_dielectric: Some(78.5),
+                ..Default::default()
+            };
+            let options = ExecutionOptions {
+                backend: BackendPreference::Gpu,
+                max_submission_steps: 4,
+                ..Default::default()
+            };
+            let mut cpu = SimulationSession::new(
+                system.clone(),
+                protocol.clone(),
+                ExecutionOptions {
+                    backend: BackendPreference::Cpu,
+                    max_submission_steps: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut session = SimulationSession::new(system.clone(), protocol, options)
+                .await
+                .unwrap();
+            assert_eq!(session.diagnostics().actual_backend, "GPU");
+            let mut expected_rng = session
+                .state()
+                .resident_rng
+                .clone()
+                .expect("fresh Langevin checkpoint RNG");
+            for _ in 0..4 {
+                for atom in 0..system.atom_count() {
+                    expected_rng.normal3(atom);
+                }
+            }
+            let result = session
+                .advance(AdvanceRequest {
+                    steps: 4,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            cpu.advance(AdvanceRequest {
+                steps: 4,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.chunk.last_step, 4);
+            assert_eq!(session.state().step, 4);
+            assert_eq!(session.diagnostics().actual_backend, "GPU");
+            assert_eq!(
+                session.state().resident_rng.as_ref().unwrap().words,
+                expected_rng.words,
+                "fresh-run GPU RNG must start from and advance the step-zero checkpoint stream"
+            );
+            assert_eq!(session.diagnostics().full_state_readback_count, 1);
+            assert_eq!(session.diagnostics().submission_count, 2);
+            assert!(session.diagnostics().neighbor_rebuild_count.is_some());
+            assert!(
+                session
+                    .diagnostics()
+                    .selected_kernel_variants
+                    .contains(&"integrator:LfMiddle".into())
+            );
+            let box_xyz = system.box_angstrom();
+            let rms_displacement = (session
+                .state()
+                .coordinates
+                .iter()
+                .zip(&cpu.state().coordinates)
+                .map(|(gpu, cpu)| {
+                    let mut delta = [gpu.x - cpu.x, gpu.y - cpu.y, gpu.z - cpu.z];
+                    for axis in 0..3 {
+                        delta[axis] -= box_xyz[axis] * (delta[axis] / box_xyz[axis]).round();
+                    }
+                    delta.iter().map(|value| value * value).sum::<f64>()
+                })
+                .sum::<f64>()
+                / system.atom_count() as f64)
+                .sqrt();
+            assert!(
+                rms_displacement < 0.05,
+                "2 fs explicit CPU/GPU RMS displacement {rms_displacement} A after four steps"
+            );
+            for bond in system.bonds() {
+                let [a, b] = bond.atoms();
+                if system.atoms()[a].element() != 1 && system.atoms()[b].element() != 1 {
+                    continue;
+                }
+                let pa = session.state().coordinates[a];
+                let pb = session.state().coordinates[b];
+                let dx = pa.x - pb.x;
+                let dy = pa.y - pb.y;
+                let dz = pa.z - pb.z;
+                let dx = dx - box_xyz[0] * (dx / box_xyz[0]).round();
+                let dy = dy - box_xyz[1] * (dy / box_xyz[1]).round();
+                let dz = dz - box_xyz[2] * (dz / box_xyz[2]).round();
+                let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                let relative = (distance - bond.length()).abs() / bond.length();
+                assert!(relative < 5e-4, "explicit X-H/O-H residual {relative:e}");
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn implicit_gpu_lf_middle_advances_at_two_femtoseconds_resident() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Implicit,
+                constraints: glysys_dynamics::ConstraintModel::HBonds,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                equilibration_steps: 0,
+                production_steps: 8,
+                minimization_iterations: 30,
+                save_every: 2,
+                seed: 29,
+                ..Default::default()
+            };
+            let options = ExecutionOptions {
+                backend: BackendPreference::Gpu,
+                max_submission_steps: 4,
+                ..Default::default()
+            };
+            let mut cpu = SimulationSession::new(
+                system.clone(),
+                protocol.clone(),
+                ExecutionOptions {
+                    backend: BackendPreference::Cpu,
+                    max_submission_steps: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut gpu = SimulationSession::new(system.clone(), protocol, options)
+                .await
+                .unwrap();
+            let result = gpu
+                .advance(AdvanceRequest {
+                    steps: 4,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            cpu.advance(AdvanceRequest {
+                steps: 4,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.chunk.last_step, 4);
+            assert_eq!(gpu.diagnostics().actual_backend, "GPU");
+            assert_eq!(gpu.diagnostics().full_state_readback_count, 1);
+            assert_eq!(gpu.diagnostics().submission_count, 2);
+            assert_eq!(
+                gpu.diagnostics().full_state_readback_bytes,
+                system.atom_count() as u64 * 64 + 52
+            );
+            let reference = glysys_energy::EnergyEvaluator::new(
+                &system,
+                glysys_energy::EnergyOptions {
+                    obc2: Some(glysys_energy::Obc2Options::default()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .energy_and_gradient(&gpu.state().coordinates)
+            .unwrap();
+            let reference_gradients = reference.gradients.as_ref().unwrap();
+            let gradient_rms = (gpu
+                .state()
+                .gradient
+                .iter()
+                .zip(reference_gradients)
+                .map(|(actual, expected)| {
+                    (actual.x - expected.x).powi(2)
+                        + (actual.y - expected.y).powi(2)
+                        + (actual.z - expected.z).powi(2)
+                })
+                .sum::<f64>()
+                / reference_gradients
+                    .iter()
+                    .map(|g| g.x * g.x + g.y * g.y + g.z * g.z)
+                    .sum::<f64>()
+                    .max(1e-30))
+            .sqrt();
+            assert!(
+                gradient_rms <= 1e-3,
+                "implicit tiled-force relative RMS {gradient_rms}"
+            );
+            for (actual, expected) in gpu.state().gradient.iter().zip(reference_gradients) {
+                for (actual, expected) in [
+                    (actual.x, expected.x),
+                    (actual.y, expected.y),
+                    (actual.z, expected.z),
+                ] {
+                    assert!(
+                        (actual - expected).abs() <= 0.02 + 0.001 * expected.abs(),
+                        "implicit tiled-force component error: actual={actual}, reference={expected}"
+                    );
+                }
+            }
+            assert!(
+                (gpu.state().potential_energy - reference.total()).abs()
+                    <= 0.05_f64.max(1e-5 * system.atom_count() as f64),
+                "implicit tiled-force energy mismatch: GPU={}, CPU={}",
+                gpu.state().potential_energy,
+                reference.total()
+            );
+            let rms = (gpu
+                .state()
+                .coordinates
+                .iter()
+                .zip(&cpu.state().coordinates)
+                .map(|(gpu, cpu)| {
+                    (gpu.x - cpu.x).powi(2) + (gpu.y - cpu.y).powi(2) + (gpu.z - cpu.z).powi(2)
+                })
+                .sum::<f64>()
+                / system.atom_count() as f64)
+                .sqrt();
+            assert!(rms < 0.05, "implicit 2 fs CPU/GPU RMS delta {rms} A");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn implicit_gpu_scalar_observation_keeps_state_resident_until_full_sync() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Implicit,
+                constraints: glysys_dynamics::ConstraintModel::HBonds,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                equilibration_steps: 0,
+                production_steps: 10,
+                minimization_iterations: 8,
+                save_every: 10,
+                seed: 97,
+                ..Default::default()
+            };
+            let mut session = SimulationSession::new(
+                system,
+                protocol,
+                ExecutionOptions {
+                    backend: BackendPreference::Gpu,
+                    max_submission_steps: 8,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(session.diagnostics().actual_backend, "GPU");
+            let full_before = session.diagnostics().full_state_readback_count;
+            let observation = session.advance_with_scalar_observation(2).await.unwrap();
+            assert_eq!(observation.step, 2);
+            assert!(observation.potential_energy_kcal_mol.is_finite());
+            assert!(observation.kinetic_energy_kcal_mol.is_finite());
+            assert_eq!(session.current_step(), 2);
+            assert_eq!(
+                session.state().step,
+                0,
+                "host state is still the last full snapshot"
+            );
+            assert_eq!(session.diagnostics().full_state_readback_count, full_before);
+            assert_eq!(session.diagnostics().scalar_readback_count, 1);
+            assert_eq!(session.diagnostics().scalar_readback_bytes, 20);
+            assert!(session.checkpoint().is_err());
+
+            let full = session
+                .advance(AdvanceRequest {
+                    steps: 8,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(full.chunk.last_step, 10);
+            assert_eq!(session.current_step(), 10);
+            assert_eq!(session.state().step, 10);
+            assert_eq!(
+                session.diagnostics().full_state_readback_count,
+                full_before + 1
+            );
+            assert!(session.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn explicit_gpu_scalar_observation_reads_only_thermodynamic_scalars() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: true,
+                add_ions: false,
+                padding_angstrom: 8.0,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Explicit,
+                constraints: glysys_dynamics::ConstraintModel::Settle,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                equilibration_steps: 0,
+                production_steps: 10,
+                minimization_iterations: 12,
+                save_every: 10,
+                seed: 101,
+                cutoff_angstrom: Some(5.0),
+                rf_dielectric: Some(78.5),
+                ..Default::default()
+            };
+            let mut session = SimulationSession::new(
+                system,
+                protocol,
+                ExecutionOptions {
+                    backend: BackendPreference::Gpu,
+                    explicit_gpu_tiled_nonbonded: true,
+                    max_submission_steps: 8,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(session.diagnostics().actual_backend, "GPU");
+            let full_before = session.diagnostics().full_state_readback_count;
+            let observation = session.advance_with_scalar_observation(2).await.unwrap();
+            assert_eq!(observation.step, 2);
+            assert!(observation.potential_energy_kcal_mol.is_finite());
+            assert!(observation.kinetic_energy_kcal_mol.is_finite());
+            assert_eq!(session.current_step(), 2);
+            assert_eq!(session.state().step, 0);
+            assert_eq!(session.diagnostics().full_state_readback_count, full_before);
+            assert_eq!(session.diagnostics().scalar_readback_count, 1);
+            assert_eq!(session.diagnostics().scalar_readback_bytes, 28);
+
+            let full = session
+                .advance(AdvanceRequest {
+                    steps: 8,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(full.chunk.last_step, 10);
+            assert_eq!(session.state().step, 10);
+            assert_eq!(
+                session.diagnostics().full_state_readback_count,
+                full_before + 1
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an operational native WebGPU adapter"]
+    fn implicit_gpu_tiled_lane_variants_match_f64_force_reference() {
+        pollster::block_on(async {
+            let system = glysys::SystemBuilder::new(glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(include_str!("../../../tests/fixtures/dipeptide.pdb"))
+            .unwrap();
+            let protocol = SimulationProtocol {
+                solvent: SolventModel::Implicit,
+                constraints: glysys_dynamics::ConstraintModel::HBonds,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                equilibration_steps: 0,
+                production_steps: 2,
+                minimization_iterations: 30,
+                seed: 29,
+                ..Default::default()
+            };
+            for lanes in [4, 8, 16, 32, 64, 128] {
+                let mut gpu = SimulationSession::new(
+                    system.clone(),
+                    protocol.clone(),
+                    ExecutionOptions {
+                        backend: BackendPreference::Gpu,
+                        implicit_gpu_lanes_per_target: lanes,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                gpu.advance(AdvanceRequest {
+                    steps: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+                let reference = glysys_energy::EnergyEvaluator::new(
+                    &system,
+                    glysys_energy::EnergyOptions {
+                        obc2: Some(glysys_energy::Obc2Options::default()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .energy_and_gradient(&gpu.state().coordinates)
+                .unwrap();
+                let expected = reference.gradients.as_ref().unwrap();
+                let relative_rms = (gpu
+                    .state()
+                    .gradient
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| {
+                        (actual.x - expected.x).powi(2)
+                            + (actual.y - expected.y).powi(2)
+                            + (actual.z - expected.z).powi(2)
+                    })
+                    .sum::<f64>()
+                    / expected
+                        .iter()
+                        .map(|g| g.x * g.x + g.y * g.y + g.z * g.z)
+                        .sum::<f64>()
+                        .max(1e-30))
+                .sqrt();
+                assert!(
+                    relative_rms <= 1e-3,
+                    "{lanes}-lane implicit force relative RMS {relative_rms}"
+                );
+                assert!(
+                    (gpu.state().potential_energy - reference.total()).abs()
+                        <= 0.05_f64.max(1e-5 * system.atom_count() as f64),
+                    "{lanes}-lane implicit energy mismatch"
+                );
+            }
+        });
     }
 
     #[test]

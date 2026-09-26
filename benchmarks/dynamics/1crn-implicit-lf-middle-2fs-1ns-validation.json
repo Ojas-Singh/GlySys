@@ -1,0 +1,17 @@
+{
+  "temperatureK": 300.0,
+  "timestepFs": 2.0,
+  "frictionPerPs": 1.0,
+  "langevinDiscretization": "lf-middle",
+  "equilibrationSteps": 4000,
+  "productionSteps": 500000,
+  "saveEvery": 2500,
+  "minimizationIterations": 100,
+  "seed": "7",
+  "solvent": "implicit",
+  "equilibrationEnsemble": "nvt",
+  "productionEnsemble": "nvt",
+  "constraints": "h-bonds",
+  "thermostat": "langevin",
+  "dispersionCorrection": false
+}
