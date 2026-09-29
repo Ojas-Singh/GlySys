@@ -320,15 +320,20 @@ pub(crate) fn write_prmtop(system: &System) -> Result<String> {
         "ANGLES_WITHOUT_HYDROGEN",
         &angle_records(&angles_no_h, &angle_type_index),
     );
+    let one_four = system
+        .one_four_pairs()
+        .into_iter()
+        .map(|(pair, _, _)| (pair[0], pair[1]))
+        .collect::<std::collections::HashSet<_>>();
     int_section(
         &mut output,
         "DIHEDRALS_INC_HYDROGEN",
-        &dihedral_records(&dihedrals_h, &dihedral_type_index),
+        &dihedral_records(&dihedrals_h, &dihedral_type_index, &one_four),
     );
     int_section(
         &mut output,
         "DIHEDRALS_WITHOUT_HYDROGEN",
-        &dihedral_records(&dihedrals_no_h, &dihedral_type_index),
+        &dihedral_records(&dihedrals_no_h, &dihedral_type_index, &one_four),
     );
     int_section(&mut output, "EXCLUDED_ATOMS_LIST", &excluded.values);
     float_section(&mut output, "HBOND_ACOEF", &[]);
@@ -536,7 +541,11 @@ fn angle_records(
         .collect()
 }
 
-fn dihedral_records(dihedrals: &[&Dihedral], indices: &HashMap<DihedralKey, usize>) -> Vec<isize> {
+fn dihedral_records(
+    dihedrals: &[&Dihedral],
+    indices: &HashMap<DihedralKey, usize>,
+    one_four: &std::collections::HashSet<(usize, usize)>,
+) -> Vec<isize> {
     let mut seen_pairs = std::collections::BTreeSet::new();
     dihedrals
         .iter()
@@ -553,7 +562,9 @@ fn dihedral_records(dihedrals: &[&Dihedral], indices: &HashMap<DihedralKey, usiz
             if atoms[2] == 0 || atoms[3] == 0 {
                 atoms.reverse();
             }
-            let suppress_14 = dihedral.improper || !seen_pairs.insert(pair);
+            // 1-4 once per pair, and never for atoms that are 1-2/1-3 too.
+            let suppress_14 =
+                dihedral.improper || !one_four.contains(&pair) || !seen_pairs.insert(pair);
             let third = (atoms[2] * 3) as isize * if suppress_14 { -1 } else { 1 };
             let fourth = (atoms[3] * 3) as isize * if dihedral.improper { -1 } else { 1 };
             [

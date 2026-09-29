@@ -81,15 +81,8 @@ struct FixArgs {
     /// Residue naming in the output PDB.
     #[arg(long, value_enum, default_value = "pdb")]
     naming: NamingArg,
-    /// Local Chemical Component Dictionary mmCIF files (repeatable).
-    #[arg(long = "ccd")]
-    ccd: Vec<PathBuf>,
-    /// Never download component definitions from the RCSB.
-    #[arg(long)]
-    offline: bool,
-    /// Directory caching downloaded component definitions.
-    #[arg(long)]
-    ccd_cache: Option<PathBuf>,
+    #[command(flatten)]
+    components: ComponentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +128,25 @@ struct PrepareArgs {
     /// Replace an existing generated bundle.
     #[arg(long)]
     overwrite: bool,
+    /// Repair the structure first (missing atoms, hydrogens, modified residues).
+    #[arg(long)]
+    fix: bool,
+    #[command(flatten)]
+    components: ComponentArgs,
+}
+
+/// Where Chemical Component Dictionary definitions come from.
+#[derive(Debug, Args)]
+struct ComponentArgs {
+    /// Local Chemical Component Dictionary mmCIF files or directories (repeatable).
+    #[arg(long = "ccd")]
+    ccd: Vec<PathBuf>,
+    /// Never download component definitions from the RCSB.
+    #[arg(long)]
+    offline: bool,
+    /// Directory caching downloaded component definitions.
+    #[arg(long)]
+    ccd_cache: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -147,10 +159,28 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Prepare(arguments) => {
-            let options = options(&arguments.input, Some(&arguments))?;
-            let builder = SystemBuilder::new(options)?;
-            let prepared = builder.prepare_pdb(&arguments.input.input)?;
+            let mut options = options(&arguments.input, Some(&arguments))?;
+            options.repair = options.repair || arguments.fix;
+            let contents = std::fs::read_to_string(&arguments.input.input)?;
+            let requests = StructureFixer::new(FixOptions {
+                model: options.model,
+                altloc: options.altloc,
+                ..FixOptions::default()
+            })?
+            .component_requests(&contents)?;
+            let library = component_library(requests, &arguments.components)?;
+            let builder = SystemBuilder::new(options)?.with_components(library);
+            let prepared = builder.prepare_pdb_str(&contents)?;
             prepared.write_bundle(&arguments.output)?;
+            for warning in &prepared.report().warnings {
+                match warning {
+                    glysys::BuildWarning::SmallMoleculeParameterized(message) => {
+                        eprintln!("small molecule: {message}")
+                    }
+                    glysys::BuildWarning::StructureRepaired(message) => eprintln!("{message}"),
+                    _ => {}
+                }
+            }
             println!(
                 "Prepared {} atoms ({} waters, {} Na+, {} Cl-) in {}",
                 prepared.report().total_atoms,
@@ -186,7 +216,8 @@ fn main() -> anyhow::Result<()> {
             };
             let contents = std::fs::read_to_string(&arguments.input.input)?;
             let mut fixer = StructureFixer::new(fix_options)?;
-            let library = component_library(&fixer, &contents, &arguments)?;
+            let requests = fixer.component_requests(&contents)?;
+            let library = component_library(requests, &arguments.components)?;
             *fixer.components_mut() = library;
             let fixed = fixer.fix_pdb_str(&contents)?;
             std::fs::write(&arguments.output, &fixed.pdb)?;
@@ -252,9 +283,8 @@ fn options(input: &InputArgs, prepare: Option<&PrepareArgs>) -> anyhow::Result<B
 /// Chemical component definitions for ligands and modified residues:
 /// local files first, then the cache, then the RCSB (unless offline).
 fn component_library(
-    fixer: &StructureFixer,
-    contents: &str,
-    arguments: &FixArgs,
+    requests: Vec<String>,
+    arguments: &ComponentArgs,
 ) -> anyhow::Result<ComponentLibrary> {
     let mut library = ComponentLibrary::new();
     for path in &arguments.ccd {
@@ -273,8 +303,7 @@ fn component_library(
             library.add_cif(&std::fs::read_to_string(&file)?)?;
         }
     }
-    let requests = fixer
-        .component_requests(contents)?
+    let requests = requests
         .into_iter()
         .filter(|id| library.get(id).is_none())
         .collect::<Vec<_>>();

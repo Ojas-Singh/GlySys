@@ -37,6 +37,9 @@ pub struct BuildOptions {
     pub altloc: Option<char>,
     pub protonation: ProtonationOverrides,
     pub overwrite: bool,
+    /// Repair the structure first with the structure fixer (missing atoms,
+    /// internal gaps, modified residues, hydrogens), removing crystal water.
+    pub repair: bool,
 }
 
 impl Default for BuildOptions {
@@ -52,6 +55,7 @@ impl Default for BuildOptions {
             altloc: None,
             protonation: ProtonationOverrides::default(),
             overwrite: false,
+            repair: false,
         }
     }
 }

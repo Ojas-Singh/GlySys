@@ -15,6 +15,20 @@
   microheterogeneous residues, TER-separated segments, element inference for
   two-letter elements, and REMARK 465/SEQRES/MODRES records.
 - Add the `benchmarks/fixer` comparison with OpenMM PDBFixer.
+- `prepare` parameterizes small molecules with OpenFF Sage 2.2.1 and AM1-BCC
+  charges (SMIRKS/SMARTS engine, MDL and AM1-BCC aromaticity, a native AM1
+  implementation), validated against the OpenFF Toolkit, AmberTools and
+  OpenFF Interchange.
+- `prepare` supports DNA/RNA (OL15/OL3), keeps structural divalent metal ions
+  (Li/Merz 12-6), caps chain breaks, honours protonation states written as
+  hydrogens (e.g. by `fix`), infers undeclared glycosidic and N/O-glycan
+  bonds, represents free reducing sugars with GLYCAM's ROH, and names the
+  residues responsible for a fractional total charge.
+- `prepare --fix` / `BuildOptions::repair` repairs the input first.
+- Fix 1-4 interactions for atoms that are also 1-3 neighbours across a
+  five-membered ring (proline, histidine, tryptophan, furanoses, nucleic-acid
+  sugars): they are now excluded as in tleap, in the Amber and GROMACS writers
+  and in the CPU and GPU energy code.
 
 ## 0.1.2 — 2026-09-25
 

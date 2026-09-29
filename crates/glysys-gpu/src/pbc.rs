@@ -114,21 +114,12 @@ impl PbcPacking {
             .iter()
             .map(|set| set.iter().map(|i| (*i, (0., 0., false))).collect())
             .collect();
-        for t in system.dihedrals().iter().filter(|t| !t.is_improper()) {
-            let ids = t.atoms();
-            let key = (ids[0].min(ids[3]), ids[0].max(ids[3]));
+        for (pair, scee, scnb) in system.one_four_pairs() {
             // Both directions: each endpoint's thread evaluates its half of
             // the pair, so a one-sided entry would compute one half scaled
             // and the other half as a regular pair.
-            for (first, second) in [(key.0, key.1), (key.1, key.0)] {
-                exceptions[first].insert(
-                    second,
-                    (
-                        t.electrostatic_14_scale() as f32,
-                        t.lennard_jones_14_scale() as f32,
-                        true,
-                    ),
-                );
+            for (first, second) in [(pair[0], pair[1]), (pair[1], pair[0])] {
+                exceptions[first].insert(second, (scee as f32, scnb as f32, true));
             }
         }
         let mut ranges = Vec::with_capacity(n);

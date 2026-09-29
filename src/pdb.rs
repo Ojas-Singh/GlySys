@@ -380,8 +380,11 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
     let mut discarded_hydrogen_count = 0usize;
     let mut preserved_glycan_hydrogen_count = 0usize;
     let mut residues = Vec::with_capacity(raw.residues.len());
-    for residue in raw.residues {
+    for mut residue in raw.residues {
         let protein = PROTEIN_RESIDUES.contains(&residue.reference.name.as_str());
+        if protein && let Some(state) = protonation_from_hydrogens(&residue) {
+            residue.reference.name = state.into();
+        }
         let mut atoms = Vec::with_capacity(residue.atoms.len());
         for atom in residue.atoms {
             if atom.element.eq_ignore_ascii_case("H") || atom.element.eq_ignore_ascii_case("D") {
@@ -483,6 +486,31 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
         glycans,
         warnings,
     })
+}
+
+/// Protonation variant implied by the hydrogens of an input residue
+/// (e.g. written by `glysysbuilder fix`); `None` without hydrogens.
+fn protonation_from_hydrogens(residue: &RawResidue) -> Option<&'static str> {
+    let has = |name: &str| residue.atoms.iter().any(|atom| atom.name == name);
+    if !residue
+        .atoms
+        .iter()
+        .any(|atom| matches!(atom.element.as_str(), "H" | "D"))
+    {
+        return None;
+    }
+    match residue.reference.name.as_str() {
+        "HIS" => match (has("HD1"), has("HE2")) {
+            (true, true) => Some("HIP"),
+            (true, false) => Some("HID"),
+            (false, true) => Some("HIE"),
+            _ => None,
+        },
+        "ASP" if has("HD2") || has("HD1") => Some("ASH"),
+        "GLU" if has("HE2") || has("HE1") => Some("GLH"),
+        "LYS" if has("HZ1") && has("HZ2") && !has("HZ3") => Some("LYN"),
+        _ => None,
+    }
 }
 
 fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
@@ -835,9 +863,20 @@ pub(crate) fn is_water(name: &str) -> bool {
     matches!(name, "HOH" | "WAT" | "TIP" | "TP3")
 }
 
+/// Bulk monovalent ions: removed and re-added by solvation.
 pub(crate) fn is_free_ion(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "NA" | "NA+" | "CL" | "CL-" | "K" | "K+" | "MG" | "MG2+" | "CA" | "CA2+"
+        "NA" | "NA+" | "CL" | "CL-" | "K" | "K+"
     )
 }
+
+/// Structural divalent metal ions kept with Li/Merz 12-6 parameters.
+pub(crate) fn is_metal_ion(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "MG" | "CA" | "ZN" | "MN" | "FE2" | "CU" | "CO" | "NI" | "CD" | "HG"
+    )
+}
+
+pub(crate) const NUCLEIC_RESIDUES: &[&str] = &["DA", "DC", "DG", "DT", "A", "C", "G", "U"];

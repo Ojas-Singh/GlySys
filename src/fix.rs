@@ -343,6 +343,7 @@ impl StructureFixer {
             }
         }
         work::link_polymers(&mut work);
+        work::infer_glycan_bonds(&mut work);
 
         let planned = self.plan_missing_residues(&mut work, &mut report);
         if options.add_missing_atoms {
@@ -382,6 +383,7 @@ impl StructureFixer {
                 reason: decision.reason,
             });
         }
+        self.record_glycosylation_bonds(&mut work);
         let index_of = work.index_of();
         for ((a, _), (b, _)) in &work.bonds {
             let (Some(&a), Some(&b)) = (index_of.get(a), index_of.get(b)) else {
@@ -428,6 +430,51 @@ impl StructureFixer {
         report.atoms_out = work.residues.iter().map(|r| r.atoms.len()).sum();
         report.output_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
         Ok(FixedStructure { pdb: text, report })
+    }
+
+    /// Glycosylated residues found by distance get an explicit bond so the
+    /// output carries a LINK record for downstream parameterization.
+    fn record_glycosylation_bonds(&self, work: &mut Work) {
+        let mut new_bonds = Vec::new();
+        for residue in &work.residues {
+            let attachment = match residue.variant.as_deref() {
+                Some("NLN") => "ND2",
+                Some("OLS") => "OG",
+                Some("OLT") => "OG1",
+                Some("OLP") => "OD1",
+                _ => continue,
+            };
+            let Some(anchor) = residue.position(attachment) else {
+                continue;
+            };
+            let declared = work.bonds.iter().any(|((a, atom_a), (b, atom_b))| {
+                (*a == residue.uid && atom_a == attachment)
+                    || (*b == residue.uid && atom_b == attachment)
+            });
+            if declared {
+                continue;
+            }
+            if let Some(sugar) = work
+                .residues
+                .iter()
+                .filter(|other| other.kind == ResidueKind::Glycan)
+                .filter_map(|other| {
+                    other
+                        .position("C1")
+                        .map(|c1| (distance(c1, anchor), other.uid))
+                })
+                .filter(|(d, _)| *d < 1.75)
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+            {
+                new_bonds.push((
+                    (residue.uid, attachment.to_string()),
+                    (sugar.1, "C1".to_string()),
+                ));
+            }
+        }
+        for (a, b) in new_bonds {
+            work.add_bond(a, b);
+        }
     }
 
     fn apply_removal_policy(&self, work: &mut Work, report: &mut FixReport) {

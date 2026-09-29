@@ -51,10 +51,15 @@ impl ParameterSet {
     pub(crate) fn load() -> Result<Self> {
         let mut parameters = Self::default();
         parameters.parse_legacy(amber_data::PARM10)?;
+        // OL15 only defines DNA-specific atom types (C1, C2, C7, CJ); RNA
+        // OL3 is parm10 itself.  ff14SB is applied afterwards as in tleap.
+        parameters.parse_frcmod(amber_data::DNA_OL15_FRCMOD)?;
         parameters.parse_frcmod(amber_data::FF14SB)?;
         parameters.parse_legacy(amber_data::GLYCAM)?;
         parameters.parse_frcmod(amber_data::TIP3P)?;
         parameters.parse_frcmod(amber_data::IONS_JC)?;
+        // Li/Merz 12-6 compromise (CM) set for divalent ions in TIP3P.
+        parameters.parse_frcmod(amber_data::IONS_LM)?;
         for _ in 0..4 {
             let aliases = parameters.nonbonded_aliases.clone();
             for (alias, source) in aliases {
@@ -155,13 +160,22 @@ impl ParameterSet {
     fn parse_frcmod(&mut self, contents: &str) -> Result<()> {
         let mut section = Section::None;
         for line in contents.lines().skip(1) {
-            section = match line.trim() {
+            // tleap recognizes frcmod sections by their first four letters
+            // (NONBOND, IMPROPER, DIHEDRAL, ...).
+            let trimmed = line.trim();
+            let keyword = if trimmed.len() >= 4 && trimmed.chars().all(|c| c.is_ascii_alphabetic())
+            {
+                &trimmed[..4]
+            } else {
+                trimmed
+            };
+            section = match keyword {
                 "MASS" => Section::Mass,
                 "BOND" => Section::Bond,
-                "ANGL" | "ANGLE" => Section::Angle,
+                "ANGL" => Section::Angle,
                 "DIHE" => Section::Dihedral,
-                "IMPR" | "IMPROPER" => Section::Improper,
-                "NONB" | "NONBON" => Section::Nonbond,
+                "IMPR" => Section::Improper,
+                "NONB" => Section::Nonbond,
                 _ => {
                     if !line.trim().is_empty() {
                         self.parse_lines(section, std::iter::once(line))?;

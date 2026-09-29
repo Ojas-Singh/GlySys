@@ -3,11 +3,12 @@
 GlySys is a pure-Rust molecular-system and Amber/GLYCAM parameterization
 library. It includes the `glysysbuilder` system-preparation CLI and the
 native `glysys-md` simulation runner.
-It repairs raw PDB entries (a PDBFixer-equivalent `fix` command), reads
-complete-heavy-atom structures, adds force-field hydrogens, parameterizes
-proteins with ff14SB and carbohydrates with GLYCAM06j-1, solvates with TIP3P,
-adds neutralizing ions and 0.15 M NaCl, and writes files for OpenMM and
-GROMACS.
+It repairs raw PDB entries (a PDBFixer-equivalent `fix` command), adds
+force-field hydrogens, parameterizes proteins with ff14SB, carbohydrates with
+GLYCAM06j-1, DNA/RNA with OL15/OL3, structural metal ions with Li/Merz 12-6
+parameters and other small molecules (ligands, cofactors) with the generic
+OpenFF Sage 2.2.1 force field and AM1-BCC charges, solvates with TIP3P, adds
+neutralizing ions and 0.15 M NaCl, and writes files for OpenMM and GROMACS.
 
 The workspace also contains reusable AGPL-3.0-only libraries:
 
@@ -31,6 +32,7 @@ in the crate.
 glysysbuilder fix 1abc.pdb -o fixed.pdb --report fix-report.json
 glysysbuilder fix 1abc.pdb -o fixed.pdb --ph 5.5 --missing-residues internal --remove-water
 glysysbuilder inspect input.pdb
+glysysbuilder prepare 1abc.pdb --fix --output prepared   # repair a raw PDB entry first
 glysysbuilder prepare input.pdb --output prepared
 glysysbuilder prepare input.pdb -o prepared --padding 12 --salt 0.15 --seed 7
 glysysbuilder prepare input.pdb -o prepared --protonation A:42=HID
@@ -179,6 +181,38 @@ listed in the JSON report.
 PDB entries covering alternate locations, NMR models, modified residues,
 ligands, metals, nucleic acids, glycoproteins and a 58,000-atom assembly.
 
+## Generic force field for everything else (`prepare`)
+
+Residues that no ff14SB, GLYCAM06j-1, OL15/OL3 or ion template covers — drug
+ligands, cofactors, buffer molecules, modified residues kept as they are — are
+parameterized with **OpenFF Sage 2.2.1** (SMIRNOFF: every bond, angle, torsion,
+improper and van der Waals parameter is assigned by SMIRKS matching, including
+MDL aromaticity) and **AM1-BCC** partial charges computed by GlySys's own AM1
+implementation (MOPAC parameters) plus the original AM1-BCC bond charge
+corrections. Sage is designed to be combined with Amber ff14SB, and its 1-4
+scaling (0.5 / 0.8333) is Amber's.
+
+Chemistry (bond orders, formal charges, hydrogens) comes from each residue's
+Chemical Component Dictionary definition, fetched like `fix` does. Ligands
+must carry their hydrogens: `prepare --fix` (or `BuildOptions::repair`) runs
+the structure fixer first. Charges are computed at the deposited geometry
+without optimization, and the CCD protonation state is used as-is.
+
+Validation (`scripts/data`, 80 CCD components from the fixer benchmark):
+
+- Sage assignments are identical to the OpenFF Toolkit's `label_molecules` for
+  every bond, angle, torsion, improper and vdW term (≈17,000 terms);
+- AM1 heats of formation agree with AmberTools `sqm` to 0.06 kcal/mol
+  (median), and AM1-BCC charges with `antechamber -c bcc` to 0.005 e RMS
+  (median; 78/80 molecules within 0.05 e on every atom — nitrate and the flavin
+  of FAD differ by AmberTools' resonance-form choices);
+- OpenMM energies of GlySys prmtops equal OpenFF Interchange energies for the
+  same charges within 0.003 kcal/mol.
+
+Not covered: ligands containing metals (heme and other organometallics),
+ligands covalently bonded to the protein, and ligands whose deposited
+coordinates are incomplete; these are reported per residue.
+
 ## Rust API
 
 ```rust,no_run
@@ -196,11 +230,14 @@ copies minimized coordinates back without a file-format round trip.
 
 ## Input contract
 
-`prepare` accepts PDB files whose heavy atoms are complete (run `fix` first
-for raw PDB entries). It supports
+`prepare` accepts PDB files whose heavy atoms are complete (use `--fix` for
+raw PDB entries). It supports DNA and RNA (Amber OL15/OL3; a 5'-terminal
+phosphate is removed), structural Mg/Ca/Zn/Mn/Fe(II)/Cu/Co/Ni/Cd/Hg ions
+(Li/Merz 12-6 compromise set; coordination bonds are not modelled), small
+molecules via the generic force field above, and
 standard proteins, standalone GLYCAM-compatible glycans, noncovalent
 lectin–glycan complexes, and existing Asn/Ser/Thr/Hyp glycosylation.
-Unsupported ligands, nucleic acids, lipids, metals, missing heavy atoms, and
+Metal-containing ligands, covalently bound ligands, missing heavy atoms and
 ambiguous covalent chemistry are rejected with residue-level diagnostics.
 
 Input waters and free ions are removed and rebuilt. Protein hydrogens are
@@ -233,6 +270,11 @@ original MIT terms.
 AmberTools states that force-field parameter
 files in `dat/leap` are in the public domain. See
 [`data/amber/PROVENANCE.md`](data/amber/PROVENANCE.md) for the pinned subset.
+
+OpenFF Sage 2.2.1 parameters (`data/openff`) are CC-BY-4.0 (Open Force Field
+Initiative); the AM1-BCC corrections come from openff-recharge (MIT) and the
+AM1 parameters from MOPAC (Apache-2.0). See
+[`data/openff/PROVENANCE.md`](data/openff/PROVENANCE.md).
 
 The modified-residue substitution table in `src/fix/chemistry.rs` is adapted
 from OpenMM PDBFixer (MIT licence, Copyright (c) 2013-2025 Stanford University

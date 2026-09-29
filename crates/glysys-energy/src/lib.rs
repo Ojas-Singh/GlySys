@@ -403,15 +403,11 @@ impl<'a> EnergyEvaluator<'a> {
                 "dielectric, cutoff, and gradient step must be positive".into(),
             ));
         }
-        let mut one_four = HashMap::new();
-        for torsion in system.dihedrals().iter().filter(|term| !term.is_improper()) {
-            let atoms = torsion.atoms();
-            let key = ordered(atoms[0], atoms[3]);
-            one_four.entry(key).or_insert((
-                torsion.electrostatic_14_scale(),
-                torsion.lennard_jones_14_scale(),
-            ));
-        }
+        let one_four = system
+            .one_four_pairs()
+            .into_iter()
+            .map(|(pair, scee, scnb)| (ordered(pair[0], pair[1]), (scee, scnb)))
+            .collect::<HashMap<_, _>>();
         Ok(Self {
             system: std::borrow::Cow::Borrowed(system),
             options,

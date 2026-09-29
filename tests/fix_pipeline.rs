@@ -290,3 +290,122 @@ fn rejects_invalid_options() {
         .is_err()
     );
 }
+
+const ACETATE_CIF: &str = "data_ACT
+_chem_comp.id ACT
+_chem_comp.type NON-POLYMER
+loop_
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+C C 0 -0.042 0.000 0.001
+O O 0 -1.279 0.000 -0.001
+OXT O -1 0.656 1.198 0.001
+CH3 C 0 0.705 -1.296 0.000
+H1 H 0 1.781 -1.113 0.000
+H2 H 0 0.425 -1.866 0.887
+H3 H 0 0.425 -1.865 -0.887
+loop_
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+C O DOUB
+C OXT SING
+C CH3 SING
+CH3 H1 SING
+CH3 H2 SING
+CH3 H3 SING
+";
+
+fn dry_builder(components: ComponentLibrary, repair: bool) -> SystemBuilder {
+    SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .with_components(components)
+}
+
+#[test]
+fn prepares_a_protein_ligand_complex_with_the_generic_force_field() {
+    // Crambin plus an acetate ion 20 Å away, both with hydrogens after repair.
+    let ligand = "\\
+HETATM  900  C   ACT A 101      30.000  10.000  10.000  1.00  0.00           C
+HETATM  901  O   ACT A 101      28.763  10.000   9.998  1.00  0.00           O
+HETATM  902  OXT ACT A 101      30.698  11.198  10.000  1.00  0.00           O
+HETATM  903  CH3 ACT A 101      30.747   8.704   9.999  1.00  0.00           C
+";
+    let pdb = CRAMBIN.replace("END", "") + ligand + "END\n";
+    let mut library = ComponentLibrary::new();
+    library.add_cif(ACETATE_CIF).unwrap();
+    let prepared = dry_builder(library.clone(), true)
+        .prepare_pdb_str(&pdb)
+        .unwrap();
+    let report = prepared.report();
+    assert!(report.warnings.iter().any(
+        |w| matches!(w, glysys::BuildWarning::SmallMoleculeParameterized(m) if m.contains("ACT"))
+    ));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, glysys::BuildWarning::StructureRepaired(_)))
+    );
+    assert!(
+        (report.solute_charge + 1.0).abs() < 1e-3,
+        "{}",
+        report.solute_charge
+    );
+    let files = prepared.bundle_strings().unwrap();
+    assert!(files["system.prmtop"].contains("s"));
+    // Without the component definition the ligand is rejected, not guessed.
+    let error = dry_builder(ComponentLibrary::new(), true)
+        .prepare_pdb_str(&pdb)
+        .unwrap_err();
+    assert!(error.to_string().contains("ACT"), "{error}");
+}
+
+#[test]
+fn free_reducing_sugar_is_capped_with_roh() {
+    let pdb = include_str!("fixtures/fix/nag_free.pdb");
+    let prepared = dry_builder(ComponentLibrary::new(), false)
+        .prepare_pdb_str(pdb)
+        .unwrap();
+    assert!((prepared.report().solute_charge).abs() < 1e-3);
+    assert!(
+        prepared
+            .residues()
+            .iter()
+            .any(|residue| residue.name() == "ROH")
+    );
+}
+
+#[test]
+fn prepare_repairs_modified_residues_first() {
+    let options = BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: false,
+        ..BuildOptions::default()
+    };
+    assert!(
+        SystemBuilder::new(options)
+            .unwrap()
+            .prepare_pdb_str(SELENOMETHIONINE)
+            .is_err()
+    );
+    let prepared = dry_builder(ComponentLibrary::new(), true)
+        .prepare_pdb_str(SELENOMETHIONINE)
+        .unwrap();
+    assert!(
+        !prepared
+            .residues()
+            .iter()
+            .any(|residue| residue.name() == "MSE")
+    );
+}

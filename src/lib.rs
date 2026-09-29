@@ -8,11 +8,13 @@ mod error;
 mod fix;
 mod forcefield;
 pub mod io;
+mod ligand;
 mod model;
 mod options;
 mod pdb;
 mod prepare;
 mod report;
+mod smirnoff;
 mod snapshot;
 mod solvate;
 mod structure;
@@ -28,6 +30,10 @@ pub use model::{Angle, Atom, Bond, Dihedral, ParameterizedSystem, PreparedSystem
 pub use options::{BuildOptions, ForceFieldProfile, ProtonationOverrides};
 pub use prepare::SystemBuilder;
 pub use report::{BuildReport, GlycanReport, ResidueRef};
+pub use smirnoff::{
+    Assignment, AssignmentError, ForceField as SmallMoleculeForceField, MolAtom, MolBond, Molecule,
+    am1_mulliken, atomic_number, molecule_from_component,
+};
 pub use structure::{
     AppendMap, AtomId, GlycanTree, GlycosylationSite, ResidueAnnotation, ResidueId, Structure,
     StructureAtom, StructureAtomRef, StructureResidue, SystemMetadata, read_pdb, read_pdb_str,

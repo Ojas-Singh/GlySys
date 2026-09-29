@@ -29,8 +29,8 @@ pub enum BuildError {
     ForceField(String),
     #[error("no parameter for {kind} atom types {types}")]
     MissingParameter { kind: &'static str, types: String },
-    #[error("solute charge {0:.6} is not within tolerance of an integer")]
-    NonIntegralCharge(f64),
+    #[error("solute charge {0:.6} is not within tolerance of an integer{1}")]
+    NonIntegralCharge(f64, String),
     #[error("not enough solvent molecules to place {requested} ions (only {available} eligible)")]
     InsufficientSolvent { requested: usize, available: usize },
     #[error("output directory already contains generated files: {0}")]
@@ -57,6 +57,12 @@ pub enum BuildWarning {
     ProteinHeavyAtomsReconstructed(String),
     InputHydrogensRebuilt(String),
     InputGlycanHydrogensPreserved(String),
+    /// A ligand parameterized with the generic small-molecule force field.
+    SmallMoleculeParameterized(String),
+    /// A 5'-terminal phosphate was removed (no Amber template has one).
+    TerminalPhosphateRemoved(String),
+    /// The input was repaired by the structure fixer before preparation.
+    StructureRepaired(String),
 }
 
 pub type Result<T> = std::result::Result<T, BuildError>;

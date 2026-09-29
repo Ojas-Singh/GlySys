@@ -390,6 +390,84 @@ pub(crate) fn is_pdb_saccharide(name: &str) -> bool {
     )
 }
 
+/// Glycosidic and glycan-protein bonds present in the coordinates but not
+/// declared by LINK/CONECT (older entries): a glycan carbon within 1.65 Å
+/// of an oxygen or nitrogen of another residue.
+pub(crate) fn infer_glycan_bonds(work: &mut Work) {
+    let mut points = Vec::new();
+    for (index, residue) in work.residues.iter().enumerate() {
+        for atom in &residue.atoms {
+            if matches!(atom.element.as_str(), "O" | "N") {
+                points.push((index, atom.name.clone(), atom.position));
+            }
+        }
+    }
+    let mut grid = super::geometry::Grid::new(2.0);
+    for (i, point) in points.iter().enumerate() {
+        grid.insert(i, point.2);
+    }
+    let mut found = Vec::new();
+    for (index, residue) in work.residues.iter().enumerate() {
+        if residue.kind != ResidueKind::Glycan {
+            continue;
+        }
+        for atom in residue.atoms.iter().filter(|atom| atom.element == "C") {
+            for candidate in grid.near(atom.position, 1.65) {
+                let (other, name, position) = &points[candidate];
+                if *other != index && distance(atom.position, *position) < 1.65 {
+                    found.push((
+                        (residue.uid, atom.name.clone()),
+                        (work.residues[*other].uid, name.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    for (a, b) in found {
+        work.add_bond(a, b);
+    }
+    // Reducing-end sugars (no O1, C1 unbonded) placed near an Asn/Ser/Thr
+    // attachment atom but outside bonding distance, as in some low-resolution
+    // models, are treated as attached.
+    let partners = work.explicit_partners();
+    let mut attachments = Vec::new();
+    for residue in &work.residues {
+        if residue.kind != ResidueKind::Glycan
+            || residue.atom("O1").is_some()
+            || partners.contains_key(&(residue.uid, "C1".to_string()))
+        {
+            continue;
+        }
+        let Some(c1) = residue.position("C1") else {
+            continue;
+        };
+        let nearest = work
+            .residues
+            .iter()
+            .filter(|other| other.kind == ResidueKind::Protein)
+            .filter_map(|other| {
+                let atom = match other.name.as_str() {
+                    "ASN" => "ND2",
+                    "SER" => "OG",
+                    "THR" => "OG1",
+                    "HYP" => "OD1",
+                    _ => return None,
+                };
+                other
+                    .position(atom)
+                    .map(|p| (distance(p, c1), other.uid, atom))
+            })
+            .filter(|(d, _, _)| *d < 3.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((_, uid, atom)) = nearest {
+            attachments.push(((uid, atom.to_string()), (residue.uid, "C1".to_string())));
+        }
+    }
+    for (a, b) in attachments {
+        work.add_bond(a, b);
+    }
+}
+
 /// Assign polymer neighbours from peptide / phosphodiester geometry.
 pub(crate) fn link_polymers(work: &mut Work) {
     for residue in &mut work.residues {

@@ -22,3 +22,5 @@ pub(crate) const FF14SB: &str = include_str!("../data/amber/parm/frcmod.ff14SB")
 pub(crate) const GLYCAM: &str = include_str!("../data/amber/parm/GLYCAM_06j.dat");
 pub(crate) const TIP3P: &str = include_str!("../data/amber/parm/frcmod.tip3p");
 pub(crate) const IONS_JC: &str = include_str!("../data/amber/parm/frcmod.ionsjc_tip3p");
+pub(crate) const IONS_LM: &str = include_str!("../data/amber/parm/frcmod.ions234lm_126_tip3p");
+pub(crate) const DNA_OL15_FRCMOD: &str = include_str!("../data/amber/parm/frcmod.DNA.OL15");
