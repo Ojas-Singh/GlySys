@@ -5,6 +5,7 @@
 
 mod amber_data;
 mod error;
+mod fix;
 mod forcefield;
 pub mod io;
 mod model;
@@ -18,6 +19,11 @@ mod structure;
 mod writers;
 
 pub use error::{BuildError, BuildWarning, Result};
+pub use fix::{
+    Component, ComponentAtom, ComponentBond, ComponentLibrary, FixOptions, FixReport,
+    FixedStructure, HeterogenSummary, MissingResidues, MissingSegment, Naming, ProtonationChoice,
+    ReplacedResidue, ResidueAtoms, ResidueCounts, ResidueKind, StructureFixer,
+};
 pub use model::{Angle, Atom, Bond, Dihedral, ParameterizedSystem, PreparedSystem, Residue, Vec3};
 pub use options::{BuildOptions, ForceFieldProfile, ProtonationOverrides};
 pub use prepare::SystemBuilder;

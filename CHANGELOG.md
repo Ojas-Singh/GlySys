@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Add `glysysbuilder fix` / `StructureFixer`, a PDBFixer-equivalent structure
+  repair: alternate-location and microheterogeneity resolution, modified-residue
+  replacement (MODRES, PDBFixer table, CCD parents), missing-residue modelling
+  from REMARK 465 or SEQRES with loop closure and terminal growth, missing
+  heavy-atom reconstruction with clash relief, pH-dependent protonation
+  (disulfides, metal sites, histidine tautomers, glycosylated residues), and
+  hydrogens for proteins, nucleic acids, glycans, waters and CCD-defined
+  ligands, with a JSON report of every change.
+- Add Amber OL15 DNA and OL3 RNA residue templates (used by the fixer).
+- PDB reading: hybrid-36 serials and residue numbers, duplicate serials,
+  microheterogeneous residues, TER-separated segments, element inference for
+  two-letter elements, and REMARK 465/SEQRES/MODRES records.
+- Add the `benchmarks/fixer` comparison with OpenMM PDBFixer.
+
 ## 0.1.2 — 2026-09-25
 
 - Add explicit LF-middle NVT integration, hydrogen-bond constraints, and v3

@@ -6,6 +6,8 @@ pub(crate) const GLYCAM_AMINO_N: &str =
     include_str!("../data/amber/lib/GLYCAM_aminont_06j_12SB.lib");
 pub(crate) const GLYCAM_AMINO_C: &str =
     include_str!("../data/amber/lib/GLYCAM_aminoct_06j_12SB.lib");
+pub(crate) const DNA_OL15: &str = include_str!("../data/amber/lib/DNA.OL15.lib");
+pub(crate) const RNA_OL3: &str = include_str!("../data/amber/lib/RNA.lib");
 pub(crate) const ATOMIC_IONS: &str = include_str!("../data/amber/lib/atomic_ions.lib");
 pub(crate) const TIP3P_BOX: &str = include_str!("../data/amber/lib/tip3pbox.off");
 pub(crate) const GLYCAM_PREP: &str = include_str!("../data/amber/prep/GLYCAM_06j-1.prep");

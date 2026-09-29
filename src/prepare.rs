@@ -578,8 +578,8 @@ fn selector(residue: &PdbResidue) -> String {
     .to_string()
 }
 
-type AtomLocator = (String, i32, String);
-type DeclaredAtomBond = (AtomLocator, AtomLocator);
+pub(crate) type AtomLocator = (String, i32, String);
+pub(crate) type DeclaredAtomBond = (AtomLocator, AtomLocator);
 
 fn declared_atom_bonds(parsed: &ParsedPdb) -> Vec<DeclaredAtomBond> {
     let by_serial = parsed
@@ -707,7 +707,7 @@ fn protein_terminal_flags(residues: &[PdbResidue]) -> HashMap<usize, (bool, bool
     result
 }
 
-fn infer_glycam_template_name(
+pub(crate) fn infer_glycam_template_name(
     residue: &PdbResidue,
     all: &[PdbResidue],
     bonds: &[DeclaredAtomBond],
@@ -958,7 +958,7 @@ fn hydrogen_transform(
 /// from the experimental heavy atoms.  One-heavy-neighbor groups (OH, CH3)
 /// retain their template cone geometry and sample its free torsion to avoid
 /// nonbonded heavy-atom clashes.
-fn glycan_hydrogen_positions(
+pub(crate) fn glycan_hydrogen_positions(
     template: &Template,
     residue: &PdbResidue,
     residues: &[PdbResidue],

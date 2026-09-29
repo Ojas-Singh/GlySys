@@ -18,6 +18,10 @@ pub(crate) struct Template {
     pub name: String,
     pub atoms: Vec<TemplateAtom>,
     pub bonds: Vec<[usize; 2]>,
+    /// Atom bonded to the previous residue of a polymer (OFF `connect` head).
+    pub head: Option<usize>,
+    /// Atom bonded to the next residue of a polymer (OFF `connect` tail).
+    pub tail: Option<usize>,
 }
 
 impl Template {
@@ -36,6 +40,7 @@ pub(crate) struct TemplateSet {
     c_terminal: HashMap<String, Template>,
     glycans: HashMap<String, Template>,
     ions: HashMap<String, Template>,
+    nucleic: HashMap<String, Template>,
     tip3p_box: Template,
 }
 
@@ -64,6 +69,8 @@ impl TemplateSet {
             }
         }
         let ions = parse_off(amber_data::ATOMIC_IONS)?;
+        let mut nucleic = parse_off(amber_data::DNA_OL15)?;
+        nucleic.extend(parse_off(amber_data::RNA_OL3)?);
         let box_templates = parse_off(amber_data::TIP3P_BOX)?;
         let tip3p_box = box_templates
             .get("TIP3PBOX")
@@ -76,6 +83,7 @@ impl TemplateSet {
             c_terminal,
             glycans,
             ions,
+            nucleic,
             tip3p_box,
         })
     }
@@ -111,6 +119,22 @@ impl TemplateSet {
         self.glycans.keys().map(String::as_str)
     }
 
+    /// Amber OL15 DNA / OL3 RNA residue, e.g. `DA` with 5'/3' terminal forms.
+    pub(crate) fn nucleic(
+        &self,
+        name: &str,
+        five_prime: bool,
+        three_prime: bool,
+    ) -> Option<&Template> {
+        let suffix = match (five_prime, three_prime) {
+            (true, true) => "N",
+            (true, false) => "5",
+            (false, true) => "3",
+            (false, false) => "",
+        };
+        self.nucleic.get(&format!("{name}{suffix}"))
+    }
+
     pub(crate) fn ion(&self, name: &str) -> Option<&Template> {
         self.ions.get(name)
     }
@@ -126,6 +150,7 @@ fn parse_off(contents: &str) -> Result<HashMap<String, Template>> {
         atoms: Vec<TemplateAtom>,
         positions: Vec<Vec3>,
         bonds: Vec<[usize; 2]>,
+        connect: Vec<usize>,
     }
     #[derive(Clone, Copy)]
     enum Section {
@@ -133,6 +158,7 @@ fn parse_off(contents: &str) -> Result<HashMap<String, Template>> {
         Atoms,
         Positions,
         Connectivity,
+        Connect,
     }
     let mut partials: HashMap<String, Partial> = HashMap::new();
     let mut current_name = String::new();
@@ -151,6 +177,8 @@ fn parse_off(contents: &str) -> Result<HashMap<String, Template>> {
                 Section::Positions
             } else if tail.starts_with("connectivity ") {
                 Section::Connectivity
+            } else if tail.starts_with("connect ") {
+                Section::Connect
             } else {
                 Section::None
             };
@@ -205,6 +233,11 @@ fn parse_off(contents: &str) -> Result<HashMap<String, Template>> {
                     partial.bonds.push([values[0] - 1, values[1] - 1]);
                 }
             }
+            Section::Connect => {
+                if let Ok(value) = line.trim().parse::<usize>() {
+                    partial.connect.push(value);
+                }
+            }
             Section::None => {}
         }
     }
@@ -217,12 +250,23 @@ fn parse_off(contents: &str) -> Result<HashMap<String, Template>> {
                     atom.position = position;
                 }
             }
+            let connect = |index: usize| {
+                partial
+                    .connect
+                    .get(index)
+                    .copied()
+                    .filter(|value| *value != 0 && *value <= partial.atoms.len())
+                    .map(|value| value - 1)
+            };
+            let (head, tail) = (connect(0), connect(1));
             Ok((
                 name.clone(),
                 Template {
                     name,
                     atoms: partial.atoms,
                     bonds: partial.bonds,
+                    head,
+                    tail,
                 },
             ))
         })
@@ -381,6 +425,8 @@ fn parse_prep(contents: &str) -> Result<HashMap<String, Template>> {
                 name: name.to_string(),
                 atoms,
                 bonds,
+                head: None,
+                tail: None,
             },
         );
         index += 1;

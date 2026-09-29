@@ -3,10 +3,11 @@
 GlySys is a pure-Rust molecular-system and Amber/GLYCAM parameterization
 library. It includes the `glysysbuilder` system-preparation CLI and the
 native `glysys-md` simulation runner.
-It reads complete-heavy-atom PDB structures, adds force-field hydrogens,
-parameterizes proteins with ff14SB and carbohydrates with GLYCAM06j-1,
-solvates with TIP3P, adds neutralizing ions and 0.15 M NaCl, and writes files
-for OpenMM and GROMACS.
+It repairs raw PDB entries (a PDBFixer-equivalent `fix` command), reads
+complete-heavy-atom structures, adds force-field hydrogens, parameterizes
+proteins with ff14SB and carbohydrates with GLYCAM06j-1, solvates with TIP3P,
+adds neutralizing ions and 0.15 M NaCl, and writes files for OpenMM and
+GROMACS.
 
 The workspace also contains reusable AGPL-3.0-only libraries:
 
@@ -27,6 +28,8 @@ in the crate.
 ## CLI
 
 ```console
+glysysbuilder fix 1abc.pdb -o fixed.pdb --report fix-report.json
+glysysbuilder fix 1abc.pdb -o fixed.pdb --ph 5.5 --missing-residues internal --remove-water
 glysysbuilder inspect input.pdb
 glysysbuilder prepare input.pdb --output prepared
 glysysbuilder prepare input.pdb -o prepared --padding 12 --salt 0.15 --seed 7
@@ -136,6 +139,46 @@ add_ions = true
 "A:42" = "HID"
 ```
 
+## Structure repair (`fix`)
+
+`glysysbuilder fix` (and `StructureFixer` in the library) repairs a PDB model
+without parameterizing it, so ligands, metals and unusual chemistry are kept
+instead of rejected:
+
+- selects one model and one alternate location per residue, including
+  microheterogeneous sites (two residue types at one position);
+- replaces modified residues by their standard parent (`MSE` → `MET`,
+  `SEP` → `SER`, `PTR` → `TYR`, …) using MODRES records, PDBFixer's
+  substitution table and the Chemical Component Dictionary; hydroxyproline and
+  GLYCAM glycosylated residues are kept;
+- models residues that are absent from the coordinates, taking their exact
+  numbering from `REMARK 465` when present and otherwise aligning `SEQRES` as
+  PDBFixer does; internal gaps are closed by cyclic coordinate descent and
+  termini are grown by beam search, and numbering gaps without a physical
+  chain break are left alone;
+- rebuilds missing heavy atoms from each atom's local template geometry and
+  relieves the resulting clashes by a torsion scan and restrained L-BFGS
+  minimization in which only new atoms move;
+- assigns protonation states for a pH (default 7): disulfides, metal-bound
+  cysteine thiolates, histidine tautomers from hydrogen bonds and metal
+  coordination, and N-/O-glycosylated residues;
+- adds hydrogens to proteins, DNA/RNA (Amber OL15/OL3 templates), glycans
+  (GLYCAM06j-1 names), waters (oriented to hydrogen bond) and ligands, then
+  relaxes hydrogens that touch other atoms.
+
+Ligand chemistry comes from the wwPDB Chemical Component Dictionary (CCD). The
+CLI downloads the definitions it needs from the RCSB (only component codes are
+sent) and caches them in `~/.cache/glysys/ccd`; `--offline` and `--ccd FILE`
+use local definitions only. Library callers pass definitions through
+`ComponentLibrary::add_cif`, and `StructureFixer::component_requests` lists the
+codes a structure needs. Output uses wwPDB names by default; `--naming amber`
+writes Amber/GLYCAM residue names (`HID`, `CYX`, `NLN`, `4YB`). Every change is
+listed in the JSON report.
+
+[`benchmarks/fixer`](benchmarks/fixer) compares `fix` with OpenMM PDBFixer on 30
+PDB entries covering alternate locations, NMR models, modified residues,
+ligands, metals, nucleic acids, glycoproteins and a 58,000-atom assembly.
+
 ## Rust API
 
 ```rust,no_run
@@ -153,7 +196,8 @@ copies minimized coordinates back without a file-format round trip.
 
 ## Input contract
 
-Version 0.1 accepts PDB files whose heavy atoms are complete. It supports
+`prepare` accepts PDB files whose heavy atoms are complete (run `fix` first
+for raw PDB entries). It supports
 standard proteins, standalone GLYCAM-compatible glycans, noncovalent
 lectin–glycan complexes, and existing Asn/Ser/Thr/Hyp glycosylation.
 Unsupported ligands, nucleic acids, lipids, metals, missing heavy atoms, and
@@ -189,3 +233,8 @@ original MIT terms.
 AmberTools states that force-field parameter
 files in `dat/leap` are in the public domain. See
 [`data/amber/PROVENANCE.md`](data/amber/PROVENANCE.md) for the pinned subset.
+
+The modified-residue substitution table in `src/fix/chemistry.rs` is adapted
+from OpenMM PDBFixer (MIT licence, Copyright (c) 2013-2025 Stanford University
+and the Authors). Chemical Component Dictionary definitions are downloaded at
+run time and are not redistributed.

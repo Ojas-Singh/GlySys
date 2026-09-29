@@ -11,6 +11,8 @@ The subset supplies:
 - GLYCAM06j-1 carbohydrate and glycosylated-amino-acid templates/parameters
 - TIP3P solvent geometry and parameters
 - Joung-Chetham monovalent TIP3P ion parameters
+- Amber OL15 DNA (`DNA.OL15.lib`) and OL3 RNA (`RNA.lib`) residue templates,
+  used by the structure fixer for nucleic-acid atoms and hydrogens
 
 Files remain in their native Amber formats so their provenance is auditable
 and the Rust parsers can be tested against the original source representation.

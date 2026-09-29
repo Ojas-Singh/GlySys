@@ -57,24 +57,56 @@ struct CandidateAtom {
     occupancy: f64,
 }
 
-pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb> {
-    let available_models = available_models(contents);
-    if !available_models.contains(&options.model) {
-        return Err(BuildError::ModelNotFound(options.model));
-    }
+/// One residue of the selected model, before force-field interpretation.
+#[derive(Debug, Clone)]
+pub(crate) struct RawResidue {
+    pub reference: ResidueRef,
+    pub atoms: Vec<PdbAtom>,
+    /// A TER record follows this residue in the input.
+    pub ter_after: bool,
+}
 
+/// Coordinates and connectivity of one model with alternate locations resolved.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawModel {
+    pub residues: Vec<RawResidue>,
+    pub conect: BTreeSet<(u32, u32)>,
+    pub links: Vec<DeclaredLink>,
+    pub ssbonds: Vec<(ResidueKey, ResidueKey)>,
+    /// SEQRES residue names per chain, in sequence order.
+    pub seqres: BTreeMap<String, Vec<String>>,
+    /// MODRES records: modified residue and its standard parent name.
+    pub modres: Vec<(ResidueKey, String, String)>,
+    /// REMARK 465 residues (unobserved), in the order listed.
+    pub unobserved: Vec<(ResidueKey, String)>,
+    pub warnings: Vec<BuildWarning>,
+}
+
+/// Read the selected model's atoms and connectivity records.
+///
+/// Alternate locations are resolved per residue: a microheterogeneous site
+/// (two residue types sharing one residue number) keeps only the residue type
+/// of the selected alternate location plus the shared, unlabelled atoms.
+/// Distinct residues that merely share a number (no alternate locations) are
+/// kept apart.  Hydrogens are retained; callers decide whether to keep them.
+pub(crate) fn read_model(contents: &str, model: u32, altloc: Option<char>) -> Result<RawModel> {
+    let available_models = available_models(contents);
+    if !available_models.contains(&model) {
+        return Err(BuildError::ModelNotFound(model));
+    }
     let mut current_model = if contents.lines().any(|line| line.starts_with("MODEL ")) {
         0
     } else {
         1
     };
-    let mut candidates: BTreeMap<(String, i32, Option<char>, String), Vec<CandidateAtom>> =
-        BTreeMap::new();
-    let mut conect = BTreeSet::new();
-    let mut links = Vec::new();
-    let mut ssbonds = Vec::new();
-    let mut discarded_hydrogen_count = 0usize;
-    let mut preserved_glycan_hydrogen_count = 0usize;
+    type Group = ((String, i32, Option<char>), Vec<CandidateAtom>);
+    let mut groups: Vec<Group> = Vec::new();
+    let mut group_index: HashMap<(String, i32, Option<char>), usize> = HashMap::new();
+    let mut ter_after_group = HashSet::new();
+    let mut result = RawModel::default();
+    let mut used_serials = HashSet::new();
+    let mut synthetic_serial = 100_000_000u32;
+    let mut in_remark_465_table = false;
 
     for (line_number, line) in contents.lines().enumerate() {
         if line.starts_with("MODEL ") {
@@ -91,68 +123,283 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
         // global pre-MODEL section of an NMR/assembly PDB.  They describe the
         // selected coordinates and must not be discarded merely because the
         // parser is currently outside the requested MODEL block.
+        let global = current_model == 0 || current_model == model;
         if line.starts_with("CONECT") {
-            if current_model == 0 || current_model == options.model {
+            if global {
                 let serials = line
                     .as_bytes()
                     .get(6..)
                     .into_iter()
                     .flat_map(|rest| rest.chunks(5))
-                    .filter_map(|chunk| std::str::from_utf8(chunk).ok()?.trim().parse::<u32>().ok())
+                    .filter_map(|chunk| decode_serial(std::str::from_utf8(chunk).ok()?))
                     .collect::<Vec<_>>();
                 if let Some(&first) = serials.first() {
                     for &second in &serials[1..] {
-                        conect.insert(ordered(first, second));
+                        result.conect.insert(ordered(first, second));
                     }
                 }
             }
             continue;
         }
         if line.starts_with("LINK  ") {
-            if (current_model == 0 || current_model == options.model)
-                && let Some(link) = parse_link(line)
-            {
-                links.push(link);
+            if global && let Some(link) = parse_link(line) {
+                result.links.push(link);
             }
             continue;
         }
         if line.starts_with("SSBOND") {
-            if (current_model == 0 || current_model == options.model)
-                && let Some(pair) = parse_ssbond(line)
-            {
-                ssbonds.push(pair);
+            if global && let Some(pair) = parse_ssbond(line) {
+                result.ssbonds.push(pair);
             }
             continue;
         }
-        if current_model != options.model {
+        if line.starts_with("SEQRES") {
+            let chain = field(line, 11, 12).trim().to_string();
+            let names = field(line, 19, 80)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            result.seqres.entry(chain).or_default().extend(names);
+            continue;
+        }
+        if line.starts_with("REMARK 465") {
+            let body = field(line, 10, 80);
+            if body.contains("RES C SSSEQI") {
+                in_remark_465_table = true;
+            } else if in_remark_465_table && let Some(entry) = parse_remark_465(body, model) {
+                result.unobserved.push(entry);
+            }
+            continue;
+        }
+        if line.starts_with("MODRES") {
+            let name = field(line, 12, 15).trim().to_string();
+            let parent = field(line, 24, 27).trim().to_string();
+            if let Some(number) = decode_residue_number(field(line, 18, 22)) {
+                result.modres.push((
+                    ResidueKey {
+                        chain: field(line, 16, 17).trim().to_string(),
+                        number,
+                        insertion_code: char_field(line, 22),
+                    },
+                    name,
+                    parent,
+                ));
+            }
+            continue;
+        }
+        if current_model != model {
+            continue;
+        }
+        if line.starts_with("TER") {
+            if let Some(last) = groups.len().checked_sub(1) {
+                ter_after_group.insert(last);
+            }
             continue;
         }
         if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
-            let atom = parse_atom(line, line_number + 1)?;
+            let mut atom = parse_atom(line, line_number + 1)?;
+            if !used_serials.insert(atom.serial) {
+                // Duplicate or overflowed serials cannot be referenced by
+                // CONECT unambiguously; keep the atom with a private serial.
+                synthetic_serial += 1;
+                atom.serial = synthetic_serial;
+            }
+            let key = (atom.chain.clone(), atom.residue_number, atom.insertion_code);
+            let candidate = CandidateAtom {
+                altloc: char_field(line, 16),
+                occupancy: field(line, 54, 60).trim().parse().unwrap_or(0.0),
+                atom,
+            };
+            // A residue interrupted by a TER record or by other residues
+            // restarts only when its number is reused non-contiguously by a
+            // different molecule (e.g. waters numbered like the protein).
+            let index = match group_index.get(&key) {
+                Some(&index)
+                    if index + 1 == groups.len()
+                        || groups[index].1.iter().any(|existing| {
+                            existing.atom.residue_name == candidate.atom.residue_name
+                        }) =>
+                {
+                    index
+                }
+                _ => {
+                    groups.push((key.clone(), Vec::new()));
+                    group_index.insert(key, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            groups[index].1.push(candidate);
+        }
+    }
+
+    let mut alternate_selections = 0usize;
+    for (group_number, (key, candidates)) in groups.into_iter().enumerate() {
+        let ter_after = ter_after_group.contains(&group_number);
+        for (name, atoms) in resolve_residue(candidates, altloc, &mut alternate_selections) {
+            if atoms.is_empty() {
+                continue;
+            }
+            result.residues.push(RawResidue {
+                reference: ResidueRef {
+                    chain: key.0.clone(),
+                    name,
+                    number: key.1,
+                    insertion_code: key.2,
+                },
+                atoms,
+                ter_after,
+            });
+        }
+    }
+    if alternate_selections != 0 {
+        result
+            .warnings
+            .push(BuildWarning::AlternateLocationSelected(format!(
+                "{alternate_selections} atoms had alternate locations; selected {}",
+                altloc.map_or("A or the highest occupancy".to_string(), |value| value
+                    .to_string())
+            )));
+    }
+    if result.residues.is_empty() {
+        return Err(BuildError::InvalidPdb(
+            "selected model contains no atoms".into(),
+        ));
+    }
+    Ok(result)
+}
+
+/// Split one residue-number group into residues and pick alternate locations.
+fn resolve_residue(
+    candidates: Vec<CandidateAtom>,
+    requested: Option<char>,
+    selections: &mut usize,
+) -> Vec<(String, Vec<PdbAtom>)> {
+    let mut names = Vec::<String>::new();
+    for candidate in &candidates {
+        if !names.contains(&candidate.atom.residue_name) {
+            names.push(candidate.atom.residue_name.clone());
+        }
+    }
+    // Two residue types that both carry alternate-location labels are a
+    // microheterogeneous site.  Any other name mismatch inside one contiguous
+    // residue is a formatting defect (for example a column-shifted line) and
+    // is merged into the residue named by its first atom, as before.
+    let labelled_names = names
+        .iter()
+        .filter(|name| {
+            candidates.iter().any(|candidate| {
+                &candidate.atom.residue_name == *name && candidate.altloc.is_some()
+            })
+        })
+        .count();
+    let residues: Vec<(String, Vec<CandidateAtom>)> = if labelled_names > 1 {
+        let chosen_altloc = preferred_altloc(&candidates, requested);
+        let chosen_name = candidates
+            .iter()
+            .find(|candidate| candidate.altloc == chosen_altloc)
+            .map(|candidate| candidate.atom.residue_name.clone())
+            .unwrap_or_else(|| names[0].clone());
+        let kept = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.altloc.is_none() || candidate.atom.residue_name == chosen_name
+            })
+            .map(|mut candidate| {
+                candidate.atom.residue_name = chosen_name.clone();
+                candidate
+            })
+            .collect();
+        vec![(chosen_name, kept)]
+    } else {
+        let name = names[0].clone();
+        let merged = candidates
+            .into_iter()
+            .map(|mut candidate| {
+                candidate.atom.residue_name = name.clone();
+                candidate
+            })
+            .collect();
+        vec![(name, merged)]
+    };
+
+    residues
+        .into_iter()
+        .map(|(name, candidates)| {
+            let mut by_name: Vec<(String, Vec<CandidateAtom>)> = Vec::new();
+            for candidate in candidates {
+                match by_name
+                    .iter_mut()
+                    .find(|(atom_name, _)| *atom_name == candidate.atom.name)
+                {
+                    Some((_, choices)) => choices.push(candidate),
+                    None => by_name.push((candidate.atom.name.clone(), vec![candidate])),
+                }
+            }
+            let atoms = by_name
+                .into_iter()
+                .map(|(_, mut choices)| {
+                    choices.sort_by(|left, right| {
+                        altloc_rank(right.altloc, requested)
+                            .cmp(&altloc_rank(left.altloc, requested))
+                            .then_with(|| right.occupancy.total_cmp(&left.occupancy))
+                            .then_with(|| left.altloc.cmp(&right.altloc))
+                    });
+                    if choices.len() > 1 {
+                        *selections += 1;
+                    }
+                    choices.swap_remove(0).atom
+                })
+                .collect();
+            (name, atoms)
+        })
+        .collect()
+}
+
+fn preferred_altloc(candidates: &[CandidateAtom], requested: Option<char>) -> Option<char> {
+    if requested.is_some() && candidates.iter().any(|c| c.altloc == requested) {
+        return requested;
+    }
+    if candidates.iter().any(|c| c.altloc == Some('A')) {
+        return Some('A');
+    }
+    let mut totals = BTreeMap::<char, f64>::new();
+    for candidate in candidates {
+        if let Some(altloc) = candidate.altloc {
+            *totals.entry(altloc).or_default() += candidate.occupancy;
+        }
+    }
+    totals
+        .into_iter()
+        .max_by(|left, right| left.1.total_cmp(&right.1).then(right.0.cmp(&left.0)))
+        .map(|(altloc, _)| altloc)
+}
+
+pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb> {
+    let raw = read_model(contents, options.model, options.altloc)?;
+    let mut warnings = raw.warnings;
+    let mut discarded_hydrogen_count = 0usize;
+    let mut preserved_glycan_hydrogen_count = 0usize;
+    let mut residues = Vec::with_capacity(raw.residues.len());
+    for residue in raw.residues {
+        let protein = PROTEIN_RESIDUES.contains(&residue.reference.name.as_str());
+        let mut atoms = Vec::with_capacity(residue.atoms.len());
+        for atom in residue.atoms {
             if atom.element.eq_ignore_ascii_case("H") || atom.element.eq_ignore_ascii_case("D") {
-                if PROTEIN_RESIDUES.contains(&atom.residue_name.as_str()) {
+                if protein {
                     discarded_hydrogen_count += 1;
                     continue;
                 }
                 preserved_glycan_hydrogen_count += 1;
             }
-            let altloc = char_field(line, 16);
-            let occupancy = field(line, 54, 60).trim().parse().unwrap_or(0.0);
-            let key = (
-                atom.chain.clone(),
-                atom.residue_number,
-                atom.insertion_code,
-                atom.name.clone(),
-            );
-            candidates.entry(key).or_default().push(CandidateAtom {
-                atom,
-                altloc,
-                occupancy,
+            atoms.push(atom);
+        }
+        if !atoms.is_empty() {
+            residues.push(PdbResidue {
+                reference: residue.reference,
+                atoms,
             });
         }
     }
-
-    let mut warnings = Vec::new();
     if discarded_hydrogen_count != 0 {
         warnings.push(BuildWarning::InputHydrogensRebuilt(format!(
             "{discarded_hydrogen_count} protein hydrogen/deuterium atoms were discarded and rebuilt"
@@ -163,62 +410,14 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
             "{preserved_glycan_hydrogen_count} supplied glycan hydrogen/deuterium coordinates were retained when compatible with GLYCAM"
         )));
     }
-    let mut selected = Vec::with_capacity(candidates.len());
-    for ((chain, number, insertion, name), mut choices) in candidates {
-        choices.sort_by(|left, right| {
-            let left_requested = altloc_rank(left.altloc, options.altloc);
-            let right_requested = altloc_rank(right.altloc, options.altloc);
-            right_requested
-                .cmp(&left_requested)
-                .then_with(|| right.occupancy.total_cmp(&left.occupancy))
-                .then_with(|| left.altloc.cmp(&right.altloc))
-        });
-        let chosen = choices.remove(0);
-        if !choices.is_empty() {
-            warnings.push(BuildWarning::AlternateLocationSelected(format!(
-                "{chain}:{number}{} {name}: selected {}",
-                insertion.unwrap_or(' '),
-                chosen.altloc.unwrap_or(' ')
-            )));
-        }
-        selected.push(chosen.atom);
-    }
-    selected.sort_by_key(|atom| atom.serial);
-    if selected.is_empty() {
+    if residues.is_empty() {
         return Err(BuildError::InvalidPdb(
             "selected model contains no heavy atoms".into(),
         ));
     }
-
-    let mut residue_order = Vec::<ResidueKey>::new();
-    let mut residue_atoms: HashMap<ResidueKey, Vec<PdbAtom>> = HashMap::new();
-    let mut residue_names = HashMap::new();
-    for atom in selected {
-        let key = ResidueKey {
-            chain: atom.chain.clone(),
-            number: atom.residue_number,
-            insertion_code: atom.insertion_code,
-        };
-        if !residue_atoms.contains_key(&key) {
-            residue_order.push(key.clone());
-        }
-        residue_names
-            .entry(key.clone())
-            .or_insert_with(|| atom.residue_name.clone());
-        residue_atoms.entry(key).or_default().push(atom);
-    }
-    let residues = residue_order
-        .into_iter()
-        .map(|key| PdbResidue {
-            reference: ResidueRef {
-                chain: key.chain.clone(),
-                name: residue_names[&key].clone(),
-                number: key.number,
-                insertion_code: key.insertion_code,
-            },
-            atoms: residue_atoms.remove(&key).unwrap_or_default(),
-        })
-        .collect::<Vec<_>>();
+    let conect = raw.conect;
+    let links = raw.links;
+    let ssbonds = raw.ssbonds;
     let chains = residues
         .iter()
         .map(|residue| residue.reference.chain.clone())
@@ -371,35 +570,30 @@ fn parse_atom(line: &str, line_number: usize) -> Result<PdbAtom> {
             .parse::<f64>()
             .map_err(|_| BuildError::InvalidPdb(format!("line {line_number} has invalid {label}")))
     };
-    let serial = field(line, 6, 11).trim().parse().map_err(|_| {
-        BuildError::InvalidPdb(format!("line {line_number} has invalid atom serial"))
-    })?;
-    let residue_number = field(line, 22, 26).trim().parse().map_err(|_| {
+    // Serials beyond 99,999 are written in hybrid-36 or as `*****` by some
+    // tools.  An unreadable serial is replaced by a unique private value;
+    // it can then no longer be referenced by CONECT, which is correct.
+    let serial = decode_serial(field(line, 6, 11)).unwrap_or(900_000_000 + line_number as u32);
+    let residue_number = decode_residue_number(field(line, 22, 26)).ok_or_else(|| {
         BuildError::InvalidPdb(format!("line {line_number} has invalid residue number"))
     })?;
     let name = field(line, 12, 16).trim().to_string();
-    let guessed_element = name
-        .trim_start_matches(|character: char| character.is_ascii_digit())
-        .chars()
-        .next()
-        .unwrap_or('X')
-        .to_ascii_uppercase()
-        .to_string();
+    let residue_name = field(line, 17, 20).trim().to_string();
     Ok(PdbAtom {
         serial,
         name,
-        residue_name: field(line, 17, 20).trim().to_string(),
         chain: field(line, 21, 22).trim().to_string(),
         residue_number,
         insertion_code: char_field(line, 26),
         element: {
             let declared = field(line, 76, 78).trim();
-            if declared.is_empty() {
-                guessed_element
+            if !declared.is_empty() && declared.chars().all(|c| c.is_ascii_alphabetic()) {
+                normalize_element(declared)
             } else {
-                declared.to_string()
+                guess_element(field(line, 12, 16), &residue_name)
             }
         },
+        residue_name,
         occupancy: parse_number(54, 60, "occupancy")
             .unwrap_or(1.0)
             .clamp(0.0, 1.0),
@@ -412,18 +606,173 @@ fn parse_atom(line: &str, line_number: usize) -> Result<PdbAtom> {
     })
 }
 
+/// Element symbols are compared upper-case throughout GlySys.
+fn normalize_element(value: &str) -> String {
+    value.to_ascii_uppercase()
+}
+
+const TWO_LETTER_ELEMENTS: &[&str] = &[
+    "LI", "BE", "NA", "MG", "AL", "SI", "CL", "AR", "CA", "SC", "TI", "CR", "MN", "FE", "CO", "NI",
+    "CU", "ZN", "GA", "GE", "AS", "SE", "BR", "KR", "RB", "SR", "ZR", "MO", "RU", "RH", "PD", "AG",
+    "CD", "IN", "SN", "SB", "TE", "XE", "CS", "BA", "LA", "CE", "GD", "YB", "LU", "HF", "TA", "RE",
+    "OS", "IR", "PT", "AU", "HG", "TL", "PB", "BI", "SM", "EU", "TB", "HO",
+];
+
+/// Guess an element from the raw 4-column atom-name field.
+///
+/// wwPDB right-justifies one-letter elements in columns 13-14 (" CA " is an
+/// alpha carbon) and starts two-letter elements in column 13 ("CA  " is
+/// calcium).  A left-justified name is therefore two-letter only when it
+/// names a real element and the residue is plausibly that ion/metal.
+fn guess_element(raw: &str, residue_name: &str) -> String {
+    let raw = format!("{raw:<4}");
+    let trimmed = raw.trim();
+    let letters = trimmed
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let first_column_letter = raw.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+    if letters.len() >= 2 {
+        let pair = &letters[..2];
+        if TWO_LETTER_ELEMENTS.contains(&pair)
+            && (residue_name.eq_ignore_ascii_case(pair)
+                || (first_column_letter
+                    && !PROTEIN_RESIDUES.contains(&residue_name)
+                    && !matches!(pair, "CA" | "CD" | "NE" | "HG" | "HO" | "CE")))
+        {
+            return pair.to_string();
+        }
+    }
+    letters
+        .chars()
+        .next()
+        .map_or_else(|| "X".to_string(), |c| c.to_string())
+}
+
+/// Decimal or hybrid-36 atom serial (5 columns).
+pub(crate) fn decode_serial(field: &str) -> Option<u32> {
+    decode_hybrid36(field.trim(), 5)
+}
+
+/// Decimal or hybrid-36 residue sequence number (4 columns).
+pub(crate) fn decode_residue_number(field: &str) -> Option<i32> {
+    let value = field.trim();
+    value
+        .parse::<i32>()
+        .ok()
+        .or_else(|| decode_hybrid36(value, 4).map(|n| n as i32))
+}
+
+fn decode_hybrid36(value: &str, width: u32) -> Option<u32> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(number) = value.parse::<u32>() {
+        return Some(number);
+    }
+    if value.len() != width as usize || !value.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let first = value.chars().next()?;
+    let digits = |upper: bool| -> Option<u32> {
+        value.chars().try_fold(0u32, |accumulator, character| {
+            let digit = if character.is_ascii_digit() {
+                character as u32 - '0' as u32
+            } else if upper && character.is_ascii_uppercase() {
+                character as u32 - 'A' as u32 + 10
+            } else if !upper && character.is_ascii_lowercase() {
+                character as u32 - 'a' as u32 + 10
+            } else {
+                return None;
+            };
+            accumulator.checked_mul(36)?.checked_add(digit)
+        })
+    };
+    let decimal_limit = 10u32.pow(width);
+    let block = 26 * 36u32.pow(width - 1);
+    if first.is_ascii_uppercase() {
+        Some(digits(true)? - 10 * 36u32.pow(width - 1) + decimal_limit)
+    } else if first.is_ascii_lowercase() {
+        Some(digits(false)? - 10 * 36u32.pow(width - 1) + decimal_limit + block)
+    } else {
+        None
+    }
+}
+
+/// Hybrid-36 encoding used when a serial or residue number overflows.
+pub(crate) fn encode_hybrid36(value: u32, width: u32) -> String {
+    let decimal_limit = 10u32.pow(width);
+    if value < decimal_limit {
+        return format!("{value:>width$}", width = width as usize);
+    }
+    let block = 26 * 36u32.pow(width - 1);
+    let (offset, alphabet) = if value < decimal_limit + block {
+        (
+            value - decimal_limit + 10 * 36u32.pow(width - 1),
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        )
+    } else {
+        (
+            (value - decimal_limit - block).min(block - 1) + 10 * 36u32.pow(width - 1),
+            b"0123456789abcdefghijklmnopqrstuvwxyz",
+        )
+    };
+    let mut digits = vec![b'0'; width as usize];
+    let mut remaining = offset;
+    for slot in digits.iter_mut().rev() {
+        *slot = alphabet[(remaining % 36) as usize];
+        remaining /= 36;
+    }
+    String::from_utf8(digits).expect("hybrid-36 digits are ASCII")
+}
+
+/// `[model] RES C SSSEQI` of a REMARK 465 table row.
+fn parse_remark_465(body: &str, model: u32) -> Option<(ResidueKey, String)> {
+    let tokens = body.split_whitespace().collect::<Vec<_>>();
+    let (entry_model, rest) = match tokens.len() {
+        3 => (None, &tokens[..]),
+        4 => (tokens[0].parse::<u32>().ok(), &tokens[1..]),
+        _ => return None,
+    };
+    if entry_model.is_some_and(|value| value != model) {
+        return None;
+    }
+    let name = rest[0].to_string();
+    let chain = rest[1].to_string();
+    if chain.len() != 1 || name.len() > 3 {
+        return None;
+    }
+    let sequence = rest[2];
+    let split = sequence
+        .char_indices()
+        .rfind(|(_, c)| c.is_ascii_digit())
+        .map(|(index, c)| index + c.len_utf8())?;
+    let number = sequence[..split].parse::<i32>().ok()?;
+    let insertion_code = sequence[split..].chars().next();
+    Some((
+        ResidueKey {
+            chain,
+            number,
+            insertion_code,
+        },
+        name,
+    ))
+}
+
 fn parse_link(line: &str) -> Option<DeclaredLink> {
     Some(DeclaredLink {
         first_atom: field(line, 12, 16).trim().to_string(),
         first: ResidueKey {
             chain: field(line, 21, 22).trim().to_string(),
-            number: field(line, 22, 26).trim().parse().ok()?,
+            number: decode_residue_number(field(line, 22, 26))?,
             insertion_code: char_field(line, 26),
         },
         second_atom: field(line, 42, 46).trim().to_string(),
         second: ResidueKey {
             chain: field(line, 51, 52).trim().to_string(),
-            number: field(line, 52, 56).trim().parse().ok()?,
+            number: decode_residue_number(field(line, 52, 56))?,
             insertion_code: char_field(line, 56),
         },
     })
