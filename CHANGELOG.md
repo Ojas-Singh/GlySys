@@ -24,7 +24,12 @@
   hydrogens (e.g. by `fix`), infers undeclared glycosidic and N/O-glycan
   bonds, represents free reducing sugars with GLYCAM's ROH, and names the
   residues responsible for a fractional total charge.
-- `prepare --fix` / `BuildOptions::repair` repairs the input first.
+- `prepare --fix` / `BuildOptions::repair` repairs the input first;
+  `SystemBuilder::component_requests` lists the CCD definitions it can use.
+- Add `ParameterizedSystem::solute` (the solvated system's dry solute).
+- The no-cutoff energy no longer allocates every atom pair (large systems
+  ran out of memory, notably in WebAssembly) and is about twice as fast,
+  with bit-identical results.
 - Fix 1-4 interactions for atoms that are also 1-3 neighbours across a
   five-membered ring (proline, histidine, tryptophan, furanoses, nucleic-acid
   sugars): they are now excluded as in tleap, in the Amber and GROMACS writers
