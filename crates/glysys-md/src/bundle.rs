@@ -393,13 +393,9 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
 
 fn expected_pair_set(system: &ParameterizedSystem) -> BTreeSet<(usize, usize)> {
     system
-        .dihedrals()
-        .iter()
-        .filter(|dihedral| !dihedral.is_improper())
-        .map(|dihedral| {
-            let atoms = dihedral.atoms();
-            canonical_pair(atoms[0] + 1, atoms[3] + 1)
-        })
+        .one_four_pairs()
+        .into_iter()
+        .map(|(pair, _, _)| canonical_pair(pair[0] + 1, pair[1] + 1))
         .collect()
 }
 

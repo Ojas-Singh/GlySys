@@ -87,6 +87,39 @@ impl System {
     pub(crate) fn charge(&self) -> f64 {
         self.atoms.iter().map(|atom| atom.charge).sum()
     }
+
+    /// Scaled 1-4 pairs as tleap defines them: end atoms of proper torsions,
+    /// once per pair, excluding pairs that are also 1-2 or 1-3 neighbours
+    /// (atoms across a five-membered ring).  Returns ((i, j), scee, scnb).
+    pub(crate) fn one_four_pairs(&self) -> Vec<([usize; 2], f64, f64)> {
+        one_four_pairs(self.atoms.len(), &self.bonds, &self.dihedrals)
+    }
+}
+
+pub(crate) fn one_four_pairs(
+    atom_count: usize,
+    bonds: &[Bond],
+    dihedrals: &[Dihedral],
+) -> Vec<([usize; 2], f64, f64)> {
+    let mut neighbors = vec![Vec::new(); atom_count];
+    for bond in bonds {
+        neighbors[bond.atoms[0]].push(bond.atoms[1]);
+        neighbors[bond.atoms[1]].push(bond.atoms[0]);
+    }
+    let close = |a: usize, b: usize| {
+        neighbors[a].contains(&b) || neighbors[a].iter().any(|&m| neighbors[m].contains(&b))
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::new();
+    for dihedral in dihedrals.iter().filter(|dihedral| !dihedral.improper) {
+        let (a, b) = (dihedral.atoms[0], dihedral.atoms[3]);
+        let pair = [a.min(b), a.max(b)];
+        if a == b || close(a, b) || !seen.insert(pair) {
+            continue;
+        }
+        pairs.push((pair, dihedral.scee, dihedral.scnb));
+    }
+    pairs
 }
 
 /// A fully parameterized and solvated system ready to be written.
@@ -134,6 +167,11 @@ impl ParameterizedSystem {
         &self.system.angles
     }
 
+    /// Scaled 1-4 pairs ((i, j), scee, scnb), consistent with tleap.
+    pub fn one_four_pairs(&self) -> Vec<([usize; 2], f64, f64)> {
+        self.system.one_four_pairs()
+    }
+
     pub fn dihedrals(&self) -> &[Dihedral] {
         &self.system.dihedrals
     }
@@ -148,6 +186,64 @@ impl ParameterizedSystem {
 
     pub fn metadata(&self) -> &SystemMetadata {
         &self.metadata
+    }
+
+    /// The solute alone, without added water, ions or periodic box, as a
+    /// preparation with `add_water = false` would produce it.
+    pub fn solute(&self) -> Self {
+        let n = self.system.solute_atom_count;
+        let system = &self.system;
+        let within = |atoms: &[usize]| atoms.iter().all(|&atom| atom < n);
+        let solute = System {
+            atoms: system.atoms[..n].to_vec(),
+            residues: system
+                .residues
+                .iter()
+                .filter(|residue| residue.first_atom < n)
+                .cloned()
+                .collect(),
+            bonds: system
+                .bonds
+                .iter()
+                .filter(|bond| within(&bond.atoms))
+                .copied()
+                .collect(),
+            angles: system
+                .angles
+                .iter()
+                .filter(|angle| within(&angle.atoms))
+                .copied()
+                .collect(),
+            dihedrals: system
+                .dihedrals
+                .iter()
+                .filter(|dihedral| within(&dihedral.atoms))
+                .cloned()
+                .collect(),
+            exclusions: system.exclusions[..n].to_vec(),
+            box_angstrom: [0.0; 3],
+            component_count: system.component_count,
+            solute_atom_count: n,
+            water_residue_count: 0,
+            sodium_count: 0,
+            chloride_count: 0,
+        };
+        let mut report = self.report.clone();
+        report.options.add_water = false;
+        report.options.add_ions = false;
+        report.output_sha256.clear();
+        report.total_atoms = n;
+        report.residues = solute.residues.len();
+        report.waters = 0;
+        report.sodium_ions = 0;
+        report.chloride_ions = 0;
+        report.total_charge = report.solute_charge;
+        report.box_angstrom = [0.0; 3];
+        Self {
+            system: solute,
+            report,
+            metadata: self.metadata.clone(),
+        }
     }
 
     /// Return the current Cartesian coordinates in Å.
@@ -440,4 +536,53 @@ fn atomic_write(path: PathBuf, contents: &[u8]) -> Result<()> {
     ));
     std::fs::write(&temporary, contents).map_err(crate::error::write_error(temporary.clone()))?;
     std::fs::rename(&temporary, &path).map_err(crate::error::write_error(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bond(a: usize, b: usize) -> Bond {
+        Bond {
+            atoms: [a, b],
+            force: 1.0,
+            length: 1.0,
+        }
+    }
+
+    fn torsion(atoms: [usize; 4]) -> Dihedral {
+        Dihedral {
+            atoms,
+            force: 1.0,
+            periodicity: 3,
+            phase: 0.0,
+            improper: false,
+            scee: 1.2,
+            scnb: 2.0,
+        }
+    }
+
+    #[test]
+    fn five_ring_torsions_do_not_scale_one_three_pairs() {
+        // Cyclopentane ring 0-1-2-3-4 with substituent 5 on atom 0.
+        let bonds = [
+            bond(0, 1),
+            bond(1, 2),
+            bond(2, 3),
+            bond(3, 4),
+            bond(4, 0),
+            bond(0, 5),
+        ];
+        let dihedrals = [
+            torsion([0, 1, 2, 3]), // 0 and 3 are 1-3 through 4
+            torsion([5, 0, 1, 2]), // a genuine 1-4 pair
+            torsion([5, 0, 4, 3]), // 5-3: genuine
+            torsion([2, 1, 0, 5]), // duplicate of 5-2
+        ];
+        let pairs = one_four_pairs(6, &bonds, &dihedrals)
+            .into_iter()
+            .map(|(pair, _, _)| pair)
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, vec![[2, 5], [3, 5]]);
+    }
 }

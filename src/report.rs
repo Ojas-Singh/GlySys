@@ -62,6 +62,9 @@ pub(crate) fn force_field_versions() -> BTreeMap<String, String> {
         ("carbohydrate", "GLYCAM06j-1"),
         ("water", "Amber TIP3P"),
         ("ions", "Joung-Chetham Na+/Cl- for TIP3P"),
+        ("nucleic_acids", "Amber OL15 DNA, OL3 RNA"),
+        ("metal_ions", "Li-Merz 12-6 for TIP3P"),
+        ("small_molecules", "OpenFF Sage 2.2.1, AM1-BCC"),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))

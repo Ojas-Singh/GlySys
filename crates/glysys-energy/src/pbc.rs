@@ -513,14 +513,11 @@ impl<'a> PbcForceField<'a> {
                 "periodic force field needs at least one atom".into(),
             ));
         }
-        let mut one_four = HashMap::new();
-        for torsion in system.dihedrals().iter().filter(|t| !t.is_improper()) {
-            let atoms = torsion.atoms();
-            one_four.entry(ordered(atoms[0], atoms[3])).or_insert((
-                torsion.electrostatic_14_scale(),
-                torsion.lennard_jones_14_scale(),
-            ));
-        }
+        let one_four = system
+            .one_four_pairs()
+            .into_iter()
+            .map(|(pair, scee, scnb)| (ordered(pair[0], pair[1]), (scee, scnb)))
+            .collect::<HashMap<_, _>>();
         let mut one_four_atoms = vec![false; system.atom_count()];
         for &(a, b) in one_four.keys() {
             one_four_atoms[a] = true;

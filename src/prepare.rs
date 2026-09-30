@@ -3,18 +3,33 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::fix::ComponentLibrary;
 use crate::forcefield::{ParameterSet, Template, TemplateSet};
+use crate::ligand::{ExplicitTerms, canonical};
 use crate::model::{Angle, Atom, Bond, Dihedral, ParameterizedSystem, Residue, System, Vec3};
 use crate::pdb::{self, PROTEIN_RESIDUES, ParsedPdb, PdbResidue};
 use crate::report::BuildReport;
+use crate::smirnoff::ForceField;
 use crate::{BuildError, BuildOptions, BuildWarning, Result, Structure};
 
 /// Reusable builder containing validated options and immutable force-field data.
-#[derive(Debug)]
 pub struct SystemBuilder {
     options: BuildOptions,
     templates: TemplateSet,
     parameters: ParameterSet,
+    /// Chemical Component Dictionary definitions for small molecules.
+    components: ComponentLibrary,
+    small_molecules: std::sync::OnceLock<std::result::Result<ForceField, String>>,
+}
+
+impl std::fmt::Debug for SystemBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SystemBuilder")
+            .field("options", &self.options)
+            .field("components", &self.components.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SystemBuilder {
@@ -24,11 +39,42 @@ impl SystemBuilder {
             options,
             templates: TemplateSet::load()?,
             parameters: ParameterSet::load()?,
+            components: ComponentLibrary::new(),
+            small_molecules: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Chemical component definitions used to parameterize ligands with
+    /// OpenFF Sage 2.2.1 and AM1-BCC charges.
+    pub fn with_components(mut self, components: ComponentLibrary) -> Self {
+        self.components = components;
+        self
+    }
+
+    pub fn components_mut(&mut self) -> &mut ComponentLibrary {
+        &mut self.components
+    }
+
+    fn small_molecule_force_field(&self) -> Result<&ForceField> {
+        self.small_molecules
+            .get_or_init(|| ForceField::sage().map_err(|error| error.0))
+            .as_ref()
+            .map_err(|error| BuildError::ForceField(error.clone()))
     }
 
     pub fn options(&self) -> &BuildOptions {
         &self.options
+    }
+
+    /// Chemical component IDs in `contents` (ligands, cofactors, modified
+    /// residues) whose CCD definitions preparation and repair can use.
+    pub fn component_requests(&self, contents: &str) -> Result<Vec<String>> {
+        crate::StructureFixer::new(crate::FixOptions {
+            model: self.options.model,
+            altloc: self.options.altloc,
+            ..crate::FixOptions::default()
+        })?
+        .component_requests(contents)
     }
 
     pub fn prepare_pdb(&self, path: impl AsRef<Path>) -> Result<ParameterizedSystem> {
@@ -60,6 +106,7 @@ impl SystemBuilder {
                     && !pdb::is_water(name)
                     && !pdb::is_free_ion(name)
                     && self.templates.glycan(name).is_none()
+                    && self.components.get(name).is_none()
                     && !matches!(
                         name,
                         "NAG"
@@ -120,9 +167,47 @@ impl SystemBuilder {
     }
 
     pub fn prepare_pdb_str(&self, contents: &str) -> Result<ParameterizedSystem> {
-        let structure = crate::read_pdb_str(contents, &self.options)?;
         let input_sha256 = format!("{:x}", Sha256::digest(contents.as_bytes()));
+        if self.options.repair {
+            let (repaired, note) = self.repair(contents)?;
+            // The repaired file holds only the selected model and altloc.
+            let mut options = self.options.clone();
+            options.model = 1;
+            options.altloc = None;
+            let structure = crate::read_pdb_str(&repaired, &options)?;
+            let mut prepared = self.prepare_structure_with_hash(&structure, input_sha256)?;
+            prepared
+                .report
+                .warnings
+                .insert(0, BuildWarning::StructureRepaired(note));
+            return Ok(prepared);
+        }
+        let structure = crate::read_pdb_str(contents, &self.options)?;
         self.prepare_structure_with_hash(&structure, input_sha256)
+    }
+
+    /// Run the structure fixer as preparation does: internal gaps only,
+    /// crystal water removed, every other repair enabled.
+    fn repair(&self, contents: &str) -> Result<(String, String)> {
+        let fixer = crate::StructureFixer::new(crate::FixOptions {
+            model: self.options.model,
+            altloc: self.options.altloc,
+            protonation: self.options.protonation.clone(),
+            missing_residues: crate::MissingResidues::Internal,
+            keep_water: false,
+            ..crate::FixOptions::default()
+        })?
+        .with_components(self.components.clone());
+        let fixed = fixer.fix_pdb_str(contents)?;
+        let report = &fixed.report;
+        let note = format!(
+            "structure repaired: {} heavy atoms rebuilt, {} residues modelled, {} modified residues replaced, {} hydrogens added",
+            report.heavy_atoms_added,
+            report.residues_added,
+            report.replaced_residues.len(),
+            report.hydrogens_added
+        );
+        Ok((fixed.pdb, note))
     }
 
     /// Parameterize an editable structure without serializing and reparsing it.
@@ -156,7 +241,34 @@ impl SystemBuilder {
         });
         let charge_tolerance = if has_sulfated_gag { 0.15 } else { 1.0e-3 };
         if (solute_charge - rounded_charge).abs() > charge_tolerance {
-            return Err(BuildError::NonIntegralCharge(solute_charge));
+            // Name the residues whose charge is fractional (usually a glycan
+            // template chosen without one of its linkages).
+            let fractional = system
+                .residues
+                .iter()
+                .filter_map(|residue| {
+                    let charge: f64 = system.atoms[residue.atom_range()]
+                        .iter()
+                        .map(|a| a.charge)
+                        .sum();
+                    ((charge - charge.round()).abs() > 0.01).then(|| {
+                        format!(
+                            "{}:{}{} {} {charge:+.3}",
+                            residue.chain,
+                            residue.number,
+                            residue.insertion_code.map(String::from).unwrap_or_default(),
+                            residue.name
+                        )
+                    })
+                })
+                .take(12)
+                .collect::<Vec<_>>();
+            let detail = if fractional.is_empty() {
+                String::new()
+            } else {
+                format!(" (fractional residues: {})", fractional.join(", "))
+            };
+            return Err(BuildError::NonIntegralCharge(solute_charge, detail));
         }
         if self.options.add_water {
             crate::solvate::solvate_and_ionize(
@@ -268,33 +380,147 @@ impl SystemBuilder {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let declared_bonds = declared_atom_bonds(parsed);
+        let mut declared_bonds = declared_atom_bonds(parsed);
+        let mut inferred_links = inferred_glycosylation_links(&kept, &declared_bonds);
+        split_reducing_hydroxyls(
+            &mut kept,
+            &declared_bonds,
+            &mut inferred_links,
+            &self.templates,
+            warnings,
+        );
+        for link in &inferred_links {
+            declared_bonds.push((
+                (
+                    link.first.chain.clone(),
+                    link.first.number,
+                    link.first_atom.clone(),
+                ),
+                (
+                    link.second.chain.clone(),
+                    link.second.number,
+                    link.second_atom.clone(),
+                ),
+            ));
+        }
         normalize_special_residues(&mut kept, &declared_bonds, protonation, warnings);
         normalize_disulfides(&mut kept, &parsed.ssbonds);
         let terminal = protein_terminal_flags(&kept);
+        let nucleic = nucleic_terminal_flags(&kept);
+        for (index, residue) in kept.iter_mut().enumerate() {
+            // Amber has no 5'-phosphate terminal residues: drop the phosphate.
+            if nucleic.get(&index).is_some_and(|(five, _)| *five)
+                && residue.atoms.iter().any(|atom| atom.name == "P")
+            {
+                residue.atoms.retain(|atom| {
+                    !matches!(
+                        atom.name.as_str(),
+                        "P" | "OP1" | "OP2" | "OP3" | "HOP3" | "HOP2"
+                    )
+                });
+                warnings.push(BuildWarning::TerminalPhosphateRemoved(format!(
+                    "{}",
+                    residue.reference
+                )));
+            }
+        }
 
         let mut atoms = Vec::new();
         let mut residues = Vec::new();
         let mut bonds = Vec::<[usize; 2]>::new();
         let mut serial_to_atom = HashMap::new();
         let mut residue_atom = HashMap::<(usize, String), usize>::new();
+        let mut explicit = ExplicitTerms::default();
 
         for (residue_index, residue) in kept.iter().enumerate() {
             let name = residue.reference.name.as_str();
             let (n_terminal, c_terminal) =
                 terminal.get(&residue_index).copied().unwrap_or_default();
-            let template = if PROTEIN_RESIDUES.contains(&name) {
-                self.templates.protein(name, n_terminal, c_terminal)
+            let is_nucleic = pdb::NUCLEIC_RESIDUES.contains(&name);
+            let is_ion = pdb::is_metal_ion(name);
+            // A GLYCAM code is used only when the residue's heavy atoms fit
+            // it; otherwise a same-named CCD component (e.g. ASA) wins.
+            let glycam_fits = |template: &Template| {
+                residue
+                    .atoms
+                    .iter()
+                    .filter(|atom| atom.element != "H" && atom.element != "D")
+                    .all(|atom| template.atom(&atom.name).is_some())
+            };
+            let chosen = if PROTEIN_RESIDUES.contains(&name) {
+                Ok(self.templates.protein(name, n_terminal, c_terminal))
+            } else if is_nucleic {
+                let (five, three) = nucleic.get(&residue_index).copied().unwrap_or((true, true));
+                Ok(self.templates.nucleic(name, five, three))
+            } else if is_ion {
+                Ok(self.templates.ion(&name.to_ascii_uppercase()))
             } else if let Some(template) = self.templates.glycan(name) {
-                Some(template)
+                if glycam_fits(template) || self.components.get(name).is_none() {
+                    Ok(Some(template))
+                } else {
+                    Err(BuildError::UnsupportedResidue {
+                        residue: residue.reference.to_string(),
+                        reason: format!("atoms do not match GLYCAM residue {name}"),
+                    })
+                }
             } else {
-                let glycam_name =
-                    infer_glycam_template_name(residue, &kept, &declared_bonds, &self.templates)?;
-                warnings.push(BuildWarning::GlycanNameNormalized(format!(
-                    "{} -> {glycam_name}",
-                    residue.reference
-                )));
-                self.templates.glycan(&glycam_name)
+                match infer_glycam_template_name(residue, &kept, &declared_bonds, &self.templates) {
+                    Ok(glycam_name) => {
+                        warnings.push(BuildWarning::GlycanNameNormalized(format!(
+                            "{} -> {glycam_name}",
+                            residue.reference
+                        )));
+                        Ok(self.templates.glycan(&glycam_name))
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            let template = match chosen {
+                Ok(template) => template,
+                Err(error) => {
+                    // Anything else with a chemical component definition
+                    // is a small molecule for the generic force field.
+                    let Some(component) = self.components.get(name) else {
+                        return Err(error);
+                    };
+                    let first_atom = atoms.len();
+                    let ligand = crate::ligand::parameterize(
+                        residue,
+                        component,
+                        self.small_molecule_force_field()?,
+                        residue_index,
+                        &mut explicit,
+                        first_atom,
+                    )?;
+                    for (offset, &source) in ligand.order.iter().enumerate() {
+                        serial_to_atom.insert(residue.atoms[source].serial, first_atom + offset);
+                        residue_atom.insert(
+                            (residue_index, ligand.atoms[offset].name.clone()),
+                            first_atom + offset,
+                        );
+                    }
+                    bonds.extend(
+                        ligand
+                            .bonds
+                            .iter()
+                            .map(|&[a, b]| [first_atom + a, first_atom + b]),
+                    );
+                    residues.push(Residue {
+                        name: residue.reference.name.clone(),
+                        number: residue.reference.number,
+                        insertion_code: residue.reference.insertion_code,
+                        chain: residue.reference.chain.clone(),
+                        first_atom,
+                        atom_count: ligand.atoms.len(),
+                        component: 0,
+                    });
+                    warnings.push(BuildWarning::SmallMoleculeParameterized(format!(
+                        "{}: OpenFF Sage 2.2.1 with AM1-BCC charges, net charge {}",
+                        residue.reference, ligand.charge
+                    )));
+                    atoms.extend(ligand.atoms);
+                    continue;
+                }
             }
             .ok_or_else(|| BuildError::UnsupportedResidue {
                 residue: residue.reference.to_string(),
@@ -306,11 +532,12 @@ impl SystemBuilder {
                 .iter()
                 .map(|atom| (atom.name.as_str(), atom))
                 .collect::<HashMap<_, _>>();
-            let generated_glycan_hydrogens = if PROTEIN_RESIDUES.contains(&name) {
-                HashMap::new()
-            } else {
-                glycan_hydrogen_positions(template, residue, &kept)
-            };
+            let generated_glycan_hydrogens =
+                if PROTEIN_RESIDUES.contains(&name) || is_nucleic || is_ion {
+                    HashMap::new()
+                } else {
+                    glycan_hydrogen_positions(template, residue, &kept)
+                };
             let missing = template
                 .atoms
                 .iter()
@@ -324,7 +551,7 @@ impl SystemBuilder {
             // atoms remain hard errors because inventing peptide connectivity
             // would hide a genuinely incomplete model.
             let protein_heavy_transform = if !missing.is_empty()
-                && PROTEIN_RESIDUES.contains(&name)
+                && (PROTEIN_RESIDUES.contains(&name) || is_nucleic)
                 && missing
                     .iter()
                     .all(|atom| !matches!(atom.as_str(), "N" | "CA" | "C" | "O"))
@@ -442,6 +669,20 @@ impl SystemBuilder {
                 bonds.push([first, second]);
             }
         }
+        // Nucleic-acid phosphodiester bonds.
+        for (first_index, pair) in kept.windows(2).enumerate() {
+            let second_index = first_index + 1;
+            if nucleic.get(&first_index).is_some_and(|(_, three)| !three)
+                && nucleic.get(&second_index).is_some_and(|(five, _)| !five)
+                && let (Some(&first), Some(&second)) = (
+                    residue_atom.get(&(first_index, "O3'".into())),
+                    residue_atom.get(&(second_index, "P".into())),
+                )
+                && pair[0].reference.chain == pair[1].reference.chain
+            {
+                bonds.push([first, second]);
+            }
+        }
         // PDB-declared bonds and conservative carbohydrate/attachment distance bonds.
         for (first_serial, second_serial) in &parsed.conect {
             if let (Some(&first), Some(&second)) = (
@@ -451,7 +692,7 @@ impl SystemBuilder {
                 bonds.push([first, second]);
             }
         }
-        for link in &parsed.links {
+        for link in parsed.links.iter().chain(&inferred_links) {
             let first_residue = find_residue_index(&kept, &link.first);
             let second_residue = find_residue_index(&kept, &link.second);
             if let (Some(first_residue), Some(second_residue)) = (first_residue, second_residue)
@@ -480,6 +721,11 @@ impl SystemBuilder {
                 bonds.push([first, second]);
             }
         }
+        // Metal ions use a nonbonded model: coordination LINK/CONECT records
+        // are not covalent bonds.
+        bonds.retain(|[first, second]| {
+            !is_metal_element(atoms[*first].element) && !is_metal_element(atoms[*second].element)
+        });
         for bond in &mut bonds {
             if bond[0] > bond[1] {
                 bond.swap(0, 1);
@@ -492,7 +738,7 @@ impl SystemBuilder {
             molecular_components(kept.len(), &bonds, &atoms);
         order_molecular_components(&mut atoms, &mut residues, &mut bonds, &component_by_residue);
         let (bonds, angles, dihedrals, exclusions) =
-            enumerate_parameters(&atoms, &bonds, &self.parameters)?;
+            enumerate_parameters(&atoms, &bonds, &self.parameters, &explicit)?;
         let atom_count = atoms.len();
         Ok(System {
             atoms,
@@ -578,8 +824,8 @@ fn selector(residue: &PdbResidue) -> String {
     .to_string()
 }
 
-type AtomLocator = (String, i32, String);
-type DeclaredAtomBond = (AtomLocator, AtomLocator);
+pub(crate) type AtomLocator = (String, i32, String);
+pub(crate) type DeclaredAtomBond = (AtomLocator, AtomLocator);
 
 fn declared_atom_bonds(parsed: &ParsedPdb) -> Vec<DeclaredAtomBond> {
     let by_serial = parsed
@@ -688,7 +934,51 @@ fn normalize_special_residues(
     }
 }
 
+fn is_metal_element(element: u8) -> bool {
+    matches!(element, 12 | 20 | 25 | 26 | 27 | 28 | 29 | 30 | 48 | 80)
+}
+
+/// (5'-terminal, 3'-terminal) for nucleotides, from O3'-P connectivity.
+fn nucleic_terminal_flags(residues: &[PdbResidue]) -> HashMap<usize, (bool, bool)> {
+    let position = |residue: &PdbResidue, name: &str| {
+        residue
+            .atoms
+            .iter()
+            .find(|atom| atom.name == name)
+            .map(|atom| atom.position)
+    };
+    let mut flags = HashMap::new();
+    for (index, residue) in residues.iter().enumerate() {
+        if pdb::NUCLEIC_RESIDUES.contains(&residue.reference.name.as_str()) {
+            flags.insert(index, (true, true));
+        }
+    }
+    for index in 1..residues.len() {
+        let (previous, current) = (&residues[index - 1], &residues[index]);
+        if !flags.contains_key(&(index - 1))
+            || !flags.contains_key(&index)
+            || previous.reference.chain != current.reference.chain
+        {
+            continue;
+        }
+        if let (Some(o3), Some(p)) = (position(previous, "O3'"), position(current, "P"))
+            && o3.distance2(p) < 2.2 * 2.2
+        {
+            flags.get_mut(&(index - 1)).unwrap().1 = false;
+            flags.get_mut(&index).unwrap().0 = false;
+        }
+    }
+    flags
+}
+
 fn protein_terminal_flags(residues: &[PdbResidue]) -> HashMap<usize, (bool, bool)> {
+    let position = |residue: &PdbResidue, name: &str| {
+        residue
+            .atoms
+            .iter()
+            .find(|atom| atom.name == name)
+            .map(|atom| atom.position)
+    };
     let mut by_chain: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, residue) in residues.iter().enumerate() {
         if PROTEIN_RESIDUES.contains(&residue.reference.name.as_str()) {
@@ -700,14 +990,271 @@ fn protein_terminal_flags(residues: &[PdbResidue]) -> HashMap<usize, (bool, bool
     }
     let mut result = HashMap::new();
     for indices in by_chain.values() {
-        for (position, &index) in indices.iter().enumerate() {
-            result.insert(index, (position == 0, position + 1 == indices.len()));
+        // A missing peptide bond (C-N beyond 2 Å) splits the chain into
+        // separately capped segments, as the structure fixer does.
+        let mut segments: Vec<Vec<usize>> = Vec::new();
+        for &index in indices {
+            let continues = segments
+                .last()
+                .and_then(|segment| segment.last())
+                .is_some_and(|&previous| {
+                    previous + 1 == index
+                        && match (
+                            position(&residues[previous], "C"),
+                            position(&residues[index], "N"),
+                        ) {
+                            (Some(c), Some(n)) => c.distance2(n) <= 2.0 * 2.0,
+                            _ => true,
+                        }
+                });
+            if continues {
+                segments.last_mut().unwrap().push(index);
+            } else {
+                segments.push(vec![index]);
+            }
+        }
+        for segment in segments {
+            for (position, &index) in segment.iter().enumerate() {
+                result.insert(index, (position == 0, position + 1 == segment.len()));
+            }
         }
     }
     result
 }
 
-fn infer_glycam_template_name(
+/// A free reducing sugar (O1 not bonded to another residue) is a GLYCAM
+/// residue plus an ROH aglycone: move O1 and its hydrogen into ROH.
+fn split_reducing_hydroxyls(
+    residues: &mut Vec<PdbResidue>,
+    declared: &[DeclaredAtomBond],
+    links: &mut Vec<pdb::DeclaredLink>,
+    templates: &TemplateSet,
+    warnings: &mut Vec<BuildWarning>,
+) {
+    let mut index = 0;
+    while index < residues.len() {
+        let residue = &residues[index];
+        let name = residue.reference.name.as_str();
+        let sugar = !PROTEIN_RESIDUES.contains(&name)
+            && !pdb::NUCLEIC_RESIDUES.contains(&name)
+            && name != "ROH"
+            && residue.atoms.iter().any(|atom| atom.name == "C1")
+            && residue.atoms.iter().any(|atom| atom.name == "O5")
+            && (templates.glycan(name).is_some()
+                || matches!(
+                    name,
+                    "NAG"
+                        | "NDG"
+                        | "MAN"
+                        | "BMA"
+                        | "GLC"
+                        | "BGC"
+                        | "GAL"
+                        | "GLA"
+                        | "FUC"
+                        | "FUL"
+                        | "XYS"
+                        | "XYP"
+                ));
+        let o1_bonded = declared.iter().any(|(a, b)| {
+            let this = |x: &AtomLocator| {
+                x.0 == residue.reference.chain && x.1 == residue.reference.number && x.2 == "O1"
+            };
+            (this(a) && (b.0 != a.0 || b.1 != a.1)) || (this(b) && (a.0 != b.0 || a.1 != b.1))
+        });
+        let Some(o1) = residue.atoms.iter().find(|atom| atom.name == "O1").cloned() else {
+            index += 1;
+            continue;
+        };
+        if !sugar || o1_bonded {
+            index += 1;
+            continue;
+        }
+        let mut cap = PdbResidue {
+            reference: crate::report::ResidueRef {
+                chain: residue.reference.chain.clone(),
+                name: "ROH".into(),
+                number: residue.reference.number,
+                insertion_code: Some('R'),
+            },
+            atoms: Vec::new(),
+        };
+        let sugar_key = pdb::ResidueKey {
+            chain: residue.reference.chain.clone(),
+            number: residue.reference.number,
+            insertion_code: residue.reference.insertion_code,
+        };
+        let residue = &mut residues[index];
+        residue.atoms.retain(|atom| {
+            let hydroxyl_h = matches!(atom.element.as_str(), "H" | "D")
+                && atom.position.distance2(o1.position) < 1.2 * 1.2;
+            if atom.name == "O1" || hydroxyl_h {
+                let mut moved = atom.clone();
+                moved.name = if atom.name == "O1" {
+                    "O1".into()
+                } else {
+                    "HO1".into()
+                };
+                moved.residue_name = "ROH".into();
+                moved.insertion_code = Some('R');
+                cap.atoms.push(moved);
+                false
+            } else {
+                true
+            }
+        });
+        warnings.push(BuildWarning::GlycanNameNormalized(format!(
+            "{}: reducing-end O1 represented by a GLYCAM ROH residue",
+            residue.reference
+        )));
+        links.push(pdb::DeclaredLink {
+            first: sugar_key,
+            first_atom: "C1".into(),
+            second: pdb::ResidueKey {
+                chain: cap.reference.chain.clone(),
+                number: cap.reference.number,
+                insertion_code: Some('R'),
+            },
+            second_atom: "O1".into(),
+        });
+        residues.insert(index, cap);
+        index += 2;
+    }
+}
+
+/// Protein-glycan bonds present in the coordinates but not declared by
+/// LINK/CONECT records (common in older entries).
+fn inferred_glycosylation_links(
+    residues: &[PdbResidue],
+    declared: &[DeclaredAtomBond],
+) -> Vec<pdb::DeclaredLink> {
+    let mut links = Vec::new();
+    for protein in residues {
+        let attachment = match protein.reference.name.as_str() {
+            "ASN" | "NLN" => "ND2",
+            "SER" | "OLS" => "OG",
+            "THR" | "OLT" => "OG1",
+            "HYP" | "OLP" => "OD1",
+            _ => continue,
+        };
+        // Only inter-residue records count; CONECT often lists intra-residue bonds.
+        let inter = |(a, b): &&DeclaredAtomBond| a.0 != b.0 || a.1 != b.1;
+        let already = declared.iter().filter(inter).any(|(a, b)| {
+            (a.0 == protein.reference.chain && a.1 == protein.reference.number && a.2 == attachment)
+                || (b.0 == protein.reference.chain
+                    && b.1 == protein.reference.number
+                    && b.2 == attachment)
+        });
+        let Some(anchor) = protein.atoms.iter().find(|atom| atom.name == attachment) else {
+            continue;
+        };
+        if already {
+            continue;
+        }
+        for sugar in residues {
+            if PROTEIN_RESIDUES.contains(&sugar.reference.name.as_str()) {
+                continue;
+            }
+            // Bonded geometry, or a reducing-end sugar (no O1, C1 otherwise
+            // unbonded) left within 3 Å of the attachment atom by a
+            // low-resolution model.
+            let reducing_end = sugar.atoms.iter().all(|atom| atom.name != "O1")
+                && !declared.iter().filter(inter).any(|(a, b)| {
+                    (a.0 == sugar.reference.chain && a.1 == sugar.reference.number && a.2 == "C1")
+                        || (b.0 == sugar.reference.chain
+                            && b.1 == sugar.reference.number
+                            && b.2 == "C1")
+                });
+            let limit = if reducing_end { 3.0 } else { 1.75 };
+            if let Some(c1) = sugar.atoms.iter().find(|atom| atom.name == "C1")
+                && c1.position.distance2(anchor.position) < limit * limit
+                && !links.iter().any(|link: &pdb::DeclaredLink| {
+                    link.second.chain == sugar.reference.chain
+                        && link.second.number == sugar.reference.number
+                })
+            {
+                links.push(pdb::DeclaredLink {
+                    first: pdb::ResidueKey {
+                        chain: protein.reference.chain.clone(),
+                        number: protein.reference.number,
+                        insertion_code: protein.reference.insertion_code,
+                    },
+                    first_atom: attachment.into(),
+                    second: pdb::ResidueKey {
+                        chain: sugar.reference.chain.clone(),
+                        number: sugar.reference.number,
+                        insertion_code: sugar.reference.insertion_code,
+                    },
+                    second_atom: "C1".into(),
+                });
+            }
+        }
+    }
+    // Glycosidic bonds: a carbohydrate carbon within 1.65 Å of an oxygen or
+    // nitrogen of another carbohydrate residue.
+    let is_sugar = |residue: &PdbResidue| {
+        let name = residue.reference.name.as_str();
+        !PROTEIN_RESIDUES.contains(&name)
+            && !pdb::NUCLEIC_RESIDUES.contains(&name)
+            && !pdb::is_water(name)
+            && residue.atoms.iter().any(|atom| atom.name == "C1")
+            && residue
+                .atoms
+                .iter()
+                .any(|atom| atom.name == "O5" || atom.name == "O6")
+    };
+    let key = |residue: &PdbResidue| pdb::ResidueKey {
+        chain: residue.reference.chain.clone(),
+        number: residue.reference.number,
+        insertion_code: residue.reference.insertion_code,
+    };
+    for (i, first) in residues.iter().enumerate() {
+        if !is_sugar(first) {
+            continue;
+        }
+        for carbon in first.atoms.iter().filter(|atom| atom.element == "C") {
+            for (j, second) in residues.iter().enumerate() {
+                if i == j || !is_sugar(second) {
+                    continue;
+                }
+                for other in second
+                    .atoms
+                    .iter()
+                    .filter(|atom| matches!(atom.element.as_str(), "O" | "N"))
+                {
+                    if carbon.position.distance2(other.position) >= 1.65 * 1.65 {
+                        continue;
+                    }
+                    let declared_already = declared.iter().any(|(a, b)| {
+                        (a.0 == first.reference.chain
+                            && a.1 == first.reference.number
+                            && a.2 == carbon.name
+                            && b.0 == second.reference.chain
+                            && b.1 == second.reference.number
+                            && b.2 == other.name)
+                            || (b.0 == first.reference.chain
+                                && b.1 == first.reference.number
+                                && b.2 == carbon.name
+                                && a.0 == second.reference.chain
+                                && a.1 == second.reference.number
+                                && a.2 == other.name)
+                    });
+                    if !declared_already {
+                        links.push(pdb::DeclaredLink {
+                            first: key(first),
+                            first_atom: carbon.name.clone(),
+                            second: key(second),
+                            second_atom: other.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    links
+}
+
+pub(crate) fn infer_glycam_template_name(
     residue: &PdbResidue,
     all: &[PdbResidue],
     bonds: &[DeclaredAtomBond],
@@ -958,7 +1505,7 @@ fn hydrogen_transform(
 /// from the experimental heavy atoms.  One-heavy-neighbor groups (OH, CH3)
 /// retain their template cone geometry and sample its free torsion to avoid
 /// nonbonded heavy-atom clashes.
-fn glycan_hydrogen_positions(
+pub(crate) fn glycan_hydrogen_positions(
     template: &Template,
     residue: &PdbResidue,
     residues: &[PdbResidue],
@@ -1544,12 +2091,49 @@ fn enumerate_parameters(
     atoms: &[Atom],
     raw_bonds: &[[usize; 2]],
     parameters: &ParameterSet,
+    explicit: &ExplicitTerms,
 ) -> Result<Enumerated> {
+    // Terms touching a small molecule come from its own assignment; a term
+    // spanning a small molecule and anything else would be a covalent link
+    // the generic force field cannot parameterize.
+    let covalent = |indices: &[usize]| -> Result<bool> {
+        let inside = indices.iter().filter(|&&i| explicit.contains(i)).count();
+        if inside == 0 {
+            Ok(false)
+        } else if inside == indices.len() {
+            Ok(true)
+        } else {
+            Err(BuildError::UnsupportedResidue {
+                residue: format!(
+                    "atoms {}",
+                    indices
+                        .iter()
+                        .map(|i| atoms[*i].name.clone())
+                        .collect::<Vec<_>>()
+                        .join("-")
+                ),
+                reason: "covalently bound small molecules are not supported".into(),
+            })
+        }
+    };
     let mut adjacency = vec![Vec::new(); atoms.len()];
     let mut bonds = Vec::new();
     for &[first, second] in raw_bonds {
         adjacency[first].push(second);
         adjacency[second].push(first);
+        if covalent(&[first, second])? {
+            let bond = explicit
+                .bonds
+                .get(&canonical([first, second]))
+                .ok_or_else(|| {
+                    BuildError::ForceField(format!(
+                        "no small-molecule bond {}-{}",
+                        atoms[first].name, atoms[second].name
+                    ))
+                })?;
+            bonds.push(*bond);
+            continue;
+        }
         let parameter = parameters.bond(&atoms[first].atom_type, &atoms[second].atom_type)?;
         bonds.push(Bond {
             atoms: [first, second],
@@ -1567,6 +2151,19 @@ fn enumerate_parameters(
             for right_index in left_index + 1..adjacency[center].len() {
                 let left = adjacency[center][left_index];
                 let right = adjacency[center][right_index];
+                if covalent(&[left, center, right])? {
+                    let angle = explicit
+                        .angles
+                        .get(&canonical([left, center, right]))
+                        .ok_or_else(|| {
+                            BuildError::ForceField(format!(
+                                "no small-molecule angle at {}",
+                                atoms[center].name
+                            ))
+                        })?;
+                    angles.push(*angle);
+                    continue;
+                }
                 let parameter = parameters.angle(
                     &atoms[left].atom_type,
                     &atoms[center].atom_type,
@@ -1599,6 +2196,16 @@ fn enumerate_parameters(
                 if !proper_keys.insert(key) {
                     continue;
                 }
+                if covalent(&key)? {
+                    let terms = explicit.propers.get(&canonical(key)).ok_or_else(|| {
+                        BuildError::ForceField(format!(
+                            "no small-molecule torsion at {}",
+                            atoms[key[1]].name
+                        ))
+                    })?;
+                    dihedrals.extend(terms.iter().copied());
+                    continue;
+                }
                 for parameter in parameters.dihedrals([
                     &atoms[key[0]].atom_type,
                     &atoms[key[1]].atom_type,
@@ -1618,8 +2225,9 @@ fn enumerate_parameters(
             }
         }
     }
+    dihedrals.extend(explicit.impropers.iter().copied());
     for center in 0..atoms.len() {
-        if adjacency[center].len() < 3 {
+        if adjacency[center].len() < 3 || explicit.contains(center) {
             continue;
         }
         for first in 0..adjacency[center].len() - 2 {

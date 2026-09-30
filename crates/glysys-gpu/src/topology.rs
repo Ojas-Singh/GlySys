@@ -109,15 +109,11 @@ impl PreparedTopology {
             .iter()
             .map(|set| set.iter().map(|i| (*i, (0., 0.))).collect())
             .collect();
-        let mut scales = BTreeMap::new();
-        for t in system.dihedrals().iter().filter(|t| !t.is_improper()) {
-            let ids = t.atoms();
-            let key = (ids[0].min(ids[3]), ids[0].max(ids[3]));
-            scales.entry(key).or_insert((
-                t.electrostatic_14_scale() as f32,
-                t.lennard_jones_14_scale() as f32,
-            ));
-        }
+        let scales = system
+            .one_four_pairs()
+            .into_iter()
+            .map(|(pair, scee, scnb)| ((pair[0], pair[1]), (scee as f32, scnb as f32)))
+            .collect::<BTreeMap<_, _>>();
         for ((a, b), scale) in scales {
             exceptions[a].insert(b, scale);
             exceptions[b].insert(a, scale);

@@ -335,6 +335,47 @@ fn supports_water_without_ions_and_fully_dry_outputs() {
 }
 
 #[test]
+fn solute_of_a_solvated_system_matches_a_dry_build() {
+    let solvated = SystemBuilder::new(BuildOptions::default())
+        .unwrap()
+        .prepare_pdb_str(GLYCAN)
+        .unwrap();
+    let dry = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(GLYCAN)
+    .unwrap();
+    let solute = solvated.solute();
+    assert!(solvated.atom_count() > solute.atom_count());
+    assert_eq!(solute.atom_count(), dry.atom_count());
+    assert_eq!(solute.residues().len(), dry.residues().len());
+    assert_eq!(solute.bonds().len(), dry.bonds().len());
+    assert_eq!(solute.angles().len(), dry.angles().len());
+    assert_eq!(solute.dihedrals().len(), dry.dihedrals().len());
+    assert_eq!(solute.one_four_pairs(), dry.one_four_pairs());
+    assert_eq!(solute.box_angstrom(), [0.0; 3]);
+    assert_eq!(solute.report().waters, 0);
+    assert_eq!(solute.report().total_atoms, dry.report().total_atoms);
+    for (a, b) in solute.atoms().iter().zip(dry.atoms()) {
+        assert_eq!(a.name(), b.name());
+        assert_eq!(a.atom_type(), b.atom_type());
+        assert!((a.charge() - b.charge()).abs() < 1.0e-12);
+    }
+    // Solvation may translate the solute; internal geometry is unchanged.
+    let shift = |system: &glysys::ParameterizedSystem, i: usize| {
+        let (a, b) = (system.atoms()[0].position(), system.atoms()[i].position());
+        [b.x - a.x, b.y - a.y, b.z - a.z]
+    };
+    for i in 1..dry.atom_count() {
+        let (a, b) = (shift(&solute, i), shift(&dry, i));
+        assert!((0..3).all(|k| (a[k] - b[k]).abs() < 1.0e-6));
+    }
+}
+
+#[test]
 fn rejects_missing_heavy_atoms() {
     let incomplete = DIPEPTIDE.replace(
         "ATOM     19  O   GLY     2       7.395   6.219   0.000  1.00  0.00\n",

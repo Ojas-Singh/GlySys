@@ -1,0 +1,1845 @@
+{
+ "results": [
+  {
+   "id": "1CRN",
+   "category": "clean",
+   "note": "crambin, disulfides",
+   "input": {
+    "atoms": 327,
+    "heavy_atoms": 327,
+    "hydrogens": 0,
+    "residues": 46,
+    "standard_residues": 46,
+    "complete_standard_residues": 46,
+    "solvent_ion_residues": 0,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.171,
+    "output": {
+     "atoms": 642,
+     "heavy_atoms": 327,
+     "hydrogens": 315,
+     "residues": 46,
+     "standard_residues": 46,
+     "complete_standard_residues": 46,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 642
+     },
+     "seconds": 0.215
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.17,
+    "output": {
+     "atoms": 642,
+     "heavy_atoms": 327,
+     "hydrogens": 315,
+     "residues": 46,
+     "standard_residues": 46,
+     "complete_standard_residues": 46,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 642
+     },
+     "seconds": 0.168
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1UBQ",
+   "category": "clean",
+   "note": "ubiquitin with waters",
+   "input": {
+    "atoms": 660,
+    "heavy_atoms": 660,
+    "hydrogens": 0,
+    "residues": 134,
+    "standard_residues": 76,
+    "complete_standard_residues": 76,
+    "solvent_ion_residues": 58,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.342,
+    "output": {
+     "atoms": 1405,
+     "heavy_atoms": 660,
+     "hydrogens": 745,
+     "residues": 134,
+     "standard_residues": 76,
+     "complete_standard_residues": 76,
+     "solvent_ion_residues": 58,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 1405
+     },
+     "seconds": 0.189
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.184,
+    "output": {
+     "atoms": 1231,
+     "heavy_atoms": 602,
+     "hydrogens": 629,
+     "residues": 76,
+     "standard_residues": 76,
+     "complete_standard_residues": 76,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 1231
+     },
+     "seconds": 0.185
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "2PTC",
+   "category": "clean",
+   "note": "trypsin-BPTI complex",
+   "input": {
+    "atoms": 2241,
+    "heavy_atoms": 2241,
+    "hydrogens": 0,
+    "residues": 439,
+    "standard_residues": 281,
+    "complete_standard_residues": 281,
+    "solvent_ion_residues": 158,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.616,
+    "output": {
+     "atoms": 4584,
+     "heavy_atoms": 2241,
+     "hydrogens": 2343,
+     "residues": 439,
+     "standard_residues": 281,
+     "complete_standard_residues": 281,
+     "solvent_ion_residues": 158,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 4584
+     },
+     "seconds": 0.306
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.245,
+    "output": {
+     "atoms": 4112,
+     "heavy_atoms": 2083,
+     "hydrogens": 2029,
+     "residues": 281,
+     "standard_residues": 281,
+     "complete_standard_residues": 281,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 4112
+     },
+     "seconds": 0.28
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1EJG",
+   "category": "altloc",
+   "note": "crambin 0.54 A, alternate locations",
+   "input": {
+    "atoms": 843,
+    "heavy_atoms": 424,
+    "hydrogens": 419,
+    "residues": 48,
+    "standard_residues": 48,
+    "complete_standard_residues": 47,
+    "solvent_ion_residues": 0,
+    "other_residues": {},
+    "overlaps": 41
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.147,
+    "output": {
+     "atoms": 642,
+     "heavy_atoms": 327,
+     "hydrogens": 315,
+     "residues": 46,
+     "standard_residues": 46,
+     "complete_standard_residues": 46,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 642
+     },
+     "seconds": 0.23
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.195,
+    "error": "Error: unsupported residue A/PRO/22 : heavy atom OG is not present in template PRO"
+   }
+  },
+  {
+   "id": "2VB1",
+   "category": "altloc",
+   "note": "lysozyme 0.65 A, alternate locations",
+   "input": {
+    "atoms": 2900,
+    "heavy_atoms": 1545,
+    "hydrogens": 1355,
+    "residues": 312,
+    "standard_residues": 129,
+    "complete_standard_residues": 129,
+    "solvent_ion_residues": 174,
+    "other_residues": {
+     "NO3": 9
+    },
+    "overlaps": 3
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.015,
+    "output": {
+     "atoms": 2543,
+     "heavy_atoms": 1223,
+     "hydrogens": 1320,
+     "residues": 312,
+     "standard_residues": 129,
+     "complete_standard_residues": 129,
+     "solvent_ion_residues": 174,
+     "other_residues": {
+      "NO3": 9
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 129 (ACT).  The set of atoms is similar to CGLY, but is missing 1 N atom.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.188
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/ACT/201 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.277,
+    "error": "Error: unsupported residue A/ACT/201 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1D3Z",
+   "category": "nmr",
+   "note": "ubiquitin NMR ensemble with hydrogens",
+   "input": {
+    "atoms": 1231,
+    "heavy_atoms": 602,
+    "hydrogens": 629,
+    "residues": 76,
+    "standard_residues": 76,
+    "complete_standard_residues": 76,
+    "solvent_ion_residues": 0,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.154,
+    "output": {
+     "atoms": 1231,
+     "heavy_atoms": 602,
+     "hydrogens": 629,
+     "residues": 76,
+     "standard_residues": 76,
+     "complete_standard_residues": 76,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 1231
+     },
+     "seconds": 0.234
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.376,
+    "output": {
+     "atoms": 1231,
+     "heavy_atoms": 602,
+     "hydrogens": 629,
+     "residues": 76,
+     "standard_residues": 76,
+     "complete_standard_residues": 76,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 1231
+     },
+     "seconds": 0.19
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1L2Y",
+   "category": "nmr",
+   "note": "Trp-cage NMR ensemble",
+   "input": {
+    "atoms": 304,
+    "heavy_atoms": 154,
+    "hydrogens": 150,
+    "residues": 20,
+    "standard_residues": 20,
+    "complete_standard_residues": 20,
+    "solvent_ion_residues": 0,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.121,
+    "output": {
+     "atoms": 304,
+     "heavy_atoms": 154,
+     "hydrogens": 150,
+     "residues": 20,
+     "standard_residues": 20,
+     "complete_standard_residues": 20,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 304
+     },
+     "seconds": 0.179
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.202,
+    "output": {
+     "atoms": 304,
+     "heavy_atoms": 154,
+     "hydrogens": 150,
+     "residues": 20,
+     "standard_residues": 20,
+     "complete_standard_residues": 20,
+     "solvent_ion_residues": 0,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 304
+     },
+     "seconds": 0.155
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1A62",
+   "category": "modified",
+   "note": "selenomethionine (MSE)",
+   "input": {
+    "atoms": 1102,
+    "heavy_atoms": 1102,
+    "hydrogens": 0,
+    "residues": 240,
+    "standard_residues": 122,
+    "complete_standard_residues": 122,
+    "solvent_ion_residues": 115,
+    "other_residues": {
+     "MSE": 3
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.671,
+    "output": {
+     "atoms": 2410,
+     "heavy_atoms": 1144,
+     "hydrogens": 1266,
+     "residues": 245,
+     "standard_residues": 130,
+     "complete_standard_residues": 130,
+     "solvent_ion_residues": 115,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 5,
+     "nonstandard_replaced": [
+      "MSE"
+     ],
+     "missing_atoms": 3,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 2410
+     },
+     "seconds": 0.257
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.16,
+    "error": "Error: unsupported residue A/MSE/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1APM",
+   "category": "modified",
+   "note": "phosphoserine/threonine (SEP, TPO) + ligand",
+   "input": {
+    "atoms": 3075,
+    "heavy_atoms": 3075,
+    "hydrogens": 0,
+    "residues": 569,
+    "standard_residues": 358,
+    "complete_standard_residues": 324,
+    "solvent_ion_residues": 207,
+    "other_residues": {
+     "OCT": 1,
+     "SEP": 2,
+     "TPO": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 18.924,
+    "output": {
+     "atoms": 6670,
+     "heavy_atoms": 3233,
+     "hydrogens": 3437,
+     "residues": 578,
+     "standard_residues": 370,
+     "complete_standard_residues": 370,
+     "solvent_ion_residues": 207,
+     "other_residues": {
+      "OCT": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 9,
+     "nonstandard_replaced": [
+      "SEP",
+      "TPO"
+     ],
+     "missing_atoms": 130,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 370 (OCT).  The set of atoms is similar to CHL1, but is missing 28 H atoms, 19 C atoms, and 1 O atom.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.34
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue E/OCT/354 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.188,
+    "error": "Error: unsupported residue E/SEP/10 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1AYA",
+   "category": "modified",
+   "note": "phosphotyrosine (PTR)",
+   "input": {
+    "atoms": 1872,
+    "heavy_atoms": 1872,
+    "hydrogens": 0,
+    "residues": 360,
+    "standard_residues": 217,
+    "complete_standard_residues": 208,
+    "solvent_ion_residues": 141,
+    "other_residues": {
+     "PTR": 2
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 5.074,
+    "output": {
+     "atoms": 3983,
+     "heavy_atoms": 1941,
+     "hydrogens": 2042,
+     "residues": 365,
+     "standard_residues": 224,
+     "complete_standard_residues": 224,
+     "solvent_ion_residues": 141,
+     "other_residues": {},
+     "overlaps": 1
+    },
+    "details": {
+     "missing_residues": 5,
+     "nonstandard_replaced": [
+      "PTR"
+     ],
+     "missing_atoms": 35,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 3983
+     },
+     "seconds": 0.258
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.172,
+    "error": "Error: unsupported residue P/PTR/0 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1AQK",
+   "category": "modified",
+   "note": "pyroglutamate (PCA)",
+   "input": {
+    "atoms": 3597,
+    "heavy_atoms": 3597,
+    "hydrogens": 0,
+    "residues": 731,
+    "standard_residues": 440,
+    "complete_standard_residues": 440,
+    "solvent_ion_residues": 289,
+    "other_residues": {
+     "PCA": 2
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.08,
+    "output": {
+     "atoms": 7411,
+     "heavy_atoms": 3599,
+     "hydrogens": 3812,
+     "residues": 731,
+     "standard_residues": 442,
+     "complete_standard_residues": 442,
+     "solvent_ion_residues": 289,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "PCA"
+     ],
+     "missing_atoms": 4,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 7411
+     },
+     "seconds": 0.352
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.197,
+    "error": "Error: unsupported residue L/PCA/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1EYW",
+   "category": "modified",
+   "note": "carbamylated lysine (KCX)",
+   "input": {
+    "atoms": 2768,
+    "heavy_atoms": 2768,
+    "hydrogens": 0,
+    "residues": 555,
+    "standard_residues": 329,
+    "complete_standard_residues": 328,
+    "solvent_ion_residues": 223,
+    "other_residues": {
+     "KCX": 1,
+     "PEL": 1,
+     "TEN": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 3.493,
+    "output": {
+     "atoms": 5795,
+     "heavy_atoms": 2772,
+     "hydrogens": 3023,
+     "residues": 556,
+     "standard_residues": 331,
+     "complete_standard_residues": 331,
+     "solvent_ion_residues": 223,
+     "other_residues": {
+      "PEL": 1,
+      "TEN": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 1,
+     "nonstandard_replaced": [
+      "KCX"
+     ],
+     "missing_atoms": 3,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 333 (TEN).  The set of atoms is similar to DLPA, but is missing 37 H atoms, 21 C atoms, and 4 O atoms.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.246
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/ZN/401 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.185,
+    "error": "Error: unsupported residue A/KCX/169 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "132L",
+   "category": "modified",
+   "note": "dimethyllysine (MLY)",
+   "input": {
+    "atoms": 1091,
+    "heavy_atoms": 1091,
+    "hydrogens": 0,
+    "residues": 207,
+    "standard_residues": 124,
+    "complete_standard_residues": 124,
+    "solvent_ion_residues": 78,
+    "other_residues": {
+     "DM0": 1,
+     "MLY": 4
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.354,
+    "output": {
+     "atoms": 2194,
+     "heavy_atoms": 1079,
+     "hydrogens": 1115,
+     "residues": 207,
+     "standard_residues": 129,
+     "complete_standard_residues": 129,
+     "solvent_ion_residues": 78,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "DM0",
+      "MLY"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 2194
+     },
+     "seconds": 0.209
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.165,
+    "error": "Error: unsupported residue A/DM0/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1DMP",
+   "category": "modified",
+   "note": "S-hydroxycysteine (CSO)",
+   "input": {
+    "atoms": 1884,
+    "heavy_atoms": 1554,
+    "hydrogens": 330,
+    "residues": 199,
+    "standard_residues": 196,
+    "complete_standard_residues": 196,
+    "solvent_ion_residues": 0,
+    "other_residues": {
+     "CSO": 2,
+     "DMQ": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.68,
+    "output": {
+     "atoms": 3196,
+     "heavy_atoms": 1552,
+     "hydrogens": 1644,
+     "residues": 199,
+     "standard_residues": 198,
+     "complete_standard_residues": 198,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "DMQ": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "CSO"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 198 (DMQ).  The set of atoms is similar to DMPE, but is missing 30 H atoms, 5 O atoms, and 1 P atom and has 3 N atoms too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.286
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue B/DMQ/450 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.19,
+    "error": "Error: unsupported residue A/CSO/67 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1CAG",
+   "category": "modified",
+   "note": "hydroxyproline collagen peptide (HYP)",
+   "input": {
+    "atoms": 674,
+    "heavy_atoms": 674,
+    "hydrogens": 0,
+    "residues": 179,
+    "standard_residues": 58,
+    "complete_standard_residues": 58,
+    "solvent_ion_residues": 85,
+    "other_residues": {
+     "ACY": 6,
+     "HYP": 30
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.059,
+    "output": {
+     "atoms": 1371,
+     "heavy_atoms": 655,
+     "hydrogens": 716,
+     "residues": 181,
+     "standard_residues": 90,
+     "complete_standard_residues": 90,
+     "solvent_ion_residues": 85,
+     "other_residues": {
+      "ACY": 6
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 2,
+     "nonstandard_replaced": [
+      "HYP"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 1
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 90 (ACY).  The set of atoms is similar to CALA, but is missing 1 H atom, 1 C atom, and 1 N atom.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.183
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/ACY/206 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.166,
+    "error": "Error: unsupported residue A/ACY/206 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1A2T",
+   "category": "modified",
+   "note": "S,S-(2-hydroxyethyl)thiocysteine (CME)",
+   "input": {
+    "atoms": 1510,
+    "heavy_atoms": 1156,
+    "hydrogens": 354,
+    "residues": 182,
+    "standard_residues": 134,
+    "complete_standard_residues": 134,
+    "solvent_ion_residues": 46,
+    "other_residues": {
+     "CME": 1,
+     "THP": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 3.7,
+    "output": {
+     "atoms": 2571,
+     "heavy_atoms": 1253,
+     "hydrogens": 1318,
+     "residues": 196,
+     "standard_residues": 149,
+     "complete_standard_residues": 149,
+     "solvent_ion_residues": 46,
+     "other_residues": {
+      "THP": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 14,
+     "nonstandard_replaced": [
+      "CME"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 149 (CA).  The atoms and bonds in the residue match CA, but the set of externally bonded atoms has 1 Ca atom too many.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.246
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/THP/151 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.183,
+    "error": "Error: unsupported residue A/CME/23 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1MDX",
+   "category": "modified",
+   "note": "PLP-lysine (LLP)",
+   "input": {
+    "atoms": 3256,
+    "heavy_atoms": 3256,
+    "hydrogens": 0,
+    "residues": 811,
+    "standard_residues": 365,
+    "complete_standard_residues": 352,
+    "solvent_ion_residues": 444,
+    "other_residues": {
+     "AKG": 1,
+     "LLP": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 29.993,
+    "output": {
+     "atoms": 7349,
+     "heavy_atoms": 3475,
+     "hydrogens": 3874,
+     "residues": 838,
+     "standard_residues": 393,
+     "complete_standard_residues": 393,
+     "solvent_ion_residues": 444,
+     "other_residues": {
+      "AKG": 1
+     },
+     "overlaps": 1
+    },
+    "details": {
+     "missing_residues": 27,
+     "nonstandard_replaced": [
+      "LLP"
+     ],
+     "missing_atoms": 48,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 393 (AKG).  The set of atoms is similar to DT5, but is missing 7 H atoms, 5 C atoms, and 2 N atoms.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.272
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/AKG/401 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.19,
+    "error": "Error: unsupported residue A/LLP/188 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1GRM",
+   "category": "modified",
+   "note": "gramicidin, D-amino acids and caps",
+   "input": {
+    "atoms": 272,
+    "heavy_atoms": 272,
+    "hydrogens": 0,
+    "residues": 32,
+    "standard_residues": 16,
+    "complete_standard_residues": 16,
+    "solvent_ion_residues": 0,
+    "other_residues": {
+     "DLE": 8,
+     "DVA": 4,
+     "ETA": 2,
+     "FVA": 2
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.667,
+    "output": {
+     "atoms": 554,
+     "heavy_atoms": 272,
+     "hydrogens": 282,
+     "residues": 32,
+     "standard_residues": 28,
+     "complete_standard_residues": 28,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "ETA": 2,
+      "FVA": 2
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "DLE",
+      "DVA"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 0 (FVA).  The set of heavy atoms matches CILE, but the residue is missing 1 H atom.  You may be able to add it with Modeller.addHydrogens().  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.218
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/FVA/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.164,
+    "error": "Error: unsupported residue A/FVA/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "4HHB",
+   "category": "ligand",
+   "note": "hemoglobin with heme",
+   "input": {
+    "atoms": 4779,
+    "heavy_atoms": 4779,
+    "hydrogens": 0,
+    "residues": 801,
+    "standard_residues": 574,
+    "complete_standard_residues": 574,
+    "solvent_ion_residues": 223,
+    "other_residues": {
+     "HEM": 4
+    },
+    "overlaps": 1
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.562,
+    "output": {
+     "atoms": 9731,
+     "heavy_atoms": 4779,
+     "hydrogens": 4952,
+     "residues": 801,
+     "standard_residues": 574,
+     "complete_standard_residues": 574,
+     "solvent_ion_residues": 223,
+     "other_residues": {
+      "HEM": 4
+     },
+     "overlaps": 1
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 574 (HEM).  The set of atoms is similar to DMPE, but is missing 34 H atoms, 4 O atoms, and 1 P atom and has 1 C atom, 3 N atoms, and 1 Fe atom too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.351
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/HEM/142 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.216,
+    "error": "Error: unsupported residue A/HEM/142 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "3PTB",
+   "category": "ligand",
+   "note": "trypsin with benzamidine and calcium",
+   "input": {
+    "atoms": 1701,
+    "heavy_atoms": 1701,
+    "hydrogens": 0,
+    "residues": 287,
+    "standard_residues": 223,
+    "complete_standard_residues": 223,
+    "solvent_ion_residues": 63,
+    "other_residues": {
+     "BEN": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.74,
+    "output": {
+     "atoms": 3424,
+     "heavy_atoms": 1701,
+     "hydrogens": 1723,
+     "residues": 287,
+     "standard_residues": 223,
+     "complete_standard_residues": 223,
+     "solvent_ion_residues": 63,
+     "other_residues": {
+      "BEN": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 224 (BEN).  The set of atoms is similar to NTRP, but is missing 4 H atoms, 4 C atoms, and 1 O atom.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.262
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/BEN/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.173,
+    "error": "Error: unsupported residue A/BEN/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1AKE",
+   "category": "ligand",
+   "note": "adenylate kinase with Ap5A",
+   "input": {
+    "atoms": 3816,
+    "heavy_atoms": 3816,
+    "hydrogens": 0,
+    "residues": 808,
+    "standard_residues": 428,
+    "complete_standard_residues": 428,
+    "solvent_ion_residues": 378,
+    "other_residues": {
+     "AP5": 2
+    },
+    "overlaps": 1
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.303,
+    "output": {
+     "atoms": 7988,
+     "heavy_atoms": 3804,
+     "hydrogens": 4184,
+     "residues": 808,
+     "standard_residues": 428,
+     "complete_standard_residues": 428,
+     "solvent_ion_residues": 378,
+     "other_residues": {
+      "AP5": 2
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 428 (AP5).  The set of atoms is similar to G, but has 18 H atoms, 10 C atoms, 5 N atoms, 15 O atoms, and 4 P atoms too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.276
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/AP5/215 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.267,
+    "error": "Error: unsupported residue A/AP5/215 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1C3W",
+   "category": "ligand",
+   "note": "bacteriorhodopsin with retinal and lipids",
+   "input": {
+    "atoms": 2073,
+    "heavy_atoms": 2073,
+    "hydrogens": 0,
+    "residues": 260,
+    "standard_residues": 222,
+    "complete_standard_residues": 222,
+    "solvent_ion_residues": 23,
+    "other_residues": {
+     "LI1": 13,
+     "RET": 1,
+     "SQU": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 1.456,
+    "output": {
+     "atoms": 3986,
+     "heavy_atoms": 2074,
+     "hydrogens": 1912,
+     "residues": 260,
+     "standard_residues": 222,
+     "complete_standard_residues": 222,
+     "solvent_ion_residues": 23,
+     "other_residues": {
+      "LI1": 13,
+      "RET": 1,
+      "SQU": 1
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 1
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 206 (LYS).  The atoms and bonds in the residue match LYS, but the set of externally bonded atoms has 1 N atom too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.249
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/LI1/601 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.193,
+    "error": "Error: unsupported residue A/LI1/601 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1CA2",
+   "category": "metal",
+   "note": "carbonic anhydrase with zinc",
+   "input": {
+    "atoms": 2207,
+    "heavy_atoms": 2207,
+    "hydrogens": 0,
+    "residues": 424,
+    "standard_residues": 256,
+    "complete_standard_residues": 256,
+    "solvent_ion_residues": 168,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.691,
+    "output": {
+     "atoms": 4534,
+     "heavy_atoms": 2208,
+     "hydrogens": 2326,
+     "residues": 424,
+     "standard_residues": 256,
+     "complete_standard_residues": 256,
+     "solvent_ion_residues": 168,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 1
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 4534
+     },
+     "seconds": 0.347
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/ZN/262 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.181,
+    "error": "Error: unsupported residue A/ZN/262 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1BNA",
+   "category": "nucleic",
+   "note": "B-DNA dodecamer",
+   "input": {
+    "atoms": 566,
+    "heavy_atoms": 566,
+    "hydrogens": 0,
+    "residues": 104,
+    "standard_residues": 24,
+    "complete_standard_residues": 24,
+    "solvent_ion_residues": 80,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.232,
+    "output": {
+     "atoms": 998,
+     "heavy_atoms": 566,
+     "hydrogens": 432,
+     "residues": 104,
+     "standard_residues": 24,
+     "complete_standard_residues": 24,
+     "solvent_ion_residues": 80,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 998
+     },
+     "seconds": 0.238
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/DC/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.186,
+    "error": "Error: unsupported residue A/DC/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1AAY",
+   "category": "nucleic",
+   "note": "zinc finger-DNA complex",
+   "input": {
+    "atoms": 1330,
+    "heavy_atoms": 1330,
+    "hydrogens": 0,
+    "residues": 258,
+    "standard_residues": 107,
+    "complete_standard_residues": 107,
+    "solvent_ion_residues": 151,
+    "other_residues": {},
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 2.72,
+    "output": {
+     "atoms": 2646,
+     "heavy_atoms": 1352,
+     "hydrogens": 1294,
+     "residues": 263,
+     "standard_residues": 112,
+     "complete_standard_residues": 112,
+     "solvent_ion_residues": 151,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 5,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": true,
+     "details": {
+      "particles": 2646
+     },
+     "seconds": 0.272
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue B/DA/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.187,
+    "error": "Error: unsupported residue B/DA/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "1EHZ",
+   "category": "nucleic",
+   "note": "tRNA-Phe with modified nucleotides",
+   "input": {
+    "atoms": 1821,
+    "heavy_atoms": 1821,
+    "hydrogens": 0,
+    "residues": 245,
+    "standard_residues": 62,
+    "complete_standard_residues": 62,
+    "solvent_ion_residues": 169,
+    "other_residues": {
+     "1MA": 1,
+     "2MG": 1,
+     "5MC": 2,
+     "5MU": 1,
+     "7MG": 1,
+     "H2U": 2,
+     "M2G": 1,
+     "OMC": 1,
+     "OMG": 1,
+     "PSU": 2,
+     "YYG": 1
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 0.615,
+    "output": {
+     "atoms": 2936,
+     "heavy_atoms": 1795,
+     "hydrogens": 1141,
+     "residues": 245,
+     "standard_residues": 76,
+     "complete_standard_residues": 76,
+     "solvent_ion_residues": 169,
+     "other_residues": {},
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "1MA",
+      "2MG",
+      "5MC",
+      "5MU",
+      "7MG",
+      "H2U",
+      "M2G",
+      "OMC",
+      "OMG",
+      "PSU",
+      "YYG"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 0 (G).  The set of atoms is similar to G, but has 1 H atom and 1 O atom too many.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.287
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: unsupported residue A/G/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.256,
+    "error": "Error: unsupported residue A/G/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  },
+  {
+   "id": "5KZC",
+   "category": "glycan",
+   "note": "glycoprotein with N-glycans, truncated side chain",
+   "input": {
+    "atoms": 13849,
+    "heavy_atoms": 13849,
+    "hydrogens": 0,
+    "residues": 1788,
+    "standard_residues": 1759,
+    "complete_standard_residues": 1756,
+    "solvent_ion_residues": 0,
+    "other_residues": {
+     "BMA": 3,
+     "MAN": 16,
+     "NAG": 10
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 305.586,
+    "output": {
+     "atoms": 28492,
+     "heavy_atoms": 14453,
+     "hydrogens": 14039,
+     "residues": 1868,
+     "standard_residues": 1839,
+     "complete_standard_residues": 1839,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "BMA": 3,
+      "MAN": 16,
+      "NAG": 10
+     },
+     "overlaps": 2
+    },
+    "details": {
+     "missing_residues": 80,
+     "nonstandard_replaced": [],
+     "missing_atoms": 6,
+     "missing_terminals": 2
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 241 (ASN).  The atoms and bonds in the residue match ASN, but the set of externally bonded atoms has 1 N atom too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.756
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.935,
+    "output": {
+     "atoms": 27364,
+     "heavy_atoms": 13863,
+     "hydrogens": 13501,
+     "residues": 1788,
+     "standard_residues": 1752,
+     "complete_standard_residues": 1752,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "0MA": 9,
+      "0YB": 4,
+      "2MA": 4,
+      "4YB": 6,
+      "NLN": 7,
+      "VMA": 3,
+      "VMB": 3
+     },
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 229 (SER).  The atoms and bonds in the residue match SER, but the set of externally bonded atoms is missing 1 C atom.  Is the chain missing a terminal capping group?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.746
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1HZH",
+   "category": "glycan",
+   "note": "IgG1 antibody: glycans, insertion codes, missing residues",
+   "input": {
+    "atoms": 10647,
+    "heavy_atoms": 10647,
+    "hydrogens": 0,
+    "residues": 1420,
+    "standard_residues": 1331,
+    "complete_standard_residues": 1331,
+    "solvent_ion_residues": 71,
+    "other_residues": {
+     "BMA": 2,
+     "FUC": 1,
+     "GAL": 3,
+     "MAN": 4,
+     "NAG": 8
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 3.3,
+    "output": {
+     "atoms": 21073,
+     "heavy_atoms": 10648,
+     "hydrogens": 10425,
+     "residues": 1420,
+     "standard_residues": 1331,
+     "complete_standard_residues": 1331,
+     "solvent_ion_residues": 71,
+     "other_residues": {
+      "BMA": 2,
+      "FUC": 1,
+      "GAL": 3,
+      "MAN": 4,
+      "NAG": 8
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [],
+     "missing_atoms": 0,
+     "missing_terminals": 1
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 1331 (NAG).  The set of atoms is similar to CN, but is missing 1 C atom and 2 N atoms.  Is the chain terminated in a way that is unsupported by the force field?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.566
+    },
+    "glysys_prepare": {
+     "ok": false,
+     "error": "Error: solute charge 20.388000 is not within tolerance of an integer"
+    }
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 0.688,
+    "error": "Error: solute charge 20.388000 is not within tolerance of an integer"
+   }
+  },
+  {
+   "id": "1IGT",
+   "category": "insertion",
+   "note": "IgG2a antibody, insertion codes, glycans",
+   "input": {
+    "atoms": 12956,
+    "heavy_atoms": 10434,
+    "hydrogens": 2522,
+    "residues": 1334,
+    "standard_residues": 1316,
+    "complete_standard_residues": 1316,
+    "solvent_ion_residues": 0,
+    "other_residues": {
+     "BMA": 2,
+     "FUC": 1,
+     "FUL": 1,
+     "GAL": 2,
+     "MAN": 4,
+     "NAG": 8
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": true,
+    "seconds": 3.065,
+    "output": {
+     "atoms": 20602,
+     "heavy_atoms": 10434,
+     "hydrogens": 10168,
+     "residues": 1334,
+     "standard_residues": 1316,
+     "complete_standard_residues": 1316,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "BMA": 2,
+      "FUC": 1,
+      "FUL": 1,
+      "GAL": 2,
+      "MAN": 4,
+      "NAG": 8
+     },
+     "overlaps": 0
+    },
+    "details": {
+     "missing_residues": 0,
+     "nonstandard_replaced": [
+      "ASN"
+     ],
+     "missing_atoms": 0,
+     "missing_terminals": 0
+    },
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 511 (ASN).  The atoms and bonds in the residue match ASN, but the set of externally bonded atoms has 1 N atom too many.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.546
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   },
+   "glysys": {
+    "ok": true,
+    "seconds": 0.757,
+    "output": {
+     "atoms": 20572,
+     "heavy_atoms": 10434,
+     "hydrogens": 10138,
+     "residues": 1334,
+     "standard_residues": 1314,
+     "complete_standard_residues": 1314,
+     "solvent_ion_residues": 0,
+     "other_residues": {
+      "0LA": 2,
+      "0YB": 2,
+      "0fA": 1,
+      "0fB": 1,
+      "2MA": 4,
+      "4YB": 4,
+      "NLN": 2,
+      "UYB": 2,
+      "VMB": 2
+     },
+     "overlaps": 0
+    },
+    "details": null,
+    "openmm_amber14": {
+     "ok": false,
+     "error": "ValueError: No template found for residue 510 (TYR).  The atoms and bonds in the residue match TYR, but the set of externally bonded atoms is missing 1 C atom.  Is the chain missing a terminal capping group?  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#template",
+     "seconds": 0.516
+    },
+    "glysys_prepare": {
+     "ok": true
+    }
+   }
+  },
+  {
+   "id": "1AON",
+   "category": "large",
+   "note": "GroEL/GroES complex with ADP",
+   "input": {
+    "atoms": 58870,
+    "heavy_atoms": 58870,
+    "hydrogens": 0,
+    "residues": 8029,
+    "standard_residues": 8015,
+    "complete_standard_residues": 7924,
+    "solvent_ion_residues": 7,
+    "other_residues": {
+     "ADP": 7
+    },
+    "overlaps": 0
+   },
+   "pdbfixer": {
+    "ok": false,
+    "seconds": null,
+    "error": "timed out after 900s"
+   },
+   "glysys": {
+    "ok": false,
+    "seconds": 3.012,
+    "error": "Error: unsupported residue A/ADP/1 : carbohydrate component has no GLYCAM06j-1 mapping"
+   }
+  }
+ ]
+}

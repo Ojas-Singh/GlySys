@@ -111,14 +111,9 @@ pub(crate) fn write_topology(system: &System) -> String {
         .unwrap();
     }
     let pairs = system
-        .dihedrals
-        .iter()
-        .filter(|dihedral| !dihedral.improper)
-        .map(|dihedral| {
-            let first = dihedral.atoms[0].min(dihedral.atoms[3]);
-            let second = dihedral.atoms[0].max(dihedral.atoms[3]);
-            (first, second)
-        })
+        .one_four_pairs()
+        .into_iter()
+        .map(|(pair, _, _)| (pair[0], pair[1]))
         .collect::<BTreeSet<_>>();
     writeln!(output).unwrap();
     writeln!(output, "[ pairs ]").unwrap();
