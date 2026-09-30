@@ -66,6 +66,17 @@ impl SystemBuilder {
         &self.options
     }
 
+    /// Chemical component IDs in `contents` (ligands, cofactors, modified
+    /// residues) whose CCD definitions preparation and repair can use.
+    pub fn component_requests(&self, contents: &str) -> Result<Vec<String>> {
+        crate::StructureFixer::new(crate::FixOptions {
+            model: self.options.model,
+            altloc: self.options.altloc,
+            ..crate::FixOptions::default()
+        })?
+        .component_requests(contents)
+    }
+
     pub fn prepare_pdb(&self, path: impl AsRef<Path>) -> Result<ParameterizedSystem> {
         let path = path.as_ref();
         let contents =

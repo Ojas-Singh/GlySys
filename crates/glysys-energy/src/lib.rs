@@ -461,6 +461,61 @@ impl<'a> EnergyEvaluator<'a> {
         }
     }
 
+    /// Visit interacting nonbonded pairs in ascending (first, second) order
+    /// with their (scee, scnb) 1-4 scale factors; excluded pairs that are not
+    /// 1-4 pairs are skipped. Without a cutoff every pair is a candidate: walk
+    /// the upper triangle directly, since allocating it (N²/2 pairs) exhausts
+    /// memory for large systems, notably under wasm32, and classify pairs by
+    /// marking each row's exclusions instead of per-pair set lookups.
+    fn for_each_nonbonded_pair(
+        &self,
+        coordinates: &[Vec3],
+        mut visit: impl FnMut(usize, usize, (f64, f64)),
+    ) {
+        let exclusions = self.system.exclusions();
+        if self.options.cutoff.is_some() || self.active_terms_only {
+            for (first, second) in self.nonbonded_pairs(coordinates) {
+                let scale = self.one_four.get(&ordered(first, second)).copied();
+                if exclusions[first].contains(&second) && scale.is_none() {
+                    continue;
+                }
+                visit(first, second, scale.unwrap_or((1.0, 1.0)));
+            }
+            return;
+        }
+        let n = coordinates.len();
+        let mut rows = vec![Vec::new(); n];
+        for (&(first, second), &scale) in &self.one_four {
+            rows[first].push((second, scale));
+        }
+        const EXCLUDED: u8 = 1;
+        const SCALED: u8 = 2;
+        let mut marks = vec![0u8; n];
+        let mut scales = vec![(1.0, 1.0); n];
+        for first in 0..n {
+            for &second in exclusions[first].range(first + 1..) {
+                marks[second] = EXCLUDED;
+            }
+            for &(second, scale) in &rows[first] {
+                marks[second] = SCALED;
+                scales[second] = scale;
+            }
+            for second in first + 1..n {
+                match marks[second] {
+                    0 => visit(first, second, (1.0, 1.0)),
+                    SCALED => visit(first, second, scales[second]),
+                    _ => {}
+                }
+            }
+            for &second in exclusions[first].range(first + 1..) {
+                marks[second] = 0;
+            }
+            for &(second, _) in &rows[first] {
+                marks[second] = 0;
+            }
+        }
+    }
+
     /// Calculate only cross nonbonded interactions between two disjoint atom
     /// groups. This mirrors the Cookbook interaction objective: bonded,
     /// internal, restraint, and implicit-solvent terms are intentionally not
@@ -684,21 +739,14 @@ impl<'a> EnergyEvaluator<'a> {
             add_scaled(&mut gradient[center], first_derivative, -factor);
             add_scaled(&mut gradient[center], third_derivative, -factor);
         }
-        let exclusions = self.system.exclusions();
         let atoms = self.system.atoms();
-        let mut apply_pair = |first: usize, second: usize| {
+        let apply_pair = |first: usize, second: usize, (scee, scnb): (f64, f64)| {
             if self.active_terms_only
                 && !self.selection.is_movable(first)
                 && !self.selection.is_movable(second)
             {
                 return;
             }
-            let pair = ordered(first, second);
-            let scale_14 = self.one_four.get(&pair).copied();
-            if exclusions[first].contains(&second) && scale_14.is_none() {
-                return;
-            }
-            let (scee, scnb) = scale_14.unwrap_or((1.0, 1.0));
             let vector = subtract(coordinates[first], coordinates[second]);
             let radius = norm(vector).max(1.0e-8);
             let first_atom = &atoms[first];
@@ -715,20 +763,7 @@ impl<'a> EnergyEvaluator<'a> {
             add_scaled(&mut gradient[first], vector, derivative / radius);
             add_scaled(&mut gradient[second], vector, -derivative / radius);
         };
-        if self.options.cutoff.is_none() && !self.active_terms_only {
-            // The implicit OBC2 model is all-pairs. Walk the deterministic
-            // upper triangle directly instead of allocating and sorting a
-            // 206k-entry pair vector on every force evaluation.
-            for first in 0..coordinates.len() {
-                for second in first + 1..coordinates.len() {
-                    apply_pair(first, second);
-                }
-            }
-        } else {
-            for (first, second) in self.nonbonded_pairs(coordinates) {
-                apply_pair(first, second);
-            }
-        }
+        self.for_each_nonbonded_pair(coordinates, apply_pair);
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
                 let vector = subtract(*position, restraint.reference);
@@ -866,15 +901,8 @@ impl<'a> EnergyEvaluator<'a> {
                 result.proper_torsions += energy;
             }
         }
-        let exclusions = self.system.exclusions();
-        for (first, second) in self.nonbonded_pairs(coordinates) {
+        self.for_each_nonbonded_pair(coordinates, |first, second, (scee, scnb)| {
             let r = distance(coordinates[first], coordinates[second]).max(1.0e-8);
-            let pair = ordered(first, second);
-            let scale = self.one_four.get(&pair).copied();
-            if exclusions[first].contains(&second) && scale.is_none() {
-                continue;
-            }
-            let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
             let first_atom = &self.system.atoms()[first];
             let second_atom = &self.system.atoms()[second];
             let radius = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
@@ -885,7 +913,7 @@ impl<'a> EnergyEvaluator<'a> {
             result.electrostatics +=
                 COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge()
                     / (self.options.dielectric * r * scee);
-        }
+        });
         if let Some(solvent) = &self.options.obc2 {
             (result.generalized_born, result.surface_area) =
                 solvent.components(self.system.atoms(), coordinates);

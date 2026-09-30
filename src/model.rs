@@ -188,6 +188,64 @@ impl ParameterizedSystem {
         &self.metadata
     }
 
+    /// The solute alone, without added water, ions or periodic box, as a
+    /// preparation with `add_water = false` would produce it.
+    pub fn solute(&self) -> Self {
+        let n = self.system.solute_atom_count;
+        let system = &self.system;
+        let within = |atoms: &[usize]| atoms.iter().all(|&atom| atom < n);
+        let solute = System {
+            atoms: system.atoms[..n].to_vec(),
+            residues: system
+                .residues
+                .iter()
+                .filter(|residue| residue.first_atom < n)
+                .cloned()
+                .collect(),
+            bonds: system
+                .bonds
+                .iter()
+                .filter(|bond| within(&bond.atoms))
+                .copied()
+                .collect(),
+            angles: system
+                .angles
+                .iter()
+                .filter(|angle| within(&angle.atoms))
+                .copied()
+                .collect(),
+            dihedrals: system
+                .dihedrals
+                .iter()
+                .filter(|dihedral| within(&dihedral.atoms))
+                .cloned()
+                .collect(),
+            exclusions: system.exclusions[..n].to_vec(),
+            box_angstrom: [0.0; 3],
+            component_count: system.component_count,
+            solute_atom_count: n,
+            water_residue_count: 0,
+            sodium_count: 0,
+            chloride_count: 0,
+        };
+        let mut report = self.report.clone();
+        report.options.add_water = false;
+        report.options.add_ions = false;
+        report.output_sha256.clear();
+        report.total_atoms = n;
+        report.residues = solute.residues.len();
+        report.waters = 0;
+        report.sodium_ions = 0;
+        report.chloride_ions = 0;
+        report.total_charge = report.solute_charge;
+        report.box_angstrom = [0.0; 3];
+        Self {
+            system: solute,
+            report,
+            metadata: self.metadata.clone(),
+        }
+    }
+
     /// Return the current Cartesian coordinates in Å.
     pub fn coordinates(&self) -> Vec<Vec3> {
         self.system.atoms.iter().map(|atom| atom.position).collect()

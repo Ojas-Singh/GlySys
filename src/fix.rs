@@ -251,6 +251,14 @@ impl StructureFixer {
             .filter(|residue| {
                 matches!(residue.kind, ResidueKind::Ligand | ResidueKind::Glycan)
                     && self.components.get(&residue.input_name).is_none()
+                    // GLYCAM residues (and caps such as ROH) need no CCD entry.
+                    && !self.templates.glycan(&residue.name).is_some_and(|template| {
+                        residue
+                            .atoms
+                            .iter()
+                            .filter(|atom| !atom.is_hydrogen())
+                            .all(|atom| template.atom(&atom.name).is_some())
+                    })
             })
             .map(|residue| residue.input_name.to_ascii_uppercase())
             .filter(|name| {

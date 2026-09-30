@@ -162,14 +162,9 @@ fn main() -> anyhow::Result<()> {
             let mut options = options(&arguments.input, Some(&arguments))?;
             options.repair = options.repair || arguments.fix;
             let contents = std::fs::read_to_string(&arguments.input.input)?;
-            let requests = StructureFixer::new(FixOptions {
-                model: options.model,
-                altloc: options.altloc,
-                ..FixOptions::default()
-            })?
-            .component_requests(&contents)?;
-            let library = component_library(requests, &arguments.components)?;
-            let builder = SystemBuilder::new(options)?.with_components(library);
+            let mut builder = SystemBuilder::new(options)?;
+            let requests = builder.component_requests(&contents)?;
+            *builder.components_mut() = component_library(requests, &arguments.components)?;
             let prepared = builder.prepare_pdb_str(&contents)?;
             prepared.write_bundle(&arguments.output)?;
             for warning in &prepared.report().warnings {
