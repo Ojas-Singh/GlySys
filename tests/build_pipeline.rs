@@ -6,7 +6,10 @@ use glysys::{
 const DIPEPTIDE: &str = include_str!("fixtures/dipeptide.pdb");
 const GLYCAN: &str = include_str!("fixtures/glycan.pdb");
 const DIPEPTIDE_TLEAP_PRMTOP: &str = include_str!("fixtures/dipeptide.prmtop");
-const SULFATED_GAG: &str = include_str!("../reference/gmml2/tests/correct_outputs/028/00036.pdb");
+/// A structure of the GMML2 reference set. That set is not in the repository
+/// (`reference/` is ignored), so it is read when the test runs, not when it
+/// is compiled.
+const SULFATED_GAG_PATH: &str = "reference/gmml2/tests/correct_outputs/028/00036.pdb";
 const SULFATED_GAG_WITH_CAP: &str = include_str!("fixtures/sulfated_gag_with_cap.pdb");
 
 #[test]
@@ -120,14 +123,19 @@ fn recognizes_and_prepares_standalone_glycam_glycan() {
 }
 
 #[test]
+#[ignore = "needs the GMML2 reference set in reference/gmml2, which is not in the repository"]
 fn prepares_connected_sulfated_gag_chain() {
+    let sulfated_gag = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SULFATED_GAG_PATH),
+    )
+    .expect("the GMML2 reference set");
     let system = SystemBuilder::new(BuildOptions {
         add_water: false,
         add_ions: false,
         ..BuildOptions::default()
     })
     .unwrap()
-    .prepare_pdb_str(SULFATED_GAG)
+    .prepare_pdb_str(&sulfated_gag)
     .unwrap();
     let report = system.report();
     assert_eq!(report.glycans.len(), 1);
