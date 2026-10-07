@@ -27,6 +27,13 @@
 - `prepare --fix` / `BuildOptions::repair` repairs the input first;
   `SystemBuilder::component_requests` lists the CCD definitions it can use.
 - Add `ParameterizedSystem::solute` (the solvated system's dry solute).
+- The aligned heavy-atom RMSD of a trajectory frame is taken over the solute
+  only (`analysis::rmsd_atoms`): water and single-atom ions are left out. In a
+  water box it used to measure the solvent's diffusion. Add
+  `ParameterizedSystem::solute_atom_count`.
+- A failed solute constraint on the GPU names its constraint group and says
+  when the reported error is saturated; the group index no longer spills into
+  the error kind for solutes with more than 4,095 groups.
 - The no-cutoff energy no longer allocates every atom pair (large systems
   ran out of memory, notably in WebAssembly) and is about twice as fast,
   with bit-identical results.

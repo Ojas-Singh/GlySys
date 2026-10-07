@@ -184,6 +184,12 @@ impl ParameterizedSystem {
         self.system.box_angstrom
     }
 
+    /// Atoms of the solute: they come first, before the water and ions that
+    /// solvation added.
+    pub fn solute_atom_count(&self) -> usize {
+        self.system.solute_atom_count
+    }
+
     pub fn metadata(&self) -> &SystemMetadata {
         &self.metadata
     }

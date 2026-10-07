@@ -824,7 +824,7 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
           let old_direction = state[n + a].xyz - state[n + b].xyz;
           let projection = dot(d, old_direction);
           if (abs(projection) < 1e-12) {
-            atomicStore(&aux[status_idx()], 0x50000000u | (id.x << 16u));
+            atomicStore(&aux[status_idx()], 0x50000000u | (min(id.x, 0xfffu) << 16u));
             return;
           }
           let delta = 0.5 * (t.z * t.z - dot(d, d))
@@ -857,7 +857,7 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
       let residual = abs(length(d) - t.z) / max(t.z, 1e-8);
       if (residual > 2e-5) {
         let encoded_residual = u32(clamp(residual * 1000000.0, 0.0, 65535.0));
-        atomicStore(&aux[status_idx()], 0x50000000u | (id.x << 16u) | encoded_residual);
+        atomicStore(&aux[status_idx()], 0x50000000u | (min(id.x, 0xfffu) << 16u) | encoded_residual);
       }
     }
   }
@@ -1011,7 +1011,7 @@ fn rattle(@builtin(global_invocation_id) id: vec3<u32>) {
       let velocity_scale = max(length(state[a].xyz - state[b].xyz), 1.0);
       if (residual > 5e-5 * velocity_scale) {
         let encoded_residual = u32(clamp(residual * 1000000.0, 0.0, 65535.0));
-        atomicStore(&aux[status_idx()], 0x60000000u | (id.x << 16u) | encoded_residual);
+        atomicStore(&aux[status_idx()], 0x60000000u | (min(id.x, 0xfffu) << 16u) | encoded_residual);
       }
     }
   }

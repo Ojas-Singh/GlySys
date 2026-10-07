@@ -37,6 +37,35 @@ pub struct FrameAnalysis {
     pub torsion_degrees: Vec<Option<f64>>,
 }
 
+/// Atoms of the aligned heavy-atom RMSD: the heavy atoms of the solute.
+/// Water (added or crystallographic) and single-atom ions are left out: they
+/// diffuse, and in a water box they outnumber the solute, so an RMSD that
+/// includes them measures the solvent.
+pub fn rmsd_atoms(system: &ParameterizedSystem) -> Vec<usize> {
+    let residues = system.residues();
+    let mut residue_atoms = vec![0usize; residues.len()];
+    for atom in system.atoms() {
+        if let Some(count) = residue_atoms.get_mut(atom.residue_index()) {
+            *count += 1;
+        }
+    }
+    system
+        .atoms()
+        .iter()
+        .enumerate()
+        .take(system.solute_atom_count())
+        .filter(|(_, atom)| {
+            let residue = atom.residue_index();
+            atom.element() != 1
+                && residue_atoms.get(residue).is_none_or(|&count| count > 1)
+                && residues
+                    .get(residue)
+                    .is_none_or(|r| !matches!(r.name(), "HOH" | "WAT" | "TIP3" | "TIP" | "TP3"))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// Geometry-only input for an analysis worker; no force field or simulation
 /// needs to be reconstructed from the displayed PDB.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,13 +86,7 @@ impl AnalysisDefinition {
         if reference.len() != system.atom_count() {
             return Err(crate::invalid("analysis reference atom count"));
         }
-        let rmsd_atoms: Vec<_> = system
-            .atoms()
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.element() != 1)
-            .map(|(i, _)| i)
-            .collect();
+        let rmsd_atoms = rmsd_atoms(system);
         let rmsd_reference = rmsd_atoms.iter().map(|&i| reference[i]).collect();
         Ok(Self {
             schema_version: 1,
@@ -271,13 +294,7 @@ pub fn analyze(
     coordinates: &[Vec3],
     torsions: &[TorsionDefinition],
 ) -> FrameAnalysis {
-    let indices: Vec<_> = system
-        .atoms()
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.element() != 1)
-        .map(|(i, _)| i)
-        .collect();
+    let indices = rmsd_atoms(system);
     FrameAnalysis {
         aligned_heavy_atom_rmsd: aligned_rmsd(
             &indices.iter().map(|&i| reference[i]).collect::<Vec<_>>(),
@@ -292,6 +309,51 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rmsd_is_over_the_heavy_atoms_of_the_solute_only() {
+        let fixture = include_str!("../../../tests/fixtures/dipeptide.pdb");
+        let dry = glysys::SystemBuilder::new(glysys::BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..Default::default()
+        })
+        .unwrap()
+        .prepare_pdb_str(fixture)
+        .unwrap();
+        let wet = glysys::SystemBuilder::new(glysys::BuildOptions {
+            add_water: true,
+            add_ions: true,
+            salt_molar: 0.15,
+            padding_angstrom: 6.,
+            ..Default::default()
+        })
+        .unwrap()
+        .prepare_pdb_str(fixture)
+        .unwrap();
+        assert!(
+            wet.atom_count() > dry.atom_count(),
+            "water was added: {} atoms against {}",
+            wet.atom_count(),
+            dry.atom_count()
+        );
+        assert_eq!(wet.solute_atom_count(), dry.atom_count());
+        let heavy = dry.atoms().iter().filter(|a| a.element() != 1).count();
+        let selected = rmsd_atoms(&wet);
+        assert_eq!(selected.len(), heavy);
+        assert!(selected.iter().all(|&i| i < wet.solute_atom_count()));
+        assert_eq!(selected, rmsd_atoms(&dry));
+        // the definition handed to the analysis worker uses the same atoms
+        let definition = AnalysisDefinition::from_system(&wet, &wet.coordinates(), &[]).unwrap();
+        assert_eq!(definition.rmsd_atoms, selected);
+        // water that moves does not change the solute's RMSD
+        let mut moved = wet.coordinates();
+        for point in moved.iter_mut().skip(wet.solute_atom_count()) {
+            point.x += 3.;
+        }
+        let result = analyze(&wet, &wet.coordinates(), &moved, &[]);
+        assert!(result.aligned_heavy_atom_rmsd.unwrap() < 1e-9);
+    }
     #[test]
     fn worker_analysis_matches_geometry_and_rejects_invalid_frames() {
         let points = vec![
