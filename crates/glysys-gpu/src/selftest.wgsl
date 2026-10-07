@@ -16,6 +16,9 @@
 
 var<workgroup> shared_values: array<vec4<f32>, 64>;
 
+// where 0xffffffff sits among the patterns (selftest.rs checks it)
+const SENTINEL_INDEX: u32 = 26u;
+
 fn rebuilt(v: vec4<f32>, scale: f32) -> vec4<f32> {
   return vec4<f32>(v.xyz * scale, v.w);
 }
@@ -55,7 +58,9 @@ fn collect(
 
   // through a function-local vector that is rebuilt in a loop, as the tile
   // kernels do with the atom they cache
-  var cached = vec4<f32>(0.0, 0.0, 0.0, bitcast<f32>(0xffffffffu));
+  // The sentinel is read at run time: a constant bitcast to a NaN is a
+  // compile error in WGSL.
+  var cached = vec4<f32>(0.0, 0.0, 0.0, bitcast<f32>(patterns[SENTINEL_INDEX]));
   for (var k = 0u; k < 4u; k++) {
     if (k == (i & 3u)) { cached = rebuilt(value, f32(k + 1u)); }
   }
