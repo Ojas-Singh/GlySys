@@ -459,15 +459,29 @@ pub struct ResidentDynamicsState {
 fn dynamics_error(value: u32) -> Option<String> {
     let constraint_kind = value & 0xf000_0000;
     if constraint_kind == 0x5000_0000 || constraint_kind == 0x6000_0000 {
-        let index = (value >> 16) & 0x0fff;
-        let residual = (value & 0xffff) as f32 / 1_000_000.0;
+        // The shader packs the index of the constraint group (a heavy atom
+        // with its hydrogens) into 12 bits and the relative residual, in
+        // parts per million, into 16: both saturate.
+        let group = (value >> 16) & 0x0fff;
+        let encoded = value & 0xffff;
+        let residual = encoded as f32 / 1_000_000.0;
         let kind = if constraint_kind == 0x5000_0000 {
-            "solute position"
+            "position"
         } else {
-            "solute velocity"
+            "velocity"
+        };
+        let group = if group == 0x0fff {
+            "4095 or beyond".to_string()
+        } else {
+            group.to_string()
+        };
+        let residual = if encoded == 0xffff {
+            format!("{residual:.1e} or more")
+        } else {
+            format!("{residual:.1e}")
         };
         return Some(format!(
-            "GPU {kind}-constraint projection failed at packed bond index {index} (residual {residual:.6e})"
+            "GPU solute {kind} constraints failed in constraint group {group} (relative error {residual})"
         ));
     }
     match value {
@@ -2493,5 +2507,27 @@ impl ResidentPbc {
     ) -> Result<(Vec<Vec3>, Vec<Vec3>), Error> {
         let state = self.read_dynamics_checkpoint(box_xyz).await?;
         Ok((state.coordinates, state.velocities))
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::dynamics_error;
+
+    #[test]
+    fn constraint_failures_name_their_group_and_say_when_a_field_is_saturated() {
+        assert_eq!(dynamics_error(0), None);
+        assert_eq!(
+            dynamics_error(0x5000_0000 | (149 << 16) | 1234).unwrap(),
+            "GPU solute position constraints failed in constraint group 149 (relative error 1.2e-3)"
+        );
+        assert_eq!(
+            dynamics_error(0x5000_0000 | (149 << 16) | 0xffff).unwrap(),
+            "GPU solute position constraints failed in constraint group 149 (relative error 6.6e-2 or more)"
+        );
+        assert_eq!(
+            dynamics_error(0x6000_0000 | (0x0fff << 16) | 30).unwrap(),
+            "GPU solute velocity constraints failed in constraint group 4095 or beyond (relative error 3.0e-5)"
+        );
     }
 }
