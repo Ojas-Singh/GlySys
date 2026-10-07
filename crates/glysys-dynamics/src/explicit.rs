@@ -18,6 +18,8 @@ use glysys_energy::pbc::{
     BoxVectors, NonbondedElectrostatics, PbcForceField, PbcNeighborList, ReactionField,
     classify_waters, molecules,
 };
+use glysys_energy::pbc_cluster::ClusterPairEngine;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 pub const SKIN_ANGSTROM: f64 = 1.5;
@@ -93,6 +95,37 @@ fn electrostatics_kind(protocol: &SimulationProtocol) -> NonbondedElectrostatics
             interpolation_order: 4,
         },
     }
+}
+
+/// Cluster-pair engine for reaction-field dynamics. Setting the environment
+/// variable `GLYSYS_CPU_REFERENCE_PAIRS` keeps the f64 reference pair loop
+/// (for validation runs); PME has no cluster kernel yet.
+fn cluster_engine(
+    system: &ParameterizedSystem,
+    protocol: &SimulationProtocol,
+) -> Result<Option<ClusterPairEngine>> {
+    if protocol.electrostatics != ElectrostaticsModel::ReactionField || reference_pairs_requested()
+    {
+        return Ok(None);
+    }
+    ClusterPairEngine::new(
+        system,
+        cutoff_angstrom(protocol),
+        SKIN_ANGSTROM,
+        protocol.rf_dielectric.unwrap_or(78.5),
+    )
+    .map(Some)
+    .map_err(Error::Energy)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reference_pairs_requested() -> bool {
+    std::env::var_os("GLYSYS_CPU_REFERENCE_PAIRS").is_some()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn reference_pairs_requested() -> bool {
+    false
 }
 
 /// Covalent bonds involving solute hydrogen, constrained alongside SETTLE
@@ -540,6 +573,12 @@ pub struct ExplicitSimulation<'a> {
     molecules: Vec<Vec<usize>>,
     backend: ReactionField,
     pairs: PbcNeighborList,
+    /// Single-precision cluster-pair engine for the dynamics force loop.
+    /// `None` keeps the f64 reference pair list for every evaluation.
+    cluster: Option<ClusterPairEngine>,
+    /// Set by [`Self::advance`] for steps whose energy, virial and pressure
+    /// are not observed (no frame, stage boundary or chunk end follows).
+    force_only: bool,
     /// Homogeneous long-range LJ correction, precomputed per topology and
     /// cutoff. It is a volume-only term and therefore adds no Cartesian
     /// force in the fixed-box integrator.
@@ -559,6 +598,8 @@ impl<'a> ExplicitSimulation<'a> {
             molecules: self.molecules,
             backend: self.backend,
             pairs: self.pairs,
+            cluster: self.cluster,
+            force_only: self.force_only,
             dispersion_coefficient: self.dispersion_coefficient,
             degrees_of_freedom: self.degrees_of_freedom,
             state: self.state,
@@ -737,6 +778,7 @@ impl<'a> ExplicitSimulation<'a> {
             super::resident_rng::ResidentThermostatRng::seeded(protocol.seed, system.atom_count())
         });
         let velocity_convention = VelocityConvention::for_protocol(&protocol);
+        let cluster = cluster_engine(system, &protocol)?;
         let mut sim = Self {
             field,
             masses,
@@ -745,6 +787,8 @@ impl<'a> ExplicitSimulation<'a> {
             molecules,
             backend,
             pairs,
+            cluster,
+            force_only: false,
             dispersion_coefficient,
             degrees_of_freedom,
             state: SimulationState {
@@ -890,6 +934,7 @@ impl<'a> ExplicitSimulation<'a> {
             ));
         }
         let degrees_of_freedom = dof_count(system.atom_count(), &settle);
+        let cluster = cluster_engine(system, &state.protocol)?;
         let mut sim = Self {
             field,
             masses,
@@ -898,6 +943,8 @@ impl<'a> ExplicitSimulation<'a> {
             molecules: molecules(system),
             backend,
             pairs,
+            cluster,
+            force_only: false,
             dispersion_coefficient,
             degrees_of_freedom,
             state,
@@ -951,7 +998,9 @@ impl<'a> ExplicitSimulation<'a> {
 
     /// Transactional step: errors leave committed state and RNG untouched.
     pub fn step(&mut self) -> Result<()> {
-        self.refresh_pairs()?;
+        if self.cluster.is_none() || self.state.protocol.has_npt() {
+            self.refresh_pairs()?;
+        }
         let ensemble = self.segment_ensemble();
         let adaptation_enabled = self.segment_info().3;
         // A volume attempt is the only operation after integration that can
@@ -1077,20 +1126,7 @@ impl<'a> ExplicitSimulation<'a> {
                 1. / dt,
             )?;
         }
-        self.refresh_pairs_for(&next_coords)?;
-        let box_vec = self.box_vectors()?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &next_coords,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.dynamics_energy(&next_coords)?;
         for (i, m) in self.masses.iter().enumerate() {
             next_vel[i] = add(
                 next_vel[i],
@@ -1196,20 +1232,7 @@ impl<'a> ExplicitSimulation<'a> {
                 2. / dt,
             )?;
         }
-        self.refresh_pairs_for(&next_coords)?;
-        let box_vec = self.box_vectors()?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &next_coords,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.dynamics_energy(&next_coords)?;
         if !energy.components.total().is_finite() {
             return Err(invalid("nonfinite explicit energy; checkpoint retained"));
         }
@@ -1252,31 +1275,44 @@ impl<'a> ExplicitSimulation<'a> {
         let mut resident_rng = self.state.resident_rng.clone();
 
         // Full kick, followed by the velocity projection at the old positions.
-        for (i, mass) in self.masses.iter().enumerate() {
-            next_vel[i] = add(
-                next_vel[i],
-                scale(self.state.gradient[i], -dt * ACCEL / mass),
-            );
-        }
+        // Per-atom updates are independent; the parallel loops perform the
+        // same arithmetic as the serial reference in any schedule.
+        next_vel
+            .par_iter_mut()
+            .zip(self.state.gradient.par_iter())
+            .zip(self.masses.par_iter())
+            .for_each(|((velocity, gradient), mass)| {
+                *velocity = add(*velocity, scale(*gradient, -dt * ACCEL / mass));
+            });
         if let Some(constraints) = &self.settle {
             constraints.constrain_velocities(&old_coords, &mut next_vel)?;
         }
 
         // First half drift, OU thermostat, second half drift.
-        for i in 0..trial_coords.len() {
-            trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
-        }
-        for (i, mass) in self.masses.iter().enumerate() {
-            let sigma = ((1. - decay * decay) * KB * self.state.protocol.temperature_k * ACCEL
-                / mass)
-                .sqrt();
-            let noise = if let Some(stream) = &mut resident_rng {
-                scale(stream.normal3(i), sigma)
-            } else {
-                random_velocity(&mut rng, sigma)
-            };
-            next_vel[i] = add(scale(next_vel[i], decay), noise);
-            trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
+        let temperature = self.state.protocol.temperature_k;
+        if let Some(stream) = &mut resident_rng {
+            trial_coords
+                .par_iter_mut()
+                .zip(next_vel.par_iter_mut())
+                .zip(self.masses.par_iter())
+                .zip(stream.words.par_iter_mut())
+                .for_each(|(((position, velocity), mass), word)| {
+                    *position = add(*position, scale(*velocity, 0.5 * dt));
+                    let sigma = ((1. - decay * decay) * KB * temperature * ACCEL / mass).sqrt();
+                    let noise = scale(super::resident_rng::normal3_word(word), sigma);
+                    *velocity = add(scale(*velocity, decay), noise);
+                    *position = add(*position, scale(*velocity, 0.5 * dt));
+                });
+        } else {
+            for i in 0..trial_coords.len() {
+                trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
+            }
+            for (i, mass) in self.masses.iter().enumerate() {
+                let sigma = ((1. - decay * decay) * KB * temperature * ACCEL / mass).sqrt();
+                let noise = random_velocity(&mut rng, sigma);
+                next_vel[i] = add(scale(next_vel[i], decay), noise);
+                trial_coords[i] = add(trial_coords[i], scale(next_vel[i], 0.5 * dt));
+            }
         }
 
         let mut next_coords = trial_coords.clone();
@@ -1290,38 +1326,30 @@ impl<'a> ExplicitSimulation<'a> {
             constraints.shake_solute_positions_from_old(&old_coords, &mut next_coords)?;
             // Add the constraint impulse to the trial velocity. This is the
             // LF-middle centered-velocity convention (not BAOAB RATTLE).
-            for i in 0..next_vel.len() {
-                next_vel[i] = add(
-                    next_vel[i],
-                    scale(add(next_coords[i], scale(trial_coords[i], -1.)), 1. / dt),
-                );
-            }
+            next_vel
+                .par_iter_mut()
+                .zip(next_coords.par_iter())
+                .zip(trial_coords.par_iter())
+                .for_each(|((velocity, next), trial)| {
+                    *velocity = add(*velocity, scale(add(*next, scale(*trial, -1.)), 1. / dt));
+                });
         }
 
-        self.refresh_pairs_for(&next_coords)?;
-        let box_vec = self.box_vectors()?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &next_coords,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.dynamics_energy(&next_coords)?;
         if !energy.components.total().is_finite() {
             return Err(invalid("nonfinite explicit energy; checkpoint retained"));
         }
-        for i in 0..next_coords.len() {
-            let displacement = add(next_coords[i], scale(old_coords[i], -1.));
-            if !finite(&next_coords[i]) || !finite(&next_vel[i]) || norm2(displacement) > 1. {
-                return Err(invalid(
-                    "unstable LF-middle step (>1 A); checkpoint retained",
-                ));
-            }
+        let unstable = next_coords
+            .par_iter()
+            .zip(next_vel.par_iter())
+            .zip(old_coords.par_iter())
+            .any(|((next, velocity), old)| {
+                !finite(next) || !finite(velocity) || norm2(add(*next, scale(*old, -1.))) > 1.
+            });
+        if unstable {
+            return Err(invalid(
+                "unstable LF-middle step (>1 A); checkpoint retained",
+            ));
         }
         self.state.rng_state = rng;
         self.state.resident_rng = resident_rng;
@@ -1432,6 +1460,40 @@ impl<'a> ExplicitSimulation<'a> {
             self.state.barostat_frozen = true;
         }
         Ok(())
+    }
+
+    /// Forces and observables for a dynamics step at `coords`: the cluster
+    /// engine when enabled (NPT keeps the reference list, which its
+    /// barostat proposals share), otherwise the f64 reference evaluator.
+    fn dynamics_energy(&mut self, coords: &[Vec3]) -> Result<glysys_energy::pbc::PbcEnergy> {
+        let box_vec = self.box_vectors()?;
+        if !self.state.protocol.has_npt()
+            && let Some(engine) = &mut self.cluster
+        {
+            return self
+                .field
+                .evaluate_with_cluster(
+                    engine,
+                    coords,
+                    &box_vec,
+                    self.dispersion_coefficient,
+                    self.state.protocol.dispersion_correction,
+                    !self.force_only,
+                )
+                .map_err(Error::Energy);
+        }
+        self.refresh_pairs_for(coords)?;
+        self.field
+            .evaluate_with_dispersion_coefficient(
+                coords,
+                &box_vec,
+                &self.pairs.pairs,
+                &self.backend,
+                cutoff_angstrom(&self.state.protocol),
+                self.dispersion_coefficient,
+                self.state.protocol.dispersion_correction,
+            )
+            .map_err(Error::Energy)
     }
 
     fn refresh_pairs_for(&mut self, coords: &[Vec3]) -> Result<()> {
@@ -1581,7 +1643,16 @@ impl<'a> ExplicitSimulation<'a> {
         let end = (self.state.step + steps.min(100)).min(self.state.protocol.total_steps());
         let mut frames = Vec::new();
         while self.state.step < end {
-            self.step()?;
+            let next = self.state.step + 1;
+            // Only steps whose observables are reported need energies; the
+            // integrator itself consumes forces alone.
+            self.force_only = next != end
+                && !next.is_multiple_of(self.state.protocol.save_every)
+                && !self.state.protocol.is_stage_boundary(next)
+                && next != self.state.protocol.total_steps();
+            let result = self.step();
+            self.force_only = false;
+            result?;
             if self
                 .state
                 .step

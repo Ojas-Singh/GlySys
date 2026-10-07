@@ -511,3 +511,109 @@ fn resident_lf_middle_projects_implicit_xh_constraints_at_two_femtoseconds() {
         }
     });
 }
+
+/// The tiled LF-middle force pass must reproduce the f64 reference forces
+/// and every energy component at the coordinates it returns.
+#[test]
+fn resident_lf_middle_forces_and_energies_match_the_cpu_reference() {
+    pollster::block_on(async {
+        for fixture in [
+            include_str!("../../../tests/fixtures/dipeptide.pdb"),
+            include_str!("../../../tests/fixtures/glycan.pdb"),
+        ] {
+            let system = SystemBuilder::new(BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(fixture)
+            .unwrap();
+            let protocol = SimulationProtocol {
+                minimization_iterations: 30,
+                equilibration_steps: 0,
+                production_steps: 8,
+                save_every: 4,
+                seed: 31,
+                solvent: glysys_dynamics::SolventModel::Implicit,
+                constraints: glysys_dynamics::ConstraintModel::HBonds,
+                thermostat: glysys_dynamics::Thermostat::Langevin,
+                langevin_discretization: glysys_dynamics::LangevinDiscretization::LfMiddle,
+                timestep_fs: 2.0,
+                ..Default::default()
+            };
+            let cpu = CpuSimulation::new(&system, protocol).unwrap();
+            let start = cpu.state.clone();
+            let context = glysys_gpu::GpuContext::new(glysys_gpu::GpuContextOptions::default())
+                .await
+                .unwrap();
+            let mut gpu = glysys_gpu::dynamics::ResidentDynamics::with_context(&system, &context)
+                .await
+                .unwrap();
+            let rng = start.resident_rng.as_ref().unwrap().words.clone();
+            gpu.initialize_resident(&start.coordinates, &start.velocities, &rng)
+                .await
+                .unwrap();
+            let batch = gpu
+                .advance_resident_lf_middle(
+                    &start.coordinates,
+                    &start.velocities,
+                    &rng,
+                    3,
+                    0.002,
+                    300.0,
+                    1.0,
+                )
+                .await
+                .unwrap();
+            let evaluator = glysys_energy::EnergyEvaluator::new(
+                &system,
+                glysys_energy::EnergyOptions {
+                    obc2: Some(Default::default()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let reference = evaluator.energy_and_gradient(&batch.coordinates).unwrap();
+            let c = reference.components;
+            let expected = [
+                c.bonds,
+                c.angles,
+                c.proper_torsions,
+                c.improper_torsions,
+                c.van_der_waals,
+                c.electrostatics,
+                c.generalized_born,
+                c.surface_area,
+                c.restraints,
+            ];
+            for (index, (got, want)) in batch.components.iter().zip(expected).enumerate() {
+                assert!(
+                    (f64::from(*got) - want).abs() <= 2e-3 + 2e-4 * want.abs(),
+                    "component {index}: GPU {got} vs CPU {want}"
+                );
+            }
+            let (mut error2, mut reference2) = (0.0, 0.0);
+            for (atom, (g, r)) in batch
+                .gradients
+                .iter()
+                .zip(reference.gradients.as_ref().unwrap())
+                .enumerate()
+            {
+                for (got, want) in [(g.x, r.x), (g.y, r.y), (g.z, r.z)] {
+                    assert!(
+                        (got - want).abs() <= 1e-2 + 1e-3 * want.abs(),
+                        "atom {atom}: gradient {got} vs {want}"
+                    );
+                    error2 += (got - want).powi(2);
+                    reference2 += want * want;
+                }
+            }
+            assert!(
+                (error2 / reference2).sqrt() < 1e-4,
+                "normalized force RMS {}",
+                (error2 / reference2).sqrt()
+            );
+        }
+    });
+}

@@ -2,8 +2,10 @@
 
 pub mod geometry;
 pub mod hydration;
+pub mod implicit_cluster;
 mod obc2;
 pub mod pbc;
+pub mod pbc_cluster;
 pub mod prior;
 pub mod scoring;
 
@@ -626,6 +628,121 @@ impl<'a> EnergyEvaluator<'a> {
         Ok(gradients)
     }
 
+    /// The f32 implicit-solvent engine matching this evaluator's no-cutoff
+    /// nonbonded and OBC2 terms, for dynamics force steps; `None` when a
+    /// cutoff, term selection or vacuum model makes the reference path apply.
+    pub fn implicit_pair_engine(&self) -> Result<Option<implicit_cluster::ImplicitPairEngine>> {
+        let n = self.system.atom_count();
+        let Some(obc2) = &self.options.obc2 else {
+            return Ok(None);
+        };
+        if self.options.cutoff.is_some()
+            || self.active_terms_only
+            || (0..n).any(|atom| !self.selection.is_movable(atom))
+        {
+            return Ok(None);
+        }
+        implicit_cluster::ImplicitPairEngine::new(
+            &self.system,
+            obc2.clone(),
+            self.options.dielectric,
+        )
+        .map(Some)
+    }
+
+    /// Bonded, torsion and restraint gradient only (f64), the complement of
+    /// [`implicit_cluster::ImplicitPairEngine::gradient_into`].
+    pub fn bonded_gradient(&self, coordinates: &[Vec3]) -> Result<Vec<Vec3>> {
+        self.weighted_gradient(coordinates, [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    }
+
+    /// Gradient for dynamics integration steps: the same f64 physics as
+    /// [`Self::gradient_only`], with the no-cutoff Lennard-Jones/Coulomb term
+    /// evaluated row-parallel. Each atom owns its full row (every partner in
+    /// index order), so the result is independent of the thread count but
+    /// differs from the serial upper-triangle walk at rounding level. Cutoff,
+    /// active-term and partial-selection evaluators use the serial path.
+    pub fn gradient_parallel(&self, coordinates: &[Vec3]) -> Result<Vec<Vec3>> {
+        let n = self.system.atom_count();
+        if self.options.cutoff.is_some()
+            || self.active_terms_only
+            || (0..n).any(|atom| !self.selection.is_movable(atom))
+        {
+            return self.gradient_only(coordinates);
+        }
+        validate_coordinates(n, coordinates)?;
+        let mut gradients =
+            self.analytic_gradient(coordinates, &[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0])?;
+        let atoms = self.system.atoms();
+        let charge: Vec<f64> = atoms.iter().map(|a| a.charge()).collect();
+        let sigma: Vec<f64> = atoms.iter().map(|a| a.lennard_jones_radius()).collect();
+        let epsilon: Vec<f64> = atoms.iter().map(|a| a.lennard_jones_epsilon()).collect();
+        let mut scaled_rows = vec![Vec::new(); n];
+        for (&(first, second), &scale) in &self.one_four {
+            scaled_rows[first].push((second, scale));
+            scaled_rows[second].push((first, scale));
+        }
+        let exclusions = self.system.exclusions();
+        let dielectric = self.options.dielectric;
+        const EXCLUDED: u8 = 1;
+        const SCALED: u8 = 2;
+        let rows: Vec<Vec3> = (0..n)
+            .into_par_iter()
+            .map_init(
+                || (vec![0u8; n], vec![(1.0, 1.0); n]),
+                |(marks, scales), first| {
+                    for &second in &exclusions[first] {
+                        marks[second] = EXCLUDED;
+                    }
+                    for &(second, scale) in &scaled_rows[first] {
+                        marks[second] = SCALED;
+                        scales[second] = scale;
+                    }
+                    marks[first] = EXCLUDED;
+                    let mut row = Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    };
+                    for second in 0..n {
+                        let (scee, scnb) = match marks[second] {
+                            0 => (1.0, 1.0),
+                            SCALED => scales[second],
+                            _ => continue,
+                        };
+                        let vector = subtract(coordinates[first], coordinates[second]);
+                        let radius = norm(vector).max(1.0e-8);
+                        let ratio6 = ((sigma[first] + sigma[second]) / radius).powi(6);
+                        let coulomb = COULOMB_KCAL_ANGSTROM * charge[first] * charge[second]
+                            / (dielectric * scee * radius);
+                        let derivative = 12.0
+                            * (epsilon[first] * epsilon[second]).sqrt()
+                            * (ratio6 - ratio6 * ratio6)
+                            / (scnb * radius)
+                            - coulomb / radius;
+                        add_scaled(&mut row, vector, derivative / radius);
+                    }
+                    for &second in &exclusions[first] {
+                        marks[second] = 0;
+                    }
+                    for &(second, _) in &scaled_rows[first] {
+                        marks[second] = 0;
+                    }
+                    marks[first] = 0;
+                    row
+                },
+            )
+            .collect();
+        for (gradient, (row, residual)) in gradients.iter_mut().zip(
+            rows.into_iter()
+                .zip(self.residual_gradient(coordinates, &[1.0; 9])),
+        ) {
+            add_scaled(gradient, row, 1.0);
+            add_scaled(gradient, residual, 1.0);
+        }
+        Ok(gradients)
+    }
+
     /// Analytic derivative of an explicitly weighted component sum.
     pub fn weighted_gradient(&self, coordinates: &[Vec3], weights: [f64; 9]) -> Result<Vec<Vec3>> {
         if weights.iter().any(|w| !w.is_finite()) {
@@ -763,7 +880,9 @@ impl<'a> EnergyEvaluator<'a> {
             add_scaled(&mut gradient[first], vector, derivative / radius);
             add_scaled(&mut gradient[second], vector, -derivative / radius);
         };
-        self.for_each_nonbonded_pair(coordinates, apply_pair);
+        if weights[4] != 0.0 || weights[5] != 0.0 {
+            self.for_each_nonbonded_pair(coordinates, apply_pair);
+        }
         for restraint in &self.options.restraints {
             if let Some(position) = coordinates.get(restraint.atom) {
                 let vector = subtract(*position, restraint.reference);
@@ -821,7 +940,12 @@ impl<'a> EnergyEvaluator<'a> {
                 }
             }
         }
-        if let Some(options) = &self.options.obc2 {
+        if let Some(options) = self
+            .options
+            .obc2
+            .as_ref()
+            .filter(|_| weights[6] != 0.0 || weights[7] != 0.0)
+        {
             if weights[6] == weights[7] {
                 let values = obc2::gradient(self.system.atoms(), coordinates, options);
                 for (i, value) in values.into_iter().enumerate() {

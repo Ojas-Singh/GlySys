@@ -146,7 +146,17 @@ pub struct GpuContext(Arc<GpuContextInner>);
 
 impl GpuContext {
     pub async fn new(options: GpuContextOptions) -> Result<Self, Error> {
-        let instance = wgpu::Instance::default();
+        // Every indirect dispatch in this crate reads arguments written by
+        // GlySys's own bounded kernels (PBC neighbor stages), so the extra
+        // validation pass wgpu inserts before each one in release builds is
+        // pure overhead on the per-step critical path. Browsers validate
+        // indirect arguments themselves.
+        let mut flags = wgpu::InstanceFlags::from_build_config().with_env();
+        flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            flags,
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&high_performance_adapter_options())
             .await

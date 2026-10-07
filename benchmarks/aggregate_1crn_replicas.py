@@ -60,12 +60,12 @@ def equivalence(left, right, margin):
     }
 
 
-def read_pair(run_path, openmm_path):
+def read_pair(run_path, openmm_path, expected_backend="GPU"):
     run = json.loads((run_path / "run.json").read_text())
     openmm = json.loads(openmm_path.read_text())
     protocol = run["protocol"]
-    if run["backend"] != "GPU" or run["fallbackReason"] is not None:
-        raise ValueError(f"{run_path} is not a no-fallback GPU qualification")
+    if run["backend"] != expected_backend or run["fallbackReason"] is not None:
+        raise ValueError(f"{run_path} is not a no-fallback {expected_backend} qualification")
     if protocol["solvent"] not in ("explicit", "implicit") or openmm["mode"] != protocol["solvent"]:
         raise ValueError(f"solvent model mismatch in {run_path}")
     if protocol["langevinDiscretization"] != "lf-middle" or openmm["thermostat"] != "langevin-middle":
@@ -135,13 +135,14 @@ def main():
     parser.add_argument("--openmm-result", required=True, action="append", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--block-duration-ps", type=float, default=10.0)
+    parser.add_argument("--expected-backend", choices=("GPU", "CPU"), default="GPU")
     args = parser.parse_args()
     if len(args.glysys_run) != len(args.openmm_result):
         raise ValueError("provide one OpenMM result for every GlySys run")
     if not 2 <= len(args.glysys_run) <= 3:
         raise ValueError("aggregate two or three independent replicas")
 
-    replicas = [read_pair(run_path, openmm_path)
+    replicas = [read_pair(run_path, openmm_path, args.expected_backend)
                 for run_path, openmm_path in zip(args.glysys_run, args.openmm_result)]
     seeds = [replica["seed"] for replica in replicas]
     if len(set(seeds)) != len(seeds):

@@ -1,6 +1,6 @@
 # GlySys performance milestone progress
 
-Last updated: 2026-09-26. Results below distinguish diagnostic throughput from
+Last updated: 2026-10-06. Results below distinguish diagnostic throughput from
 numerical and trajectory qualification. The user accepted an approximate
 220 ns/day explicit-GPU core-throughput target; the earlier 80%-of-OpenMM
 throughput target is superseded for this milestone. Scientific equivalence gates
@@ -89,15 +89,112 @@ user authorization.
 - The service's versioned web root is `/mnt/glycoshape/GlycoShapeCE/web-glysys-md-preview-20260926`; the previous preview directory remains intact. A new systemd drop-in selects that root for the development service. The local test tunnel is `http://127.0.0.1:6969`.
 - The tetramer PDB loads in ReGlyco and its glycan-configuration API returns successfully. The scan was stopped at the explicit Level 2 dataset-terms acknowledgment prompt; no acknowledgment was made. ReGlyco scan/build/ensemble execution still requires the user's authorization for that test.
 
+## Engine and throughput update (2026-10-06)
+
+Machine: Intel i7-12700H (14 cores/20 threads) with an RTX 3060 Laptop GPU
+(Vulkan), Windows 11; OpenMM 8.6.1 (`--allow-unpinned-openmm`) in mixed
+precision. Same prepared 1CRN systems and 2 fs LF-middle qualification
+protocols as above; 100 minimization iterations, 200 warmup steps, then one
+paired 8-second timed window per engine. These are diagnostic screens, not the
+pinned-8.1.1 RX 7800 XT matrix.
+
+| ns/day | GlySys Vulkan | OpenMM CUDA | OpenMM OpenCL | GlySys CPU | OpenMM CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Explicit (12,132 atoms) | 555 | 541 | 386 | 11.0 (1 t), 32.7 (6 t), 32.8 (14 t), 34.2 (20 t) | 8.0 (1 t), 17.3 (6 t), 28.9 (14 t), 31.6 (20 t) |
+| Implicit (642 atoms) | 1834 | 1499 | 1194 | 43.5 (1 t), 130.9 (6 t), 134.4 (14 t) | 29.6 (1 t), 101.9 (6 t), 83.6 (14 t) |
+
+Changes behind these numbers:
+
+- Explicit GPU: tiled nonbonded engine (`pbc_tiles.{rs,wgsl}`, now the
+  `with_context` default): Hilbert-ordered 32-atom blocks, GPU-built
+  bounding-box tile lists, full-list tiles with no atomics in the pair kernel,
+  fixed-point bonded accumulation, one compute pass per packet with two packets
+  in flight, and energies only on each packet's final step. wgpu's
+  `VALIDATION_INDIRECT_CALL` is disabled in `GpuContext`.
+- Implicit GPU: 32×32 OBC2 tiles (`implicit_tiles.{rs,wgsl}`) in the resident
+  LF-middle loop.
+- Explicit CPU: f32 8-atom cluster-pair RF engine (`pbc_cluster.rs`, AVX2 with
+  a bitwise-identical portable path), parallel SETTLE/LF-middle updates,
+  force-only unobserved steps.
+- Implicit CPU: f32 OBC2 + LJ/Coulomb engine (`implicit_cluster.rs`, AVX2 with
+  a bitwise-identical portable path; row ownership makes results independent of
+  the thread count). One shared reciprocal per pair cut the divides per pair
+  from 5 to 3 (Born) and from 15 to 5 (chain rule). Against the f64 evaluator on
+  1CRN: relative RMS 3.6e-7, max 5.1e-5 kcal/mol/Å.
+- Torsion gradients: closed form instead of 12-component dual numbers (angle
+  bit-identical, gradients within 1e-9); 1CRN bonded gradient 0.57 → 0.24 ms.
+
+Accuracy on the same machine (OpenMM CUDA as the ensemble reference;
+`validate_1crn_dynamics.py`, unchanged margins of 3 K and 0.005 kcal/mol/atom):
+
+Force snapshots at end-of-run checkpoints against OpenMM Reference (double
+precision; `checkpoint_force_snapshot.py`, `openmm_force_snapshot.py`,
+`compare_force_snapshots.py`, tolerance RMS ≤ 1e-3) all pass:
+
+| Checkpoint | Normalized force RMS | Max component (kcal/mol/Å) | Energy difference (kcal/mol) |
+| --- | ---: | ---: | ---: |
+| Explicit CPU (f32 cluster engine), 0.308 ns | 4.7e-6 | 2.2e-3 | 0.0057 |
+| Explicit Vulkan, 0.308 ns | 5.3e-5 | 8.3e-3 | 0.0055 |
+| Implicit CPU, 0.308 ns | 7.3e-6 | 1.8e-3 | 0.0000 |
+| Implicit Vulkan, 2 ns (seeds 8 and 10) | 1.4e-5 | 1.4e-3 | 0.0017 |
+
+Trajectory equivalence:
+
+- Explicit Vulkan, seeds 8 and 9 (two-replica aggregate): **pass** on every
+  check — temperature difference 0.17 K (CI width 0.65 K), potential energy
+  difference 0.00019 kcal/mol/atom (CI width 0.0025), both stationarity checks.
+- Implicit Vulkan, three 2 ns replicas (`1crn-implicit-lf-middle-2fs-2ns-validation.json`,
+  seeds 8–10): temperature passes (0.05 K). Energy differs by 0.00185
+  kcal/mol/atom (CI width 0.0023), formally **inconclusive** because seed 8's
+  GlySys energy series has a 0.34 lag-one block correlation. At the replica
+  level the difference is not significant (t = −1.34; GlySys replica SD 0.0023,
+  OpenMM 0.0006). Control (`benchmarks/openmm_replica_control.py`, same
+  statistics and rule): three further OpenMM replicas (seeds 11–13) differ from
+  OpenMM seeds 8–10 by 0.00256 kcal/mol/atom — more than GlySys does — and
+  GlySys against those independent OpenMM replicas differs by only 0.00071
+  (inconclusive again only through the same 0.34 correlation). OpenMM's own
+  energy series reaches 0.33 lag-one correlation at 40 ps blocks: 1CRN in OBC2
+  has slow conformational energy fluctuations, so the correlation rule rather
+  than an engine difference limits this gate.
+- Implicit CPU (14 threads), one 2 ns replica: temperature (0.13 K) and energy
+  (0.0018 kcal/mol/atom, CI width 0.0040) equivalence both **pass**; the run is
+  formally inconclusive only because single-run half-versus-half stationarity
+  intervals exceed 0.005 for both GlySys (0.0058) and OpenMM (0.0055).
+- Explicit CPU (20 threads), one 1 ns replica (new
+  `1crn-explicit-lf-middle-2fs-1ns-validation.json`, seed 10): temperature
+  (0.063 K, CI width 0.42 K) and both stationarity checks pass; energy differs
+  by 0.00044 kcal/mol/atom (CI width 0.0017) but is formally inconclusive
+  because the GlySys 10 ps block correlation is 0.304 (rule ≤ 0.3). With 20 ps
+  blocks (`openmm_replica_control.py`) the correlation is 0.18 and both
+  temperature and energy equivalence pass. The 2 ns implicit CPU run passes
+  mean equivalence with both 10 and 20 ps blocks.
+- Explicit CPU (20 threads), seeds 8 and 9 (0.308 ns): the two-replica aggregate
+  (`aggregate_1crn_replicas.py --expected-backend CPU`) passes potential energy
+  (difference 0.00065, CI width 0.0025) and has a 0.041 K temperature difference
+  (CI width 0.63 K), but is formally **inconclusive**: the seed-8 GlySys
+  temperature series has a −0.357 lag-one 10 ps block correlation (rule: |r| ≤
+  0.3). Seed 9 alone passes every GlySys-side check; its overall status is
+  inconclusive only because OpenMM's own energy stationarity CI (0.00502)
+  exceeds the 0.005 margin.
+- Implicit CPU (6 threads), 0.308 ns, seed 8: inconclusive (CI widths 3.2 K
+  and 0.0092 exceed the margins; mean differences 0.84 K and 0.0019); superseded
+  by the 2 ns run above.
+
+Not re-run in this update: the browser/WebGPU smoke through GlycoShapeCE. The
+wasm32 `glysys-runtime` build passes, and the tiled kernels stay within WebGPU
+default limits (at most 7 storage buffers per stage, at most 8.2 KiB workgroup
+memory, at most 256 invocations).
+
 ## In progress / not yet passed
 
-- Explicit GPU two-replica 0.3 ns trajectory equivalence now passes. Supplied-noise and multi-snapshot force validation remain outstanding. One implicit CPU comparison is inconclusive; additional CPU replica/statistics qualification and explicit CPU trajectory qualification remain outstanding.
-- Implicit GPU is not a pass or a detected failure; the predeclared three-replica limit was reached with residual 10 ps block correlation and an energy CI width just above its margin. Diagnose the correlation/statistical window without changing the scientific margins; do not report implicit as qualified unless a justified analysis passes.
+- Explicit GPU two-replica 0.3 ns trajectory equivalence passes, now also with the 2026-10-06 tiled engine (RTX 3060, OpenMM 8.6.1 CUDA). End-of-run force snapshots against OpenMM Reference pass for all four engines. Supplied-noise force validation remains outstanding.
+- CPU explicit (1 ns) and CPU implicit (2 ns) pass mean equivalence with 20 ps blocks; at the predeclared 10 ps blocks they remain formally inconclusive (explicit energy block correlation 0.304; implicit single-run stationarity intervals above the margin for both engines). The 20 ps window was chosen after seeing the 10 ps result; confirm it on fresh replicas before treating it as the qualification window.
+- Implicit GPU (three 2 ns replicas) passes temperature; its energy remains formally inconclusive through one replica's 0.34 block correlation. The OpenMM-against-OpenMM control shows the gate's sampling limit (0.00256 kcal/mol/atom between OpenMM replica sets, against 0.00185 GlySys-OpenMM) and that OpenMM's own energy series stays correlated at 40 ps blocks.
 - Browser/WebGPU smoke and the live ns/day display are verified on the deployed preview, but the browser run was only 25 ps. ReGlyco's tetramer scan/build/ensemble E2E remains blocked on the user's choice at the Level 2 data-terms acknowledgment prompt.
-- The explicit full-run result is 225.67 ns/day including setup/output. The latest qualifying timed core-throughput matrix and the complete remaining release gates have not been run. The earlier 80%-of-OpenMM all-configuration target was superseded by the user's approximate 220 ns/day explicit-GPU target; scientific equivalence requirements remain mandatory.
+- The explicit full-run result is 225.67 ns/day including setup/output. The latest qualifying timed core-throughput matrix and the complete remaining release gates have not been run. The user restated the 80%-of-OpenMM GPU and CPU target on 2026-10-06; every configuration in the 2026-10-06 diagnostic screen is at or above 100% of OpenMM (1-20 CPU threads, CUDA and OpenCL), but the pinned matrix has not been rerun. Scientific equivalence requirements remain mandatory.
 
 ## Next concrete actions
 
-1. Diagnose why the implicit GPU observable series retains >0.3 lag-one correlation at 10 ps blocks and why the CPU 0.3 ns energy intervals remain broad; preserve the fixed mean-equivalence margins and document any justified longer statistical window.
-2. Finish supplied-noise and multi-snapshot force checks and continue CPU LF-middle qualification against OpenMM. Keep inconclusive models clearly labeled and do not release them as scientifically qualified.
+1. Predeclare the statistical window for the long validation protocols (20 ps blocks, or longer replicas for implicit, where 1CRN's energy correlation persists beyond 40 ps in OpenMM too) and rerun fresh replicas against it, keeping the 3 K / 0.005 margins.
+2. Finish supplied-noise force checks. Rerun the pinned OpenMM 8.1.1 RX 7800 XT throughput matrix and the browser/WebGPU smoke with the 2026-10-06 engines.
 3. With explicit authorization for the Level 2 dataset terms, complete the tetramer ReGlyco scan/build/ensemble preview test; otherwise leave that E2E gate pending. Then run the browser/WebGPU regression checks on the deployed 6969 preview and determine whether another bundle is needed.

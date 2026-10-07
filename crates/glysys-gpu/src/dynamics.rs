@@ -1,4 +1,5 @@
 //! Resident implicit-solvent dynamics share force-field coordinates/gradients.
+use crate::implicit_tiles::ImplicitTiles;
 use crate::{
     context::{AllocationReservation, GpuContext},
     device::{Config, Error, ResidentEvaluator},
@@ -146,6 +147,9 @@ pub struct ResidentDynamics {
     masses: Vec<f64>,
     resident_initialized: bool,
     gpu_stage_timings_ms: std::sync::Mutex<BTreeMap<String, f64>>,
+    /// Tiled OBC2 force pass for the LF-middle loop; `None` keeps the
+    /// per-target direct-force kernel (very large systems only).
+    tiles: Option<ImplicitTiles>,
     _allocation: AllocationReservation,
 }
 impl ResidentDynamics {
@@ -222,11 +226,17 @@ impl ResidentDynamics {
         let (groups, constraints) = implicit_hbond_groups(system);
         let energy = ResidentEvaluator::with_context(context, topology.view(), 1).await?;
         let existing = energy.buffers.iter().map(|b| b.size()).sum::<u64>() + energy.staging.size();
+        let use_tiles = ImplicitTiles::supports(n as u32, &energy.device.limits());
         let additional = n as u64 * (16 + 16 * LEGACY_NOISE_STEPS as u64 + 64 + 16 + 4)
             + MAX_STEPS as u64 * 256
             + groups.len() as u64 * 16
             + constraints.len() as u64 * 32
-            + 96;
+            + 96
+            + if use_tiles {
+                ImplicitTiles::allocation_bytes(n as u32)
+            } else {
+                0
+            };
         if existing
             .checked_add(additional)
             .is_none_or(|bytes| bytes > context.memory_profile().budget())
@@ -486,6 +496,12 @@ impl ResidentDynamics {
             return Err(Error::Capacity);
         }
         let constraint_group_count = groups.len() as u32;
+        let tiles = use_tiles.then(|| {
+            for (kernel, _) in crate::implicit_tiles::KERNELS {
+                context.record_pipeline(format!("implicit_tiles.{kernel}"));
+            }
+            ImplicitTiles::new(&energy, n as u32, topology.view().terms.len() as u32)
+        });
         Ok(Self {
             energy,
             topology,
@@ -511,6 +527,7 @@ impl ResidentDynamics {
             resident_initialized: false,
             gpu_stage_timings_ms: std::sync::Mutex::new(BTreeMap::new()),
             masses: system.atoms().iter().map(|a| a.mass()).collect(),
+            tiles,
             _allocation: reservation,
         })
     }
@@ -689,12 +706,14 @@ impl ResidentDynamics {
         let md_targets = (n as u32).div_ceil(targets_per_workgroup);
         let groups = self.constraint_group_count.div_ceil(64);
         let mut remaining = steps;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut previous_submission: Option<wgpu::SubmissionIndex> = None;
         while remaining > 0 {
             let batch = remaining.min(self.packet_steps);
             crate::push_error_scope(device, wgpu::ErrorFilter::OutOfMemory);
             #[cfg(not(target_arch = "wasm32"))]
             let timestamp_query_count = if self.energy._context.gpu_timestamps_enabled() {
-                u32::try_from(batch.checked_mul(12).ok_or(Error::Capacity)?)
+                u32::try_from(batch.checked_mul(16).ok_or(Error::Capacity)?)
                     .map_err(|_| Error::Capacity)?
             } else {
                 0
@@ -738,77 +757,126 @@ impl ResidentDynamics {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("resident LF-middle bounded packet"),
             });
+            // Stage kinds: integrator kernels (dynamic uniform offset),
+            // evaluator kernels, and the tiled force pass.
+            enum Kernel {
+                Integrator(usize),
+                Evaluator(usize),
+                Tiles(usize),
+            }
+            let last_packet = batch == remaining;
+            let profiled = timestamp_query_set.is_some();
+            // `forget_lifetime` releases the encoder borrow; the profiled
+            // path never opens the shared pass, so the encoder stays usable.
+            let mut shared_pass = (!profiled).then(|| {
+                encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("resident LF-middle packet"),
+                        timestamp_writes: None,
+                    })
+                    .forget_lifetime()
+            });
+            let mut query = 0u32;
             for step_index in 0..batch {
                 let offset = (step_index * 256) as u32;
-                let stages = [
+                let energy_step = last_packet && step_index + 1 == batch;
+                let mut stages: Vec<(Kernel, &str, u32, &'static str)> = vec![
                     (
-                        2,
+                        Kernel::Integrator(2),
                         "LF full force kick and velocity projection",
                         groups,
                         "velocityKickProjection",
                     ),
                     (
-                        3,
+                        Kernel::Integrator(3),
                         "LF OU, split drift, and trial snapshot",
                         atoms,
                         "thermostatAndDrift",
                     ),
                     (
-                        4,
+                        Kernel::Integrator(4),
                         "LF position projection and velocity correction",
                         groups,
                         "positionProjection",
                     ),
-                    (
-                        self.md_pipeline_start,
-                        "OBC2 tiled Born radii",
-                        md_targets,
-                        "bornRadii",
-                    ),
-                    (
-                        self.md_pipeline_start + 1,
-                        "OBC2 tiled Born adjoints",
-                        md_targets,
-                        "bornAdjoints",
-                    ),
-                    (
-                        self.md_pipeline_start + 2,
-                        "OBC2 tiled per-atom forces",
-                        md_targets,
-                        "directForces",
-                    ),
                 ];
-                for (stage_index, (pipeline_index, label, workgroups, stage_name)) in
-                    stages.into_iter().enumerate()
-                {
+                if self.tiles.is_some() {
+                    for stage in 0..crate::implicit_tiles::STAGES {
+                        stages.push((
+                            Kernel::Tiles(stage),
+                            "OBC2 tiled Born, pair, bonded and finalize passes",
+                            0,
+                            ImplicitTiles::stage_name(stage),
+                        ));
+                    }
+                } else {
+                    stages.extend([
+                        (
+                            Kernel::Evaluator(self.md_pipeline_start),
+                            "OBC2 tiled Born radii",
+                            md_targets,
+                            "bornRadii",
+                        ),
+                        (
+                            Kernel::Evaluator(self.md_pipeline_start + 1),
+                            "OBC2 tiled Born adjoints",
+                            md_targets,
+                            "bornAdjoints",
+                        ),
+                        (
+                            Kernel::Evaluator(self.md_pipeline_start + 2),
+                            "OBC2 tiled per-atom forces",
+                            md_targets,
+                            "directForces",
+                        ),
+                    ]);
+                }
+                for (kernel, label, workgroups, stage_name) in stages {
                     let timestamp_writes = timestamp_query_set.as_ref().map(|query_set| {
-                        let query = ((step_index * 6 + stage_index) * 2) as u32;
                         wgpu::ComputePassTimestampWrites {
                             query_set,
                             beginning_of_pass_write_index: Some(query),
                             end_of_pass_write_index: Some(query + 1),
                         }
                     });
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some(label),
-                        timestamp_writes,
+                    let mut own_pass = profiled.then(|| {
+                        encoder
+                            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some(label),
+                                timestamp_writes,
+                            })
+                            .forget_lifetime()
                     });
-                    if pipeline_index < self.pipelines.len() {
-                        pass.set_pipeline(&self.pipelines[pipeline_index]);
-                        pass.set_bind_group(0, &self.bind, &[offset]);
-                    } else {
-                        pass.set_pipeline(&self.energy.pipeline_set.pipelines[pipeline_index]);
-                        pass.set_bind_group(0, &self.energy.bind_group, &[]);
+                    let pass = own_pass
+                        .as_mut()
+                        .or(shared_pass.as_mut())
+                        .expect("a compute pass is open");
+                    match kernel {
+                        Kernel::Integrator(index) => {
+                            pass.set_pipeline(&self.pipelines[index]);
+                            pass.set_bind_group(0, &self.bind, &[offset]);
+                            pass.dispatch_workgroups(workgroups, 1, 1);
+                        }
+                        Kernel::Evaluator(index) => {
+                            pass.set_pipeline(&self.energy.pipeline_set.pipelines[index]);
+                            pass.set_bind_group(0, &self.energy.bind_group, &[]);
+                            pass.dispatch_workgroups(workgroups, 1, 1);
+                        }
+                        Kernel::Tiles(stage) => {
+                            self.tiles
+                                .as_ref()
+                                .expect("tiled stages require the tiled engine")
+                                .encode(pass, energy_step, stage);
+                        }
                     }
-                    pass.dispatch_workgroups(workgroups, 1, 1);
-                    drop(pass);
-                    timestamp_stages.push((
-                        stage_name,
-                        ((step_index * 6 + stage_index) * 2) as u32,
-                        ((step_index * 6 + stage_index) * 2 + 1) as u32,
-                    ));
+                    drop(own_pass);
+                    if profiled {
+                        timestamp_stages.push((stage_name, query, query + 1));
+                        query += 2;
+                    }
                 }
             }
+            drop(shared_pass);
             if let (Some(query_set), Some(resolve), Some(readback)) = (
                 timestamp_query_set.as_ref(),
                 timestamp_resolve.as_ref(),
@@ -817,14 +885,29 @@ impl ResidentDynamics {
                 encoder.resolve_query_set(query_set, 0..timestamp_query_count, resolve, 0);
                 encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, timestamp_bytes);
             }
-            queue.submit([encoder.finish()]);
+            let submission = queue.submit([encoder.finish()]);
             remaining -= batch;
+            // Keep up to two packets in flight so encoding overlaps device
+            // execution; profiling waits for each packet's timestamps.
             #[cfg(not(target_arch = "wasm32"))]
-            if let Err(error) = device.poll(wgpu::PollType::Wait) {
-                let _ = crate::pop_error_scope(device).await;
-                let _ = crate::pop_error_scope(device).await;
-                return Err(Error::Execution(error.to_string()));
+            {
+                let wait = if profiled {
+                    Some(wgpu::PollType::Wait)
+                } else {
+                    previous_submission
+                        .replace(submission)
+                        .map(wgpu::PollType::WaitForSubmissionIndex)
+                };
+                if let Some(wait) = wait
+                    && let Err(error) = device.poll(wait)
+                {
+                    let _ = crate::pop_error_scope(device).await;
+                    let _ = crate::pop_error_scope(device).await;
+                    return Err(Error::Execution(error.to_string()));
+                }
             }
+            #[cfg(target_arch = "wasm32")]
+            let _ = submission;
             if let Some(error) = crate::pop_error_scope(device).await {
                 let _ = crate::pop_error_scope(device).await;
                 return Err(Error::Execution(format!(

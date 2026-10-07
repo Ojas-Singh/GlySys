@@ -24,11 +24,13 @@ def main():
     parser.add_argument("--openmm", required=True, type=Path)
     parser.add_argument("--glysys", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--allow-unpinned-openmm", action="store_true",
+                        help="accept a reference from an OpenMM version other than 8.1.1")
     args = parser.parse_args()
 
     openmm = json.loads(args.openmm.read_text())
     glysys = json.loads(args.glysys.read_text())
-    if openmm["openmmVersion"] != "8.1.1":
+    if not args.allow_unpinned_openmm and openmm["openmmVersion"] != "8.1.1":
         raise ValueError("force comparison requires pinned OpenMM 8.1.1")
     if openmm["atoms"] != glysys["atoms"]:
         raise ValueError("atom counts differ")

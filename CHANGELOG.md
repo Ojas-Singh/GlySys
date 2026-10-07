@@ -34,6 +34,41 @@
   five-membered ring (proline, histidine, tryptophan, furanoses, nucleic-acid
   sugars): they are now excluded as in tleap, in the Amber and GROMACS writers
   and in the CPU and GPU energy code.
+- Explicit GPU dynamics use a new tiled nonbonded engine by default
+  (`PbcKernel::Tiles`): Hilbert-ordered 32-atom blocks with bounding-box tile
+  lists rebuilt on the GPU, full-list tiles without atomics, and deterministic
+  64-bit fixed-point bonded/energy accumulation. Integration packets are
+  encoded in one compute pass with up to two in flight, and energies are
+  evaluated only on each packet's final step. The CSR and fixed-row kernels stay selectable
+  through `ResidentPbc::with_context_kernel`; `with_context_variant(true)`
+  still selects fixed rows.
+- Implicit GPU LF-middle dynamics use 32×32 OBC2 tiles for Born radii, their
+  adjoints and forces, with per-term bonded forces.
+- `GpuContext` turns off wgpu's indirect-dispatch validation, which re-encoded
+  every indirect dispatch on native backends (browsers validate on their own).
+- CPU explicit dynamics evaluate reaction-field nonbonded forces with an f32
+  8-atom cluster-pair engine (explicit AVX2 with a bit-identical portable
+  fallback, reused Verlet cluster lists); SETTLE and the LF-middle updates run
+  in parallel, and unobserved steps skip energies.
+- CPU implicit dynamics evaluate the no-cutoff Lennard-Jones/Coulomb and OBC2
+  forces with an f32 engine (AVX2 with a bit-identical portable fallback;
+  results do not depend on the thread count). Set
+  `GLYSYS_CPU_REFERENCE_PAIRS` to use the f64 reference forces in dynamics.
+- Torsion gradients use the closed-form expression instead of dual numbers
+  (same angle bits, gradients equal to ~1e-9), roughly halving bonded cost.
+- Implicit checkpoint restore compares forces with a scale-aware tolerance, so
+  single-precision GPU checkpoints restore.
+- `benchmarks/openmm_1crn_dynamics.py` accepts `--allow-unpinned-openmm` and
+  the CUDA platform (mixed precision); `aggregate_1crn_replicas.py` accepts
+  `--expected-backend CPU`; `openmm_force_snapshot.py` and
+  `compare_force_snapshots.py` accept `--allow-unpinned-openmm`.
+- crabWURCS is now taken from its GitHub repository at tag `v0.3.1` instead of
+  a sibling `../crabWURCS` checkout, so clean clones and CI build without it;
+  published crates still depend on crabwurcs 0.3.1 from crates.io.
+- Add `benchmarks/openmm_replica_control.py` (the replica-aggregation gate
+  applied to two independent replica sets, e.g. OpenMM against OpenMM) and the
+  1 ns explicit validation protocol
+  `benchmarks/dynamics/1crn-explicit-lf-middle-2fs-1ns-validation.json`.
 
 ## 0.1.2 — 2026-09-25
 

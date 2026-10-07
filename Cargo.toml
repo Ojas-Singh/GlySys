@@ -31,10 +31,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-# Keep GlySys aligned with the checked-out crabWURCS workspace used by
-# ReGlyco.  The 0.3.1 PDB parser contains the LINK/chain recognition fixes
-# needed by automatic glycan discovery.
-crabwurcs = { path = "../crabWURCS/crabwurcs", version = "0.3.1", default-features = false }
+# The 0.3.1 PDB parser contains the LINK/chain recognition fixes needed by
+# automatic glycan discovery. Builds use the tagged crabWURCS repository;
+# `cargo publish` substitutes the matching crates.io release.
+crabwurcs = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.1", version = "0.3.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"

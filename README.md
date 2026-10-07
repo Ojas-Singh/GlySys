@@ -82,8 +82,30 @@ run. It does not attempt to reconstruct chemistry from a text topology.
 
 ## 1CRN dynamics qualification
 
-The current wrap-up target is about 240 ns/day for the explicit 1CRN GPU case;
-the earlier 0.80× OpenMM target is not met and is not claimed. Older short
+Latest diagnostic screen (2026-10-06): Intel i7-12700H with an RTX 3060 Laptop
+GPU on Windows 11, OpenMM 8.6.1 in mixed precision, the prepared systems and
+2 fs LF-middle protocols described below, and one paired 8-second window per
+engine after minimization and warmup (ns/day):
+
+| Model | GlySys Vulkan | OpenMM CUDA | OpenMM OpenCL | GlySys CPU | OpenMM CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Explicit TIP3P, reaction field | 555 | 541 | 386 | 11.0 / 32.7 / 32.8 / 34.2 (1 / 6 / 14 / 20 threads) | 8.0 / 17.3 / 28.9 / 31.6 |
+| Implicit OBC2 | 1834 | 1499 | 1194 | 43.5 / 130.9 / 134.4 (1 / 6 / 14 threads) | 29.6 / 101.9 / 83.6 |
+
+Accuracy on the same machine, against OpenMM with unchanged margins (3 K and
+0.005 kcal/mol/atom): end-of-run forces from every engine match OpenMM
+Reference (normalized RMS 4.7e-6 explicit CPU, 5.3e-5 explicit Vulkan, 7.3e-6
+implicit CPU, 1.4e-5 implicit Vulkan). Two explicit Vulkan 0.308 ns replicas
+pass every trajectory check (0.17 K, 0.00019 kcal/mol/atom). A 1 ns explicit CPU
+run (0.06 K, 0.00044 kcal/mol/atom) and a 2 ns implicit CPU run (0.13 K, 0.0018)
+pass mean equivalence with 20 ps blocks; at the predeclared 10 ps blocks the
+explicit run's energy correlation is 0.304 (rule ≤ 0.3) and the implicit run's
+single-run stationarity intervals, like OpenMM's own, exceed the margin. Three
+2 ns implicit Vulkan replicas differ from OpenMM by 0.00185 kcal/mol/atom, less
+than two independent OpenMM replica sets differ from each other (0.00256). See
+[`performance-progress.md`](benchmarks/dynamics/performance-progress.md). These
+short screens are not the qualification matrix below, which pins OpenMM 8.1.1,
+runs on an RX 7800 XT, and uses repeated order-alternated windows. Older short
 benchmarks used different measurement boundaries and 0.5 fs protocols, so they
 are not carried forward as current throughput claims.
 
@@ -100,10 +122,11 @@ for OpenMM GPU, plus CPU at 1, 6, and 12 threads.
 | Explicit TIP3P, reaction field | pending qualification | 219.77 (3×5 s diagnostic) | pending qualification | 600.53 (3×5 s diagnostic) | 36.6% diagnostic; not passed |
 | Implicit OBC2 | pending qualification | pending qualification | pending qualification | pending qualification | not passed |
 
-The latest explicit screen uses the opt-in cooperative kernel, fixed 640-entry
-neighbor rows, 2 fs LF-middle NVT, 2,000 warmup steps, and three synchronized
-5-second windows. Its median is 219.77 ns/day on the RX 7800 XT Vulkan backend;
-the paired OpenMM 8.1.1 OpenCL mixed-precision median is 600.53 ns/day (36.6%).
+The 2026-09-25 explicit screen used the then opt-in cooperative kernel, fixed
+640-entry neighbor rows, 2 fs LF-middle NVT, 2,000 warmup steps, and three
+synchronized 5-second windows. Its median was 219.77 ns/day on the RX 7800 XT
+Vulkan backend; the paired OpenMM 8.1.1 OpenCL mixed-precision median was
+600.53 ns/day (36.6%).
 An earlier fixed-row screen measured 247.28 versus 663.20 ns/day; these short
 screens vary with run conditions and are diagnostics, not the full matrix.
 

@@ -422,6 +422,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "crabwurcs-core",
  "crabwurcs-iupac",
@@ -434,6 +435,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs-core"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
@@ -446,6 +448,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs-iupac"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "crabwurcs-core",
  "nom",
@@ -457,6 +460,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs-mol"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "chematic",
  "crabwurcs-core",
@@ -467,6 +471,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs-pdb"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "crabwurcs-core",
  "crabwurcs-mol",
@@ -479,6 +484,7 @@ dependencies = [
 [[package]]
 name = "crabwurcs-snfg"
 version = "0.3.1"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.1#9e31b2c373099a961ce30092c90f5ec936e57078"
 dependencies = [
  "crabwurcs-core",
  "crabwurcs-iupac",
@@ -777,6 +783,7 @@ dependencies = [
  "glysys",
  "glysys-energy",
  "glysys-opt",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

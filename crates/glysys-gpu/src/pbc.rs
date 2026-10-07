@@ -19,6 +19,7 @@
 //! implementation.
 use crate::context::{AllocationReservation, GpuContext};
 use crate::device::{Error, Special};
+use crate::pbc_tiles::{SharedBuffers, TileEngine, TileKernel, TilePacking, TileSizing};
 use glysys::{ParameterizedSystem, Vec3};
 use glysys_energy::pbc::{
     BoxVectors, NonbondedElectrostatics, classify_waters, molecules, water_equilibrium,
@@ -34,6 +35,32 @@ pub const MAX_ENCODED_DYNAMICS_STEPS: usize = 8;
 const MAX_SOLUTE_CONSTRAINT_COMPONENT_BONDS: usize = 8;
 pub const TILED_NEIGHBORS_PER_ATOM: u32 = 640;
 const INDIRECT_NEIGHBOR_DISPATCH: u32 = u32::MAX;
+/// Job codes at or above this value select a tiled-engine pipeline.
+const TILE_JOB: usize = 1000;
+
+/// Explicit nonbonded implementation of a resident evaluator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PbcKernel {
+    /// Morton-sorted 32-atom blocks with half-shell tiles, separate 1-4 and
+    /// per-term bonded passes, and deterministic fixed-point accumulation.
+    #[default]
+    Tiles,
+    /// Historical per-atom CSR Verlet list evaluated by one invocation per atom.
+    Csr,
+    /// Historical fixed 640-entry rows evaluated by 64 cooperating lanes.
+    FixedRows,
+}
+
+impl PbcKernel {
+    /// Diagnostic label recorded with run provenance.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tiles => "block-tiles-32",
+            Self::Csr => "serial-per-atom",
+            Self::FixedRows => "cooperative-64-lane",
+        }
+    }
+}
 
 /// Minimal PBC packing: per-atom parameters plus exclusion/1-4 specials.
 /// Mirrors `topology::PreparedTopology` conventions (scee == 0 skips).
@@ -53,6 +80,8 @@ pub struct PbcPacking {
     pub dims: [u32; 4],
     pub limit: f64,
     pub cutoff: f64,
+    /// Orthorhombic box the packing was built for (Å).
+    pub box_angstrom: [f64; 3],
 }
 
 impl PbcPacking {
@@ -323,6 +352,7 @@ impl PbcPacking {
             dims: [n as u32, nx, ny, nz],
             limit,
             cutoff,
+            box_angstrom: b,
         })
     }
 
@@ -478,6 +508,9 @@ pub struct ResidentPbc {
     solute_constraint_component_offset: u32,
     solute_constraint_component_count: u32,
     tiled_nonbonded: bool,
+    kernel: PbcKernel,
+    tiles: Option<TileEngine>,
+    box_xyz: std::sync::Mutex<[f32; 3]>,
     gpu_stage_timings_ms: std::sync::Mutex<BTreeMap<String, f64>>,
     dt_ps: f32,
     params: Vec<[f32; 4]>,
@@ -631,6 +664,9 @@ impl ResidentPbc {
         {
             return false;
         }
+        if self.tiles.is_some() {
+            return true;
+        }
         let limit = self.limit as f64;
         [box_xyz[0] as f64, box_xyz[1] as f64, box_xyz[2] as f64]
             .into_iter()
@@ -652,12 +688,11 @@ impl ResidentPbc {
         backend: &NonbondedElectrostatics,
         max_pairs: u32,
     ) -> Result<Self, Error> {
-        Self::with_context_variant(context, packing, backend, max_pairs, false).await
+        Self::with_context_kernel(context, packing, backend, max_pairs, PbcKernel::Tiles).await
     }
 
     /// Construct a periodic evaluator and optionally select the cooperative
-    /// explicit pair kernel. The default constructor remains on the established
-    /// serial-per-atom path for browser and compatibility callers.
+    /// fixed-row pair kernel instead of the default implementation.
     pub async fn with_context_variant(
         context: &GpuContext,
         packing: &PbcPacking,
@@ -665,15 +700,38 @@ impl ResidentPbc {
         max_pairs: u32,
         tiled_nonbonded: bool,
     ) -> Result<Self, Error> {
+        let kernel = if tiled_nonbonded {
+            PbcKernel::FixedRows
+        } else {
+            PbcKernel::Tiles
+        };
+        Self::with_context_kernel(context, packing, backend, max_pairs, kernel).await
+    }
+
+    /// Construct a periodic evaluator with an explicit nonbonded kernel.
+    /// `max_pairs` bounds the historical neighbor lists and is ignored by
+    /// [`PbcKernel::Tiles`], which sizes its tile lists from the packing.
+    pub async fn with_context_kernel(
+        context: &GpuContext,
+        packing: &PbcPacking,
+        backend: &NonbondedElectrostatics,
+        max_pairs: u32,
+        kernel: PbcKernel,
+    ) -> Result<Self, Error> {
         Self::with_budget_context(
             context,
             packing,
             backend,
             max_pairs,
             context.memory_profile().budget(),
-            tiled_nonbonded,
+            kernel,
         )
         .await
+    }
+
+    /// The nonbonded kernel this evaluator runs.
+    pub fn kernel(&self) -> PbcKernel {
+        self.kernel
     }
 
     async fn with_budget_context(
@@ -682,8 +740,9 @@ impl ResidentPbc {
         backend: &NonbondedElectrostatics,
         max_pairs: u32,
         budget: u64,
-        tiled_nonbonded: bool,
+        kernel: PbcKernel,
     ) -> Result<Self, Error> {
+        let tiled_nonbonded = kernel == PbcKernel::FixedRows;
         let electro = electrostatics_uniform(backend)?;
         // The packing cutoff and the backend cutoff must agree: cells are
         // sized for one limit, physics evaluated at one cutoff.
@@ -703,13 +762,29 @@ impl ResidentPbc {
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size as u64);
         let n64 = u64::from(n);
-        let pairs_bytes = if tiled_nonbonded {
-            n64.checked_mul(u64::from(TILED_NEIGHBORS_PER_ATOM))
+        let pairs_bytes = match kernel {
+            PbcKernel::FixedRows => n64
+                .checked_mul(u64::from(TILED_NEIGHBORS_PER_ATOM))
                 .and_then(|words| words.checked_mul(4))
-                .ok_or(Error::Capacity)?
-        } else {
-            u64::from(max_pairs).checked_mul(8).ok_or(Error::Capacity)?
+                .ok_or(Error::Capacity)?,
+            PbcKernel::Csr => u64::from(max_pairs).checked_mul(8).ok_or(Error::Capacity)?,
+            // The historical pair kernels are never dispatched; keep a
+            // minimal buffer so the shared bind group stays valid.
+            PbcKernel::Tiles => 64,
         };
+        let tile_plan = if kernel == PbcKernel::Tiles {
+            let tile_packing = TilePacking::new(packing)?;
+            let sizing = TileSizing::new(n, packing.box_angstrom, packing.limit)?;
+            if n > 4_000_000 {
+                return Err(Error::Capacity);
+            }
+            Some((tile_packing, sizing))
+        } else {
+            None
+        };
+        let tile_bytes = tile_plan.as_ref().map_or(0, |(tile_packing, sizing)| {
+            TileEngine::allocation_bytes(sizing, tile_packing)
+        });
         let sys_bytes = n64.checked_mul(32).ok_or(Error::Capacity)?;
         // Cell heads, links, two range words/atom, pair counter, and a
         // single atomic numerical-status flag.
@@ -745,6 +820,7 @@ impl ResidentPbc {
             .and_then(|v| v.checked_add(state_bytes))
             .and_then(|v| v.checked_add(64 * 4))
             .and_then(|v| v.checked_add(out_bytes))
+            .and_then(|v| v.checked_add(tile_bytes))
             .ok_or(Error::Capacity)?;
         // A dynamics snapshot packs 5 per-atom regions plus a 32-byte
         // scalar block and a 4-byte status word in one transfer.  Keep a
@@ -970,6 +1046,29 @@ impl ResidentPbc {
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             )
         });
+        let tiles = tile_plan.map(|(tile_packing, sizing)| {
+            let status_word = ncells + 3 * n + 1;
+            for (kernel, _) in crate::pbc_tiles::KERNELS {
+                context.record_pipeline(format!("pbc_tiles.{kernel}"));
+            }
+            TileEngine::new(
+                &device,
+                &queue,
+                sizing,
+                &tile_packing,
+                SharedBuffers {
+                    sys: &buffers[1],
+                    aux: &buffers[2],
+                    specials: &buffers[3],
+                    out: &buffers[5],
+                    bcoords: &buffers[7],
+                },
+                electro,
+                packing.limit as f32,
+                status_word,
+                status_word + 1,
+            )
+        });
         let validation = crate::pop_error_scope(&device).await;
         let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
@@ -1010,6 +1109,9 @@ impl ResidentPbc {
             solute_constraint_component_offset: packing.solute_constraint_component_offset,
             solute_constraint_component_count: packing.solute_constraint_component_count,
             tiled_nonbonded,
+            kernel,
+            tiles,
+            box_xyz: std::sync::Mutex::new(packing.box_angstrom.map(|v| v as f32)),
             gpu_stage_timings_ms: std::sync::Mutex::new(BTreeMap::new()),
             dt_ps: f64::NAN as f32,
             params: packing.params.clone(),
@@ -1092,6 +1194,9 @@ impl ResidentPbc {
         reset_neighbor_search: bool,
         mut coordinate: impl FnMut(usize) -> [f64; 3],
     ) {
+        if let Ok(mut current) = self.box_xyz.lock() {
+            *current = box_xyz;
+        }
         let mut config = [0u8; 112];
         for (i, v) in self.dims.iter().enumerate() {
             config[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
@@ -1189,6 +1294,9 @@ impl ResidentPbc {
         // the host polls it at a bounded checkpoint.
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
+        if let Some(tiles) = &self.tiles {
+            tiles.upload(&self.queue, box_xyz, reset_neighbor_search);
+        }
         if reset_neighbor_search {
             self.queue
                 .write_buffer(&self.buffers[2], 0, &vec![0xFFu8; self.ncells as usize * 4]);
@@ -1322,40 +1430,140 @@ impl ResidentPbc {
     /// Record a chain of compute passes into one encoder with a single
     /// submit. Besides fewer round trips, this keeps pass ordering explicit
     /// for software Vulkan, where back-to-back submits without an intervening
-    /// transfer have been observed to stall.
+    /// transfer have been observed to stall. A chain is a static evaluation:
+    /// tiled force passes include every bonded term and publish energies.
     fn dispatch_chain(&self, jobs: &[(usize, u32)]) {
-        self.dispatch_repeated(jobs, 1);
+        self.dispatch_repeated(jobs, 1, true, true);
     }
 
-    fn dispatch_repeated(&self, jobs: &[(usize, u32)], steps: usize) {
-        let expanded = self.expanded_jobs(jobs);
+    /// Encode `steps` repetitions of `jobs` and submit them together. With
+    /// the tiled engine only the final repetition evaluates energies (when
+    /// `final_energy`), and dynamics skips bonded terms held rigid by
+    /// constraints unless `all_terms`.
+    fn dispatch_repeated(
+        &self,
+        jobs: &[(usize, u32)],
+        steps: usize,
+        final_energy: bool,
+        all_terms: bool,
+    ) -> wgpu::SubmissionIndex {
+        let mut variants: [Option<Vec<(usize, u32)>>; 4] = Default::default();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        for _ in 0..steps {
-            for &(pipeline, groups) in &expanded {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines[pipeline]);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                if groups == INDIRECT_NEIGHBOR_DISPATCH {
-                    pass.dispatch_workgroups_indirect(
-                        &self.buffers[2],
-                        self.neighbor_indirect_offset(pipeline),
-                    );
-                } else {
-                    pass.dispatch_workgroups(groups, 1, 1);
-                }
-                drop(pass);
+        // One pass per submission: wgpu still orders every dispatch that
+        // touches a writable storage buffer, without per-pass overhead.
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        for step in 0..steps {
+            let energy = final_energy && step + 1 == steps;
+            let resort = self.tiles.as_ref().is_some_and(TileEngine::take_resort);
+            let variant = usize::from(energy) + 2 * usize::from(resort);
+            let expanded = variants[variant]
+                .get_or_insert_with(|| self.expanded_jobs(jobs, energy, all_terms, resort));
+            for &(pipeline, groups) in expanded.iter() {
+                self.encode_job(&mut pass, pipeline, groups);
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+        drop(pass);
+        self.queue.submit(Some(encoder.finish()))
     }
 
-    fn expanded_jobs(&self, jobs: &[(usize, u32)]) -> Vec<(usize, u32)> {
-        let mut expanded = Vec::with_capacity(jobs.len() + 10);
+    fn encode_job(&self, pass: &mut wgpu::ComputePass<'_>, pipeline: usize, groups: u32) {
+        if pipeline >= TILE_JOB {
+            let tiles = self
+                .tiles
+                .as_ref()
+                .expect("tiled jobs are only expanded for the tiled engine");
+            let kernel = TileKernel::from_job(pipeline - TILE_JOB);
+            let (compute, bind_group) = tiles.kernel(kernel);
+            pass.set_pipeline(compute);
+            pass.set_bind_group(0, bind_group, &[]);
+            if let Some(stage) = kernel.rebuild_stage() {
+                pass.dispatch_workgroups_indirect(&tiles.args, 12 * stage);
+            } else {
+                let (x, y) = crate::pbc_tiles::wide_groups(groups);
+                pass.dispatch_workgroups(x, y, 1);
+            }
+            return;
+        }
+        pass.set_pipeline(&self.pipelines[pipeline]);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        if groups == INDIRECT_NEIGHBOR_DISPATCH {
+            pass.dispatch_workgroups_indirect(
+                &self.buffers[2],
+                self.neighbor_indirect_offset(pipeline),
+            );
+        } else {
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stage_name(&self, pipeline: usize) -> &'static str {
+        if pipeline >= TILE_JOB {
+            TileKernel::from_job(pipeline - TILE_JOB).stage_name()
+        } else {
+            pbc_stage_name(pipeline)
+        }
+    }
+
+    fn tile_job(&self, kernel: TileKernel) -> (usize, u32) {
+        let tiles = self.tiles.as_ref().expect("tiled engine");
+        let groups = if kernel.rebuild_stage().is_some() {
+            INDIRECT_NEIGHBOR_DISPATCH
+        } else {
+            tiles.groups(kernel)
+        };
+        (TILE_JOB + kernel.job(), groups)
+    }
+
+    fn expanded_jobs(
+        &self,
+        jobs: &[(usize, u32)],
+        energy: bool,
+        all_terms: bool,
+        resort: bool,
+    ) -> Vec<(usize, u32)> {
+        let mut expanded = Vec::with_capacity(jobs.len() + 12);
+        if self.tiles.is_some() {
+            for &(pipeline, groups) in jobs {
+                match pipeline {
+                    0 => {
+                        if resort {
+                            for kernel in TileKernel::RESORT {
+                                expanded.push(self.tile_job(kernel));
+                            }
+                        }
+                        for kernel in TileKernel::REBUILD {
+                            expanded.push(self.tile_job(kernel));
+                        }
+                    }
+                    2 => expanded.push(self.tile_job(if energy {
+                        TileKernel::PairEnergy
+                    } else {
+                        TileKernel::PairForces
+                    })),
+                    4 => {
+                        expanded.push(self.tile_job(match (all_terms, energy) {
+                            (true, true) => TileKernel::BondedAllEnergy,
+                            (true, false) => TileKernel::BondedAllForces,
+                            (false, true) => TileKernel::BondedDynamicsEnergy,
+                            (false, false) => TileKernel::BondedDynamicsForces,
+                        }));
+                        expanded.push(self.tile_job(TileKernel::Finalize));
+                    }
+                    // Cell clearing and per-atom partial reductions belong to
+                    // the historical kernels; the tiled engine publishes
+                    // totals from its finalize pass.
+                    3 | 10 => {}
+                    _ => expanded.push((pipeline, groups)),
+                }
+            }
+            return expanded;
+        }
         for &(pipeline, groups) in jobs {
             if pipeline == 0 {
                 let n = workgroups(self.n);
@@ -1388,10 +1596,12 @@ impl ResidentPbc {
         }
         // WebGPU forbids using one buffer as both a writable storage binding
         // and indirect-dispatch arguments in the same synchronization scope.
-        // Neighbor dispatch arguments are stored in `aux`, which is also the
-        // PBC metadata storage binding, so browsers must use bounded direct
-        // dispatches; each stage already checks the rebuild/status flags.
-        #[cfg(target_arch = "wasm32")]
+        // The historical neighbor dispatch arguments live in `aux`, which is
+        // also the PBC metadata storage binding, so these kernels use bounded
+        // direct dispatches on every target; each stage already checks the
+        // rebuild/status flags. (Native wgpu used to hide the conflict behind
+        // its indirect-validation copy, which the context now disables.) The
+        // tiled engine keeps its arguments in a separate buffer.
         for (pipeline, groups) in &mut expanded {
             if *groups != INDIRECT_NEIGHBOR_DISPATCH {
                 continue;
@@ -1434,26 +1644,34 @@ impl ResidentPbc {
             .unwrap_or_default()
     }
 
+    /// Submit a dynamics advance in bounded packets. Up to two packets are in
+    /// flight so command encoding overlaps device execution; only the final
+    /// step of the advance publishes energies for the observers.
     async fn dispatch_dynamics_bounded(
         &self,
         jobs: &[(usize, u32)],
         steps: usize,
     ) -> Result<(), Error> {
         let mut remaining = steps;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut previous: Option<wgpu::SubmissionIndex> = None;
         while remaining > 0 {
             let batch = remaining.min(MAX_ENCODED_DYNAMICS_STEPS);
+            let last = batch == remaining;
             #[cfg(not(target_arch = "wasm32"))]
             if self._context.gpu_timestamps_enabled() {
-                self.dispatch_repeated_profiled(jobs, batch).await?;
+                self.dispatch_repeated_profiled(jobs, batch, last).await?;
             } else {
-                self.dispatch_repeated(jobs, batch);
-                self.device
-                    .poll(wgpu::PollType::Wait)
-                    .map_err(|e| Error::Execution(e.to_string()))?;
+                let index = self.dispatch_repeated(jobs, batch, last, true);
+                if let Some(earlier) = previous.replace(index) {
+                    self.device
+                        .poll(wgpu::PollType::WaitForSubmissionIndex(earlier))
+                        .map_err(|e| Error::Execution(e.to_string()))?;
+                }
             }
             #[cfg(target_arch = "wasm32")]
             {
-                self.dispatch_repeated(jobs, batch);
+                self.dispatch_repeated(jobs, batch, last, true);
             }
             remaining -= batch;
         }
@@ -1465,12 +1683,23 @@ impl ResidentPbc {
         &self,
         jobs: &[(usize, u32)],
         steps: usize,
+        final_energy: bool,
     ) -> Result<(), Error> {
-        let expanded = self.expanded_jobs(jobs);
-        let query_count = expanded
-            .len()
-            .checked_mul(steps)
-            .and_then(|passes| passes.checked_mul(2))
+        let resorts: Vec<bool> = (0..steps)
+            .map(|_| self.tiles.as_ref().is_some_and(TileEngine::take_resort))
+            .collect();
+        let plans: Vec<Vec<(usize, u32)>> = resorts
+            .iter()
+            .enumerate()
+            .map(|(step, &resort)| {
+                self.expanded_jobs(jobs, final_energy && step + 1 == steps, true, resort)
+            })
+            .collect();
+        let query_count = plans
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            .checked_mul(2)
             .and_then(|queries| u32::try_from(queries).ok())
             .filter(|count| *count > 0)
             .ok_or(Error::Capacity)?;
@@ -1498,9 +1727,9 @@ impl ResidentPbc {
                 label: Some("GlySys profiled explicit dynamics"),
             });
         let mut query_index = 0u32;
-        let mut stages = Vec::with_capacity(expanded.len() * steps);
-        for _ in 0..steps {
-            for &(pipeline, groups) in &expanded {
+        let mut stages = Vec::with_capacity(query_count as usize / 2);
+        for expanded in &plans {
+            for &(pipeline, groups) in expanded {
                 let begin = query_index;
                 let end = begin + 1;
                 query_index += 2;
@@ -1512,18 +1741,9 @@ impl ResidentPbc {
                         end_of_pass_write_index: Some(end),
                     }),
                 });
-                pass.set_pipeline(&self.pipelines[pipeline]);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                if groups == INDIRECT_NEIGHBOR_DISPATCH {
-                    pass.dispatch_workgroups_indirect(
-                        &self.buffers[2],
-                        self.neighbor_indirect_offset(pipeline),
-                    );
-                } else {
-                    pass.dispatch_workgroups(groups, 1, 1);
-                }
+                self.encode_job(&mut pass, pipeline, groups);
                 drop(pass);
-                stages.push((pbc_stage_name(pipeline), begin, end));
+                stages.push((self.stage_name(pipeline), begin, end));
             }
         }
         encoder.resolve_query_set(&query_set, 0..query_count, &resolved, 0);
@@ -1583,6 +1803,23 @@ impl ResidentPbc {
     /// Copy a bounded snapshot in one submission/map. The source buffers all
     /// refer to the same queue boundary, including status and stochastic state.
     async fn readback_ranges(&self, ranges: &[(usize, u64, u64)]) -> Result<Vec<u8>, Error> {
+        let sources: Vec<_> = ranges
+            .iter()
+            .map(|&(source, offset, bytes)| (&self.buffers[source], offset, bytes))
+            .collect();
+        self.readback_from(&sources).await
+    }
+
+    async fn readback_buffer(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Error> {
+        self.readback_from(&[(buffer, offset, size)]).await
+    }
+
+    async fn readback_from(&self, ranges: &[(&wgpu::Buffer, u64, u64)]) -> Result<Vec<u8>, Error> {
         use std::sync::atomic::Ordering;
         let size: u64 = ranges.iter().map(|r| r.2).sum();
         if size > self.staging_bytes {
@@ -1608,13 +1845,7 @@ impl ResidentPbc {
             });
         let mut destination = 0;
         for &(source, offset, bytes) in ranges {
-            encoder.copy_buffer_to_buffer(
-                &self.buffers[source],
-                offset,
-                lease.buffer,
-                destination,
-                bytes,
-            );
+            encoder.copy_buffer_to_buffer(source, offset, lease.buffer, destination, bytes);
             destination += bytes;
         }
         self.queue.submit(Some(encoder.finish()));
@@ -1699,6 +1930,9 @@ impl ResidentPbc {
 
     /// Build cells and enumerate pairs within cutoff+skin.
     pub async fn neighbor_list(&self) -> Result<NeighborResult, Error> {
+        if self.tiles.is_some() {
+            return self.tile_neighbor_list().await;
+        }
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
         crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
@@ -1780,6 +2014,134 @@ impl ResidentPbc {
             count: pairs.len() as u32,
             pairs,
         })
+    }
+
+    /// Pairs within cutoff + skin covered by the tiled engine's current
+    /// lists, recovered from the tiles and filtered by the same f32
+    /// minimum-image distance the list build uses. Exclusion masks are
+    /// ignored so the result matches the historical list semantics.
+    async fn tile_neighbor_list(&self) -> Result<NeighborResult, Error> {
+        let tiles = self.tiles.as_ref().expect("tiled engine");
+        self.queue
+            .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
+        self.dispatch_chain(&[(0, workgroups(self.n))]);
+        let status_bytes = self.readback(2, self.meta_status_off(), 4).await?;
+        let status = u32::from_le_bytes(status_bytes[0..4].try_into().unwrap());
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
+            return Err(Error::Execution(e.to_string()));
+        }
+        if status != 0 {
+            return Err(if status == 2 || status == 3 {
+                Error::Capacity
+            } else {
+                Error::Execution(
+                    dynamics_error(status).unwrap_or_else(|| "GPU neighbor-list failure".into()),
+                )
+            });
+        }
+        let layout = tiles.sizing.layout;
+        let blocks = u64::from(tiles.sizing.blocks);
+        let order_bytes = self
+            .readback_work(u64::from(layout.order) * 4, blocks * 32 * 4)
+            .await?;
+        let tile_bytes = self
+            .readback_work(u64::from(layout.block_tiles) * 4, blocks * 2 * 4)
+            .await?;
+        let order: Vec<u32> = bytemuck::cast_slice(&order_bytes).to_vec();
+        let block_tiles: Vec<u32> = bytemuck::cast_slice(&tile_bytes).to_vec();
+        let used = tiles.sizing.capacity;
+        let atom_bytes = self
+            .readback_work(u64::from(layout.tile_atoms) * 4, u64::from(used) * 32 * 4)
+            .await?;
+        let tile_atoms: &[u32] = bytemuck::cast_slice(&atom_bytes);
+        let sys_bytes = self.readback(1, 0, u64::from(self.n) * 32).await?;
+        let sys: &[f32] = bytemuck::cast_slice(&sys_bytes);
+        let box_xyz = *self.box_xyz.lock().map_err(|_| Error::Input("box lock"))?;
+        let limit2 = self.limit * self.limit;
+        let position = |atom: u32| {
+            let i = 8 * atom as usize + 4;
+            [sys[i], sys[i + 1], sys[i + 2]]
+        };
+        let within = |a: u32, b: u32| {
+            let (pa, pb) = (position(a), position(b));
+            let mut r2 = 0.0f32;
+            for axis in 0..3 {
+                let d = pa[axis] - pb[axis];
+                let d = d - box_xyz[axis] * (d / box_xyz[axis]).round_ties_even();
+                r2 += d * d;
+            }
+            r2 <= limit2
+        };
+        let mut pairs = Vec::new();
+        for (block, range) in block_tiles.chunks_exact(2).enumerate() {
+            for tile in range[0]..range[0] + range[1] {
+                for row in 0..32usize {
+                    let a = order[32 * block + row];
+                    if a == u32::MAX {
+                        continue;
+                    }
+                    for slot in 0..32usize {
+                        let b = tile_atoms[32 * tile as usize + slot];
+                        if b == u32::MAX || (tile == range[0] && slot <= row) {
+                            continue;
+                        }
+                        if within(a, b) {
+                            pairs.push((a.min(b), a.max(b)));
+                        }
+                    }
+                }
+            }
+        }
+        // Each pair is listed from both of its blocks.
+        pairs.sort_unstable();
+        pairs.dedup();
+        Ok(NeighborResult {
+            count: pairs.len() as u32,
+            pairs,
+        })
+    }
+
+    /// Tiled-engine list occupancy as `(tiles in use, tile capacity, blocks,
+    /// largest block)` after the most recent rebuild; `None` for the
+    /// historical kernels.
+    pub async fn tile_occupancy(&self) -> Result<Option<(u32, u32, u32, u32)>, Error> {
+        let Some(tiles) = &self.tiles else {
+            return Ok(None);
+        };
+        let blocks = u64::from(tiles.sizing.blocks);
+        let bytes = self
+            .readback_work(u64::from(tiles.sizing.layout.block_tiles) * 4, blocks * 8)
+            .await?;
+        let ranges: &[u32] = bytemuck::cast_slice(&bytes);
+        let used = ranges.chunks_exact(2).map(|range| range[1]).sum();
+        let largest = ranges
+            .chunks_exact(2)
+            .map(|range| range[1])
+            .max()
+            .unwrap_or(0);
+        Ok(Some((
+            used,
+            tiles.sizing.capacity,
+            tiles.sizing.blocks,
+            largest,
+        )))
+    }
+
+    async fn readback_work(&self, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        let tiles = self.tiles.as_ref().expect("tiled engine");
+        let mut out = Vec::with_capacity(usize::try_from(size).map_err(|_| Error::Capacity)?);
+        let mut copied = 0;
+        while copied < size {
+            let chunk = (size - copied).min(self.staging_bytes);
+            out.extend_from_slice(
+                &self
+                    .readback_buffer(&tiles.work, offset + copied, chunk)
+                    .await?,
+            );
+            copied += chunk;
+        }
+        Ok(out)
     }
 
     pub async fn neighbor_rebuild_count(&self) -> Result<u32, Error> {
@@ -1897,9 +2259,12 @@ impl ResidentPbc {
     }
 
     async fn reduce_energy_once(&self) -> Result<(), Error> {
+        if self.tiles.is_some() {
+            return Ok(());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self._context.gpu_timestamps_enabled() {
-            return self.dispatch_repeated_profiled(&[(3, 1)], 1).await;
+            return self.dispatch_repeated_profiled(&[(3, 1)], 1, false).await;
         }
         // Force kernels overwrite the per-atom energy partials on every step,
         // but no integrator consumes the scalar reduction. Reduce only once

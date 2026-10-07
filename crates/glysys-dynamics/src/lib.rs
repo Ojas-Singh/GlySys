@@ -955,8 +955,23 @@ fn implicit_constraints(
     Ok(Some(topology))
 }
 
+/// The f32 implicit engine unless `GLYSYS_CPU_REFERENCE_PAIRS` requests the
+/// f64 reference forces (validation runs).
+fn implicit_engine(
+    evaluator: &EnergyEvaluator<'_>,
+) -> Result<Option<glysys_energy::implicit_cluster::ImplicitPairEngine>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("GLYSYS_CPU_REFERENCE_PAIRS").is_some() {
+        return Ok(None);
+    }
+    Ok(evaluator.implicit_pair_engine()?)
+}
+
 pub struct CpuSimulation<'a> {
     evaluator: EnergyEvaluator<'a>,
+    /// Single-precision nonbonded/OBC2 forces for integration steps whose
+    /// energies are not observed; `None` keeps the f64 evaluator.
+    implicit_engine: Option<glysys_energy::implicit_cluster::ImplicitPairEngine>,
     masses: Vec<f64>,
     constraints: Option<SettleWaters>,
     degrees_of_freedom: usize,
@@ -966,6 +981,7 @@ impl<'a> CpuSimulation<'a> {
     pub fn into_owned(self) -> CpuSimulation<'static> {
         CpuSimulation {
             evaluator: self.evaluator.into_owned(),
+            implicit_engine: self.implicit_engine,
             masses: self.masses,
             constraints: self.constraints,
             degrees_of_freedom: self.degrees_of_freedom,
@@ -1148,8 +1164,10 @@ impl<'a> CpuSimulation<'a> {
             barostat_frozen: false,
             water_occupancy: None,
         };
+        let implicit_engine = implicit_engine(&evaluator)?;
         Ok(Self {
             evaluator,
+            implicit_engine,
             masses,
             constraints,
             degrees_of_freedom,
@@ -1204,22 +1222,36 @@ impl<'a> CpuSimulation<'a> {
             ));
         }
         let reference = evaluator.energy_and_gradient(&state.coordinates)?;
+        // Checkpoints written by the resident GPU path carry single-precision
+        // forces: individual atoms differ from the f64 reference by ~1e-3
+        // kcal/mol/A (bond stretches on f32 positions), as with OpenMM mixed
+        // precision. Bound each atom loosely and the whole-system normalized
+        // RMS tightly; a chemistry mismatch fails both by orders of magnitude.
+        let (mut error2, mut reference2, mut outlier) = (0.0, 0.0, false);
+        for (a, b) in reference
+            .gradients
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(&state.gradient)
+        {
+            let delta = norm2(add(*a, scale(*b, -1.)));
+            let magnitude = norm2(*a);
+            error2 += delta;
+            reference2 += magnitude;
+            outlier |= delta.sqrt() > 1e-2 + 1e-3 * magnitude.sqrt();
+        }
         if (reference.total() - state.potential_energy).abs()
             > 1e-3 + 1e-4 * reference.total().abs()
-            || reference
-                .gradients
-                .as_ref()
-                .unwrap()
-                .iter()
-                .zip(&state.gradient)
-                .any(|(a, b)| {
-                    norm2(add(*a, scale(*b, -1.))).sqrt() > 1e-3 + 1e-3 * norm2(*a).sqrt()
-                })
+            || outlier
+            || error2 > 1e-6 * reference2.max(1e-30)
         {
             return Err(invalid("checkpoint forces do not match prepared chemistry"));
         }
+        let implicit_engine = implicit_engine(&evaluator)?;
         Ok(Self {
             evaluator,
+            implicit_engine,
             masses,
             constraints,
             degrees_of_freedom,
@@ -1252,7 +1284,14 @@ impl<'a> CpuSimulation<'a> {
                         &mut self.state,
                         &self.masses,
                         self.constraints.as_ref(),
-                        |coordinates| Ok(self.evaluator.gradient_only(coordinates)?),
+                        |coordinates| match &self.implicit_engine {
+                            Some(engine) => {
+                                let mut gradient = self.evaluator.bonded_gradient(coordinates)?;
+                                engine.gradient_into(coordinates, &mut gradient)?;
+                                Ok(gradient)
+                            }
+                            None => Ok(self.evaluator.gradient_parallel(coordinates)?),
+                        },
                     )?;
                 }
             } else {

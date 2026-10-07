@@ -30,7 +30,15 @@ impl ResidentThermostatRng {
         Ok(())
     }
     pub fn normal3(&mut self, atom: usize) -> Vec3 {
-        let word = &mut self.words[atom];
+        normal3_word(&mut self.words[atom])
+    }
+}
+
+/// Advance one atom's stream word by one version-one draw (three Box-Muller
+/// cosine variates). Streams are independent per atom, so callers may update
+/// different atoms concurrently.
+pub fn normal3_word(word: &mut u32) -> Vec3 {
+    {
         let mut uniform = || {
             *word ^= *word << 13;
             *word ^= *word >> 17;

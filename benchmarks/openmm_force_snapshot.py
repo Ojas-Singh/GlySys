@@ -30,9 +30,12 @@ def main():
         ),
     )
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--allow-unpinned-openmm", action="store_true",
+                        help="run with the installed OpenMM instead of the pinned 8.1.1 "
+                             "reference (the version is recorded in the output)")
     args = parser.parse_args()
 
-    if mm.__version__ != "8.1.1":
+    if not args.allow_unpinned_openmm and mm.__version__ != "8.1.1":
         raise RuntimeError(f"expected OpenMM 8.1.1, found {mm.__version__}")
     protocol = json.loads(args.protocol.read_text())
     checkpoint_raw = args.checkpoint.read_bytes()

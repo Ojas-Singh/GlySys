@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("--protocol", required=True, type=Path,
                         help="matching benchmarks/dynamics protocol JSON")
     parser.add_argument("--mode", choices=("explicit", "implicit"), required=True)
-    parser.add_argument("--platform", choices=("OpenCL", "CPU", "Reference"), default="OpenCL")
+    parser.add_argument("--platform", choices=("OpenCL", "CUDA", "CPU", "Reference"), default="OpenCL")
     parser.add_argument("--device-index", default="0")
     parser.add_argument("--threads", type=int, default=None,
                         help="OpenMM CPU platform thread count")
@@ -46,6 +46,9 @@ def parse_args():
     parser.add_argument("--compare-glysys-checkpoint", type=Path, default=None,
                         help="optionally compare final OpenMM subsystem temperatures with a GlySys checkpoint at the same step")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--allow-unpinned-openmm", action="store_true",
+                        help="run with the installed OpenMM/numpy instead of the pinned "
+                             "8.1.1/numpy<2 reference (the version is recorded in the output)")
     return parser.parse_args()
 
 
@@ -179,10 +182,11 @@ def structural_metrics(reference, positions):
 
 def main():
     args = parse_args()
-    if mm.__version__ != "8.1.1":
-        raise RuntimeError(f"expected OpenMM 8.1.1, found {mm.__version__}")
-    if int(np.__version__.split(".")[0]) >= 2:
-        raise RuntimeError("this validated environment requires numpy<2")
+    if not args.allow_unpinned_openmm:
+        if mm.__version__ != "8.1.1":
+            raise RuntimeError(f"expected OpenMM 8.1.1, found {mm.__version__}")
+        if int(np.__version__.split(".")[0]) >= 2:
+            raise RuntimeError("this validated environment requires numpy<2")
     protocol = json.loads(args.protocol.read_text())
     if args.equilibration_steps is not None:
         protocol["equilibrationSteps"] = args.equilibration_steps
@@ -208,7 +212,7 @@ def main():
 
     platform = mm.Platform.getPlatformByName(args.platform)
     properties = {}
-    if args.platform == "OpenCL":
+    if args.platform in ("OpenCL", "CUDA"):
         properties = {"DeviceIndex": args.device_index, "Precision": "mixed"}
     elif args.platform == "CPU" and args.threads is not None:
         properties = {"Threads": str(args.threads)}

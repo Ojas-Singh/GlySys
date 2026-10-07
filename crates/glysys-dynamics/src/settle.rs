@@ -9,6 +9,7 @@
 //! explicit residual failures.
 use super::{Error, Result};
 use glysys::Vec3;
+use rayon::prelude::*;
 
 fn invalid(s: impl Into<String>) -> Error {
     Error::Invalid(s.into())
@@ -715,10 +716,18 @@ impl SettleWaters {
         coords: &mut [Vec3],
         masses: &[f64],
     ) -> Result<()> {
-        for (w, &(doh, dhh, iso)) in self.waters.iter().zip(&self.water_geom) {
-            let &[o, h1, h2] = w;
-            if iso {
-                let (corrected, _) = settle_triangle(
+        // Each water is an independent triple: solve in parallel, then write
+        // the results in water order (identical arithmetic to a serial loop).
+        let solved: Vec<Option<[Vec3; 3]>> = self
+            .waters
+            .par_iter()
+            .zip(self.water_geom.par_iter())
+            .map(|(w, &(doh, dhh, iso))| {
+                let &[o, h1, h2] = w;
+                if !iso {
+                    return Ok(None);
+                }
+                settle_triangle(
                     old_coords[o],
                     old_coords[h1],
                     old_coords[h2],
@@ -730,7 +739,13 @@ impl SettleWaters {
                     masses[h2],
                     doh,
                     dhh,
-                )?;
+                )
+                .map(|(corrected, _)| Some(corrected))
+            })
+            .collect::<Result<_>>()?;
+        for (w, solution) in self.waters.iter().zip(solved) {
+            let &[o, h1, h2] = w;
+            if let Some(corrected) = solution {
                 [coords[o], coords[h1], coords[h2]] = corrected;
             } else {
                 // This path is retained only for legacy/non-TIP3P callers.
@@ -840,15 +855,27 @@ impl SettleWaters {
     /// SETTLE velocity solve; solute X-H bonds use the bounded general solver.
     pub fn constrain_velocities(&self, coords: &[Vec3], velocities: &mut [Vec3]) -> Result<f64> {
         let mut worst: f64 = 0.0;
-        for (index, (w, &(_, _, iso))) in self.waters.iter().zip(&self.water_geom).enumerate() {
+        let current: &[Vec3] = velocities;
+        let solved: Vec<Option<([Vec3; 3], f64)>> = self
+            .waters
+            .par_iter()
+            .zip(self.water_geom.par_iter())
+            .zip(self.water_masses.par_iter())
+            .map(|((w, &(_, _, iso)), &masses)| {
+                let &[o, h1, h2] = w;
+                if !iso {
+                    return Ok(None);
+                }
+                let mut vv = [current[o], current[h1], current[h2]];
+                let residual =
+                    settle_velocity_triangle([coords[o], coords[h1], coords[h2]], &mut vv, masses)?;
+                Ok(Some((vv, residual)))
+            })
+            .collect::<Result<_>>()?;
+        for (w, solution) in self.waters.iter().zip(solved) {
             let &[o, h1, h2] = w;
-            if iso {
-                let mut vv = [velocities[o], velocities[h1], velocities[h2]];
-                worst = worst.max(settle_velocity_triangle(
-                    [coords[o], coords[h1], coords[h2]],
-                    &mut vv,
-                    self.water_masses[index],
-                )?);
+            if let Some((vv, residual)) = solution {
+                worst = worst.max(residual);
                 velocities[o] = vv[0];
                 velocities[h1] = vv[1];
                 velocities[h2] = vv[2];
@@ -905,12 +932,12 @@ impl SettleWaters {
 
     pub fn max_violation(&self, coords: &[Vec3]) -> f64 {
         self.constraints
-            .iter()
+            .par_iter()
             .map(|&(a, b, target, _, _)| {
                 let d = sub(coords[a], coords[b]);
                 ((dot(d, d)).sqrt() - target).abs()
             })
-            .fold(0., f64::max)
+            .reduce(|| 0., f64::max)
     }
 
     /// Maximum velocity-constraint residual `|(v_a-v_b)·r_hat|` in A/ps.

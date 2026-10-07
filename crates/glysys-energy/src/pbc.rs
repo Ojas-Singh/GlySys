@@ -674,41 +674,16 @@ impl<'a> PbcForceField<'a> {
         Ok(result)
     }
 
-    pub fn evaluate(
+    /// Bonds, angles and proper/improper torsions on unwrapped coordinates:
+    /// adds their energies to `components`, gradients to `gradients`, and
+    /// their virials to `virial_terms[0..3]`.
+    fn bonded_into(
         &self,
         unwrapped: &[Vec3],
-        box_vec: &BoxVectors,
-        pairs: &[(usize, usize)],
-        backend: &dyn ElectrostaticsBackend,
-        cutoff: f64,
-    ) -> Result<PbcEnergy> {
-        let n = self.system.atom_count();
-        if unwrapped.len() != n {
-            return Err(EnergyError::CoordinateCount {
-                expected: n,
-                received: unwrapped.len(),
-            });
-        }
-        if unwrapped
-            .iter()
-            .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
-        {
-            return Err(EnergyError::NonFiniteCoordinate);
-        }
-        let mut components = EnergyComponents::default();
-        let mut gradients = vec![
-            Vec3 {
-                x: 0.,
-                y: 0.,
-                z: 0.
-            };
-            n
-        ];
-        // Virial from the displacement vectors actually used for each force:
-        // minimum-image vectors for pairs (unwrapped separations can span
-        // images and would corrupt the pressure), raw separations for bonds.
-        let mut virial_terms = [0.; 4];
-        let mut virial_pair_split = [0.; 2];
+        components: &mut EnergyComponents,
+        gradients: &mut [Vec3],
+        virial_terms: &mut [f64; 4],
+    ) {
         // Bonded terms see unwrapped coordinates: never a box split.
         for bond in self.system.bonds() {
             let [a, b] = bond.atoms();
@@ -771,6 +746,129 @@ impl<'a> PbcForceField<'a> {
                         + unwrapped[*atom].z * grad[k].z);
             }
         }
+    }
+
+    fn restraints_into(
+        &self,
+        unwrapped: &[Vec3],
+        components: &mut EnergyComponents,
+        gradients: &mut [Vec3],
+    ) {
+        for restraint in &self.restraints {
+            if let Some(p) = unwrapped.get(restraint.atom) {
+                let dx = p.x - restraint.reference.x;
+                let dy = p.y - restraint.reference.y;
+                let dz = p.z - restraint.reference.z;
+                components.restraints += restraint.force * (dx * dx + dy * dy + dz * dz);
+                gradients[restraint.atom].x += 2. * restraint.force * dx;
+                gradients[restraint.atom].y += 2. * restraint.force * dy;
+                gradients[restraint.atom].z += 2. * restraint.force * dz;
+            }
+        }
+    }
+
+    /// Dynamics evaluation with the single-precision cluster-pair engine for
+    /// pairs and 1-4 exceptions and this field's f64 bonded terms and
+    /// restraints. Returns the same observables as
+    /// [`Self::evaluate_with_dispersion_coefficient`]; the engine must have
+    /// been built for this system and its cutoff/reaction-field settings.
+    /// Without `observables` only the gradients are exact: pair energies and
+    /// virials are left at zero for force-only integration steps.
+    pub fn evaluate_with_cluster(
+        &self,
+        engine: &mut crate::pbc_cluster::ClusterPairEngine,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        dispersion_coefficient: f64,
+        include_dispersion: bool,
+        observables: bool,
+    ) -> Result<PbcEnergy> {
+        let n = self.system.atom_count();
+        if unwrapped.len() != n {
+            return Err(EnergyError::CoordinateCount {
+                expected: n,
+                received: unwrapped.len(),
+            });
+        }
+        let mut components = EnergyComponents::default();
+        let mut gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            n
+        ];
+        let mut virial_terms = [0.; 4];
+        self.bonded_into(
+            unwrapped,
+            &mut components,
+            &mut gradients,
+            &mut virial_terms,
+        );
+        let pairs = engine.evaluate_into(unwrapped, box_vec, &mut gradients, observables)?;
+        components.van_der_waals = pairs.van_der_waals;
+        components.electrostatics = pairs.electrostatics;
+        virial_terms[3] = pairs.virial;
+        self.restraints_into(unwrapped, &mut components, &mut gradients);
+        if include_dispersion {
+            if !dispersion_coefficient.is_finite() {
+                return Err(EnergyError::InvalidConfiguration(
+                    "non-finite dispersion correction coefficient".into(),
+                ));
+            }
+            components.dispersion_correction = dispersion_coefficient / box_vec.volume();
+        }
+        Ok(PbcEnergy {
+            components,
+            gradients,
+            virial: virial_terms.iter().sum(),
+            virial_terms,
+            virial_pair_split: pairs.virial_pair_split,
+        })
+    }
+
+    pub fn evaluate(
+        &self,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        backend: &dyn ElectrostaticsBackend,
+        cutoff: f64,
+    ) -> Result<PbcEnergy> {
+        let n = self.system.atom_count();
+        if unwrapped.len() != n {
+            return Err(EnergyError::CoordinateCount {
+                expected: n,
+                received: unwrapped.len(),
+            });
+        }
+        if unwrapped
+            .iter()
+            .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
+        {
+            return Err(EnergyError::NonFiniteCoordinate);
+        }
+        let mut components = EnergyComponents::default();
+        let mut gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            n
+        ];
+        // Virial from the displacement vectors actually used for each force:
+        // minimum-image vectors for pairs (unwrapped separations can span
+        // images and would corrupt the pressure), raw separations for bonds.
+        let mut virial_terms = [0.; 4];
+        let mut virial_pair_split = [0.; 2];
+        self.bonded_into(
+            unwrapped,
+            &mut components,
+            &mut gradients,
+            &mut virial_terms,
+        );
         // Nonbonded pairs use the minimum image of wrapped positions. Every
         // worker receives a sorted contiguous chunk and reduces privately;
         // chunks are folded below in the same order for reproducibility.
@@ -936,10 +1034,64 @@ fn angle_with_gradient(a: Vec3, c: Vec3, b: Vec3) -> (f64, (Vec3, Vec3, Vec3)) {
     (theta, (gu, gc, gv))
 }
 
-/// Dihedral value plus exact Cartesian gradients via forward dual numbers.
-/// The scalar matches the implicit engine's dihedral; derivatives are exact
-/// by construction, so only self-consistency needs testing.
+/// Dihedral value plus its closed-form Cartesian gradient (Blondel and
+/// Karplus, as in OpenMM and GROMACS). The angle is the implicit engine's
+/// dihedral; collinear arms give a zero gradient.
 pub(super) fn dihedral_with_gradient(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3; 4]) {
+    let sub = |a: Vec3, b: Vec3| Vec3 {
+        x: a.x - b.x,
+        y: a.y - b.y,
+        z: a.z - b.z,
+    };
+    let cross = |a: Vec3, b: Vec3| Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    };
+    let dot = |a: Vec3, b: Vec3| a.x * b.x + a.y * b.y + a.z * b.z;
+    let scale = |a: Vec3, s: f64| Vec3 {
+        x: a.x * s,
+        y: a.y * s,
+        z: a.z * s,
+    };
+    let b0 = sub(p1, p0);
+    let b1 = sub(p2, p1);
+    let b2 = sub(p3, p2);
+    let n0 = cross(b0, b1);
+    let n1 = cross(b1, b2);
+    let b1_norm2 = dot(b1, b1);
+    let r1 = b1_norm2.sqrt().max(1.0e-16);
+    let u1 = Vec3 {
+        x: b1.x / r1,
+        y: b1.y / r1,
+        z: b1.z / r1,
+    };
+    let phi = dot(cross(n0, n1), u1).atan2(dot(n0, n1));
+    let (n0_norm2, n1_norm2) = (dot(n0, n0), dot(n1, n1));
+    if n0_norm2 * n1_norm2 < 1.0e-32 {
+        return (
+            phi,
+            [Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+            }; 4],
+        );
+    }
+    let g0 = scale(n0, -r1 / n0_norm2);
+    let g3 = scale(n1, r1 / n1_norm2);
+    let inv_b1 = 1.0 / b1_norm2.max(1.0e-32);
+    let p = -dot(b0, b1) * inv_b1;
+    let q = -dot(b2, b1) * inv_b1;
+    let s = sub(scale(g0, p), scale(g3, q));
+    let g1 = sub(s, g0);
+    let g2 = sub(scale(g3, -1.0), s);
+    (phi, [g0, g1, g2, g3])
+}
+
+/// Forward-dual-number form of [`dihedral_with_gradient`], the test oracle.
+#[cfg(test)]
+fn dihedral_with_gradient_dual(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, [Vec3; 4]) {
     #[derive(Clone, Copy)]
     struct D {
         v: f64,
@@ -1099,6 +1251,35 @@ mod tests {
                 "r={r} analytic={analytic}"
             );
         }
+    }
+
+    #[test]
+    fn closed_form_torsion_gradient_matches_dual_numbers() {
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0
+        };
+        for case in 0..500 {
+            let p: [Vec3; 4] = std::array::from_fn(|k| v(k as f64 * 1.4 + next(), next(), next()));
+            let (phi, grad) = dihedral_with_gradient(p[0], p[1], p[2], p[3]);
+            let (want_phi, want) = dihedral_with_gradient_dual(p[0], p[1], p[2], p[3]);
+            assert_eq!(phi.to_bits(), want_phi.to_bits(), "case {case}");
+            for (g, w) in grad.iter().zip(&want) {
+                for (a, b) in [(g.x, w.x), (g.y, w.y), (g.z, w.z)] {
+                    assert!(
+                        (a - b).abs() <= 1e-9 * (1.0 + b.abs()),
+                        "case {case}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+        // Collinear arms: no torsion and no force.
+        let (_, grad) =
+            dihedral_with_gradient(v(0., 0., 0.), v(1., 0., 0.), v(2., 0., 0.), v(3., 1., 0.));
+        assert!(grad.iter().all(|g| g.x == 0. && g.y == 0. && g.z == 0.));
     }
 
     #[test]

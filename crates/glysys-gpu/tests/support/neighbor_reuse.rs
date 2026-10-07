@@ -136,9 +136,17 @@ fn failed_neighbor_build_remains_invalid_on_retry() {
         let context = glysys_gpu::GpuContext::new(glysys_gpu::GpuContextOptions::default())
             .await
             .unwrap();
-        let gpu = ResidentPbc::with_context(&context, &packing, &backend, 1)
-            .await
-            .unwrap();
+        // A one-pair bound exercises the historical CSR capacity path; the
+        // tiled engine sizes its own lists and is covered below.
+        let gpu = ResidentPbc::with_context_kernel(
+            &context,
+            &packing,
+            &backend,
+            1,
+            glysys_gpu::pbc::PbcKernel::Csr,
+        )
+        .await
+        .unwrap();
         let b = system.box_angstrom();
         // Centered coordinates equal the zeroed rebuild reference. Recovery
         // must retain the dirty flag rather than rely on displacement alone.
@@ -157,5 +165,45 @@ fn failed_neighbor_build_remains_invalid_on_retry() {
             assert!(gpu.dynamics_status().await.unwrap().is_some());
         }
         assert_eq!(gpu.neighbor_rebuild_count().await.unwrap(), 0);
+    });
+}
+
+#[test]
+fn tiled_engine_reports_coincident_atoms_and_stays_invalid_on_retry() {
+    pollster::block_on(async {
+        let _guard = super::gpu_test_guard();
+        let system = solvated_system(6.0);
+        let packing = PbcPacking::new(&system, 4., 1.5).unwrap();
+        let backend = NonbondedElectrostatics::ReactionField {
+            cutoff_angstrom: 4.,
+            solvent_dielectric: 78.5,
+        };
+        let context = glysys_gpu::GpuContext::new(glysys_gpu::GpuContextOptions::default())
+            .await
+            .unwrap();
+        let gpu = ResidentPbc::with_context_kernel(
+            &context,
+            &packing,
+            &backend,
+            1,
+            glysys_gpu::pbc::PbcKernel::Tiles,
+        )
+        .await
+        .unwrap();
+        let b = system.box_angstrom();
+        let coords = vec![
+            Vec3 {
+                x: b[0] * 0.5,
+                y: b[1] * 0.5,
+                z: b[2] * 0.5
+            };
+            system.atom_count()
+        ];
+        gpu.set_coordinates(&coords, [b[0] as f32, b[1] as f32, b[2] as f32], true);
+        for _ in 0..2 {
+            let result = gpu.energy_and_forces(true).await.unwrap();
+            assert!(result.neighbor_overflow);
+            assert!(gpu.dynamics_status().await.unwrap().is_some());
+        }
     });
 }

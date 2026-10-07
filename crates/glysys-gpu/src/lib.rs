@@ -3,6 +3,7 @@ pub(crate) mod adapter;
 pub mod context;
 pub mod device;
 pub mod pbc;
+pub(crate) mod pbc_tiles;
 pub mod topology;
 
 #[cfg(test)]
@@ -121,6 +122,7 @@ pub mod scoring;
 pub mod hydration;
 
 pub mod dynamics;
+pub(crate) mod implicit_tiles;
 
 /// WebGPU error scopes are useful on native backends, but Safari's WebGPU
 /// implementation has returned a non-`GPUError` object from

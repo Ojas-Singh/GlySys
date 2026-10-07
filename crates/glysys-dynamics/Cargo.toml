@@ -10,6 +10,7 @@ repository = "https://github.com/Ojas-Singh/GlySys"
 glysys = { version = "0.1.2", path = "../.." }
 glysys-energy = { version = "0.1.2", path = "../glysys-energy" }
 glysys-opt = { version = "0.1.2", path = "../glysys-opt" }
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
