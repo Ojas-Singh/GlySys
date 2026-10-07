@@ -137,7 +137,11 @@ struct GpuContextInner {
     memory_profile: MemoryProfile,
     gpu_timestamps_enabled: bool,
     pbc_tiled_nonbonded: bool,
+    uncaptured_errors: Arc<Mutex<Vec<String>>>,
 }
+
+#[cfg(target_arch = "wasm32")]
+const MAX_RECORDED_DEVICE_ERRORS: usize = 48;
 
 /// Shared, coordinator-owned GPU state. Cloning this value only clones a
 /// handle; it never requests a second adapter or device.
@@ -182,12 +186,27 @@ impl GpuContext {
             })
             .await
             .map_err(|e| Error::Unavailable(e.to_string()))?;
+        // In a browser a rejected shader or command does not stop anything:
+        // the pipeline is invalid, its passes do nothing, and the only trace
+        // is this event. Error scopes cannot be used there (see
+        // `pop_error_scope`), so the messages are kept for whoever checks the
+        // results.
+        let uncaptured_errors = Arc::new(Mutex::new(Vec::new()));
         #[cfg(target_arch = "wasm32")]
-        device.on_uncaptured_error(Box::new(|error| {
-            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "GlySys WebGPU uncaptured error: {error}"
-            )));
-        }));
+        {
+            let sink = uncaptured_errors.clone();
+            device.on_uncaptured_error(Box::new(move |error| {
+                let text = error.to_string();
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "GlySys WebGPU uncaptured error: {text}"
+                )));
+                if let Ok(mut errors) = sink.lock() {
+                    if errors.len() < MAX_RECORDED_DEVICE_ERRORS {
+                        errors.push(text);
+                    }
+                }
+            }));
+        }
         Ok(Self(Arc::new(GpuContextInner {
             _instance: instance,
             _adapter: adapter,
@@ -203,7 +222,21 @@ impl GpuContext {
             memory_profile: options.memory_profile,
             gpu_timestamps_enabled,
             pbc_tiled_nonbonded: options.pbc_tiled_nonbonded,
+            uncaptured_errors,
         })))
+    }
+
+    /// Errors the device raised outside any error scope, oldest first (at
+    /// most the first few dozen). In a browser this is where a shader the
+    /// browser's compiler rejected shows up; a caller that finds wrong results
+    /// should look here. They arrive with the event loop, so read them after
+    /// awaiting a result from the device. Natively such errors abort instead.
+    pub fn uncaptured_errors(&self) -> Vec<String> {
+        self.0
+            .uncaptured_errors
+            .lock()
+            .map(|errors| errors.clone())
+            .unwrap_or_default()
     }
 
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {

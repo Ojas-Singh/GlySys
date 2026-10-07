@@ -280,7 +280,8 @@ mod tests {
                 .iter()
                 .any(|&p| exponent(p) == 0xff && p & 0x007f_ffff != 0)
         );
-        assert!(patterns.contains(&u32::MAX));
+        // selftest.wgsl reads its sentinel from this slot
+        assert_eq!(patterns[26], u32::MAX);
     }
 
     #[test]

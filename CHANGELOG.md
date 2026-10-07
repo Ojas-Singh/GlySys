@@ -31,6 +31,9 @@
   only (`analysis::rmsd_atoms`): water and single-atom ions are left out. In a
   water box it used to measure the solvent's diffusion. Add
   `ParameterizedSystem::solute_atom_count`.
+- In a browser, `GpuContext::uncaptured_errors` keeps what the device raised
+  outside an error scope (a shader the browser's compiler rejected leaves an
+  invalid pipeline whose passes silently do nothing).
 - Add `glysys_gpu::selftest::bit_patterns`: a device self-test that copies
   integer bit patterns through float lanes the way the kernels do (buffer
   loads, rebuilt locals, workgroup memory, `select`, store and rewrite) and
