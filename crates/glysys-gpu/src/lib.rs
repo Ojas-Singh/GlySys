@@ -124,6 +124,8 @@ pub mod hydration;
 pub mod dynamics;
 pub(crate) mod implicit_tiles;
 
+pub mod selftest;
+
 /// WebGPU error scopes are useful on native backends, but Safari's WebGPU
 /// implementation has returned a non-`GPUError` object from
 /// `popErrorScope()`. wgpu 26 currently performs an internal `dyn_into().unwrap()`

@@ -31,6 +31,10 @@
   only (`analysis::rmsd_atoms`): water and single-atom ions are left out. In a
   water box it used to measure the solvent's diffusion. Add
   `ParameterizedSystem::solute_atom_count`.
+- Add `glysys_gpu::selftest::bit_patterns`: a device self-test that copies
+  integer bit patterns through float lanes the way the kernels do (buffer
+  loads, rebuilt locals, workgroup memory, `select`, store and rewrite) and
+  reports the ones that come back different.
 - A failed solute constraint on the GPU names its constraint group and says
   when the reported error is saturated; the group index no longer spills into
   the error kind for solutes with more than 4,095 groups.
