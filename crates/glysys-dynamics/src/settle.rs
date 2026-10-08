@@ -496,7 +496,22 @@ pub struct SettleWaters {
     constraints: Vec<(usize, usize, f64, f64, f64)>,
     /// Solute X-H bonds constrained alongside the waters, if any.
     solute_bonds: Vec<(usize, usize, f64, f64, f64)>,
+    /// First atom of the waters when they are isosceles and stored as
+    /// consecutive O, H, H triples, as a prepared system stores them: the
+    /// position solve then writes its results in place, in parallel.
+    water_block: Option<usize>,
     pub tolerance: f64,
+}
+
+/// See [`SettleWaters::water_block`].
+fn water_block(waters: &[[usize; 3]], geometry: &[(f64, f64, bool)]) -> Option<usize> {
+    let start = waters.first()?[0];
+    (waters
+        .iter()
+        .enumerate()
+        .all(|(i, water)| *water == [start + 3 * i, start + 3 * i + 1, start + 3 * i + 2])
+        && geometry.iter().all(|&(_, _, isosceles)| isosceles))
+    .then_some(start)
 }
 
 impl SettleWaters {
@@ -562,6 +577,7 @@ impl SettleWaters {
             solute_constraints.push((a, b, target, 1. / masses[a], 1. / masses[b]));
         }
         Ok(Self {
+            water_block: water_block(&waters, &water_geom),
             waters,
             water_geom,
             water_masses,
@@ -625,6 +641,7 @@ impl SettleWaters {
             }
         }
         Ok(Self {
+            water_block: water_block(&waters, &water_geom),
             waters,
             water_geom,
             water_masses,
@@ -716,6 +733,46 @@ impl SettleWaters {
         coords: &mut [Vec3],
         masses: &[f64],
     ) -> Result<()> {
+        if let Some(start) = self.water_block
+            && coords.len() >= start + 3 * self.waters.len()
+        {
+            let residual = |a: Vec3, b: Vec3, target: f64| {
+                let d = sub(a, b);
+                (dot(d, d).sqrt() - target).abs()
+            };
+            let worst = coords[start..start + 3 * self.waters.len()]
+                .par_chunks_mut(3)
+                .zip(self.water_geom.par_iter())
+                .enumerate()
+                .with_min_len(64)
+                .map(|(index, (triple, &(doh, dhh, _)))| {
+                    let o = start + 3 * index;
+                    let (corrected, _) = settle_triangle(
+                        old_coords[o],
+                        old_coords[o + 1],
+                        old_coords[o + 2],
+                        drifted[o],
+                        drifted[o + 1],
+                        drifted[o + 2],
+                        masses[o],
+                        masses[o + 1],
+                        masses[o + 2],
+                        doh,
+                        dhh,
+                    )?;
+                    triple.copy_from_slice(&corrected);
+                    Result::Ok(residual(corrected[0], corrected[1], doh)
+                        .max(residual(corrected[0], corrected[2], doh))
+                        .max(residual(corrected[1], corrected[2], dhh)))
+                })
+                .try_reduce(|| 0., |a: f64, b: f64| Ok(a.max(b)))?;
+            if !worst.is_finite() || worst > 1e-8 {
+                return Err(invalid(format!(
+                    "rigid-water position residual {worst:.3e} A exceeds 1e-8"
+                )));
+            }
+            return Ok(());
+        }
         // Each water is an independent triple: solve in parallel, then write
         // the results in water order (identical arithmetic to a serial loop).
         let solved: Vec<Option<[Vec3; 3]>> = self

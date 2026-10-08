@@ -29,6 +29,9 @@ pub const SKIN_ANGSTROM: f64 = 1.5;
 /// Fewest atoms a parallel task of a per-atom loop takes; such loops cost a
 /// few nanoseconds per atom, less than handing out a task does.
 const PER_ATOM_TASK: usize = 512;
+/// Below this many atoms the per-atom loops of a step run on the calling
+/// thread: waking the pool for one of them takes longer than the loop.
+const PARALLEL_ATOMS: usize = 32_768;
 /// 1 fs for flexible waters, 2 fs with SETTLE. Larger requests are rejected
 /// rather than silently integrated.
 pub fn max_timestep_fs(constraints: ConstraintModel) -> f64 {
@@ -799,7 +802,19 @@ pub struct ExplicitSimulation<'a> {
     /// Whether `state.virial_kcal_mol` holds the full virial of the stored
     /// gradient (force-only evaluations leave the pair part out).
     virial_current: bool,
+    scratch: LeapfrogScratch,
+    /// `-ACCEL / mass` of every atom: gradient to acceleration.
+    kick_per_ps: Vec<f64>,
     pub state: SimulationState,
+}
+
+/// Buffers of the leap-frog step, kept between steps: the new velocities,
+/// the positions before and after the constraints.
+#[derive(Default)]
+struct LeapfrogScratch {
+    velocities: Vec<Vec3>,
+    trial: Vec<Vec3>,
+    coordinates: Vec<Vec3>,
 }
 
 impl<'a> ExplicitSimulation<'a> {
@@ -819,6 +834,8 @@ impl<'a> ExplicitSimulation<'a> {
             coupling_plan: self.coupling_plan,
             constraint_anchor: self.constraint_anchor,
             virial_current: self.virial_current,
+            scratch: self.scratch,
+            kick_per_ps: self.kick_per_ps,
             state: self.state,
         }
     }
@@ -1004,6 +1021,7 @@ impl<'a> ExplicitSimulation<'a> {
         let cluster = cluster_engine(system, &protocol)?;
         let mut sim = Self {
             field,
+            kick_per_ps: masses.iter().map(|m| -ACCEL / m).collect(),
             masses,
             settle,
             waters,
@@ -1017,6 +1035,7 @@ impl<'a> ExplicitSimulation<'a> {
             coupling_plan,
             constraint_anchor,
             virial_current: true,
+            scratch: LeapfrogScratch::default(),
             state: SimulationState {
                 schema_version: schema_version(&protocol),
                 model_version: model_version(&protocol).into(),
@@ -1173,6 +1192,7 @@ impl<'a> ExplicitSimulation<'a> {
         let leapfrog = coupling_plan.is_some();
         let mut sim = Self {
             field,
+            kick_per_ps: masses.iter().map(|m| -ACCEL / m).collect(),
             masses,
             settle,
             waters,
@@ -1189,6 +1209,7 @@ impl<'a> ExplicitSimulation<'a> {
             // the virial of the stored forces, so take it from the
             // evaluation above.
             virial_current: leapfrog,
+            scratch: LeapfrogScratch::default(),
             state,
         };
         if leapfrog {
@@ -1628,6 +1649,15 @@ impl<'a> ExplicitSimulation<'a> {
     /// 4. on a barostat step, scale the box and the coordinates;
     /// 5. evaluate the forces at the new positions.
     fn leapfrog_step(&mut self) -> Result<()> {
+        // The buffers leave `self` for the step, so the force evaluation can
+        // borrow the simulation while they hold the new coordinates.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = self.leapfrog_step_in(&mut scratch);
+        self.scratch = scratch;
+        result
+    }
+
+    fn leapfrog_step_in(&mut self, scratch: &mut LeapfrogScratch) -> Result<()> {
         let Some(plan) = self.coupling_plan.clone() else {
             return Err(invalid("leap-frog step without a coupling plan"));
         };
@@ -1695,90 +1725,134 @@ impl<'a> ExplicitSimulation<'a> {
             ));
         }
 
-        let old_coords = self.state.coordinates.clone();
+        let atoms = self.masses.len();
         let zero = Vec3 {
             x: 0.,
             y: 0.,
             z: 0.,
         };
-        let mut next_vel = vec![zero; old_coords.len()];
-        let mut trial = vec![zero; old_coords.len()];
+        for buffer in [&mut scratch.velocities, &mut scratch.trial, &mut scratch.coordinates] {
+            buffer.resize(atoms, zero);
+        }
+        let LeapfrogScratch {
+            velocities: next_vel,
+            trial,
+            coordinates: next_coords,
+        } = scratch;
+        let old_coords = &self.state.coordinates;
         {
             let velocities = &self.state.velocities;
             let gradient = &self.state.gradient;
-            let masses = &self.masses;
+            let kicks = &self.kick_per_ps;
             let groups = &plan.group_of_atom;
-            let friction = &friction;
-            next_vel
-                .par_iter_mut()
-                .zip(trial.par_iter_mut())
-                .enumerate()
-                .with_min_len(PER_ATOM_TASK)
-                .for_each(|(i, (velocity, position))| {
-                    let f = friction[groups[i] as usize];
-                    let kick = -dt * ACCEL / masses[i];
-                    let (v, g) = (velocities[i], gradient[i]);
-                    *velocity = Vec3 {
-                        x: (v.x * (1. - f - drag[0]) + kick * g.x) / (1. + f),
-                        y: (v.y * (1. - f - drag[1]) + kick * g.y) / (1. + f),
-                        z: (v.z * (1. - f - drag[2]) + kick * g.z) / (1. + f),
-                    };
-                    *position = add(old_coords[i], scale(*velocity, dt));
-                });
+            // per group: the factors of the old velocity and of the kick
+            let factors: Vec<([f64; 3], f64)> = friction
+                .iter()
+                .map(|f| {
+                    let inverse = 1. / (1. + f);
+                    (
+                        [
+                            (1. - f - drag[0]) * inverse,
+                            (1. - f - drag[1]) * inverse,
+                            (1. - f - drag[2]) * inverse,
+                        ],
+                        dt * inverse,
+                    )
+                })
+                .collect();
+            let factors = &factors;
+            let advance = |(i, (velocity, position)): (usize, (&mut Vec3, &mut Vec3))| {
+                let (keep, kick) = factors[groups[i] as usize];
+                let kick = kick * kicks[i];
+                let (v, g) = (velocities[i], gradient[i]);
+                *velocity = Vec3 {
+                    x: v.x * keep[0] + kick * g.x,
+                    y: v.y * keep[1] + kick * g.y,
+                    z: v.z * keep[2] + kick * g.z,
+                };
+                *position = add(old_coords[i], scale(*velocity, dt));
+            };
+            if atoms >= PARALLEL_ATOMS {
+                next_vel
+                    .par_iter_mut()
+                    .zip(trial.par_iter_mut())
+                    .enumerate()
+                    .with_min_len(PER_ATOM_TASK)
+                    .for_each(advance);
+            } else {
+                next_vel.iter_mut().zip(trial.iter_mut()).enumerate().for_each(advance);
+            }
         }
 
-        let mut next_coords = trial.clone();
-        let mut constraint_virial = 0.;
+        next_coords.copy_from_slice(trial);
+        let constrained = self.settle.is_some();
         if let Some(constraints) = &self.settle {
-            constraints.settle_positions(&old_coords, &trial, &mut next_coords, &self.masses)?;
-            constraints.shake_solute_positions_from_old(&old_coords, &mut next_coords)?;
+            constraints.settle_positions(old_coords, trial, next_coords, &self.masses)?;
+            constraints.shake_solute_positions_from_old(old_coords, next_coords)?;
+        }
+        // One pass adds the constraint displacement to the velocities and
+        // finds the largest move of the step.
+        let inverse_dt = 1. / dt;
+        let correct = |(((velocity, next), unconstrained), old): (
+            ((&mut Vec3, &Vec3), &Vec3),
+            &Vec3,
+        )| {
+            if constrained {
+                *velocity = add(
+                    *velocity,
+                    scale(add(*next, scale(*unconstrained, -1.)), inverse_dt),
+                );
+            }
+            if finite(next) && finite(velocity) {
+                norm2(add(*next, scale(*old, -1.)))
+            } else {
+                f64::INFINITY
+            }
+        };
+        let largest_move = if atoms >= PARALLEL_ATOMS {
             next_vel
                 .par_iter_mut()
                 .zip(next_coords.par_iter())
                 .zip(trial.par_iter())
+                .zip(old_coords.par_iter())
                 .with_min_len(PER_ATOM_TASK)
-                .for_each(|((velocity, next), unconstrained)| {
-                    *velocity = add(
-                        *velocity,
-                        scale(add(*next, scale(*unconstrained, -1.)), 1. / dt),
-                    );
-                });
-            if self.virial_current {
-                // sum of r . G with G = m (x_constrained - x_free) / dt^2,
-                // summed in atom order so the result does not depend on the
-                // thread schedule
-                for (i, mass) in self.masses.iter().enumerate() {
-                    let moved = add(next_coords[i], scale(trial[i], -1.));
-                    let arm = add(
-                        old_coords[i],
-                        scale(old_coords[self.constraint_anchor[i] as usize], -1.),
-                    );
-                    constraint_virial +=
-                        mass * (arm.x * moved.x + arm.y * moved.y + arm.z * moved.z);
-                }
-                constraint_virial /= dt * dt * ACCEL;
-            }
-        }
-
-        let unstable = next_coords
-            .par_iter()
-            .zip(next_vel.par_iter())
-            .zip(old_coords.par_iter())
-            .with_min_len(PER_ATOM_TASK)
-            .any(|((next, velocity), old)| {
-                !finite(next) || !finite(velocity) || norm2(add(*next, scale(*old, -1.))) > 1.
-            });
-        if unstable {
+                .map(correct)
+                .reduce(|| 0., f64::max)
+        } else {
+            next_vel
+                .iter_mut()
+                .zip(next_coords.iter())
+                .zip(trial.iter())
+                .zip(old_coords.iter())
+                .map(correct)
+                .fold(0., f64::max)
+        };
+        if !(largest_move <= 1.) {
             return Err(invalid(
                 "unstable leap-frog step (>1 A); checkpoint retained",
             ));
+        }
+        let mut constraint_virial = 0.;
+        if constrained && self.virial_current {
+            // sum of r . G with G = m (x_constrained - x_free) / dt^2, summed
+            // in atom order so the result does not depend on the thread
+            // schedule
+            for (i, mass) in self.masses.iter().enumerate() {
+                let moved = add(next_coords[i], scale(trial[i], -1.));
+                let arm = add(
+                    old_coords[i],
+                    scale(old_coords[self.constraint_anchor[i] as usize], -1.),
+                );
+                constraint_virial += mass * (arm.x * moved.x + arm.y * moved.y + arm.z * moved.z);
+            }
+            constraint_virial /= dt * dt * ACCEL;
         }
 
         let mut pressure = None;
         if self.virial_current {
             let kinetic = 0.5
                 * (kinetic_energy(&self.masses, &self.state.velocities)
-                    + kinetic_energy(&self.masses, &next_vel));
+                    + kinetic_energy(&self.masses, next_vel));
             let volume = old_box.volume();
             let mut value =
                 (2. * kinetic + self.state.virial_kcal_mol + constraint_virial) / (3. * volume);
@@ -1795,11 +1869,11 @@ impl<'a> ExplicitSimulation<'a> {
             old_box
         } else {
             let scale_by = [1. + drag[0], 1. + drag[1], 1. + drag[2]];
-            next_coords.par_iter_mut().with_min_len(PER_ATOM_TASK).for_each(|p| {
+            for p in next_coords.iter_mut() {
                 p.x *= scale_by[0];
                 p.y *= scale_by[1];
                 p.z *= scale_by[2];
-            });
+            }
             BoxVectors::new(
                 lengths[0] * scale_by[0],
                 lengths[1] * scale_by[1],
@@ -1816,12 +1890,18 @@ impl<'a> ExplicitSimulation<'a> {
         }
 
         if plan.com_interval > 0 && step.is_multiple_of(plan.com_interval) {
-            remove_com_motion(&plan.com_groups, &self.masses, &mut next_vel);
+            remove_com_motion(&plan.com_groups, &self.masses, next_vel);
         }
 
         let virial_was_current = self.virial_current;
-        let energy = match self.dynamics_energy_in(&next_coords, &new_box) {
-            Ok(energy) if energy.components.total().is_finite() => energy,
+        let energy = match self.dynamics_energy_in(next_coords, &new_box) {
+            Ok(energy)
+                if energy.components.total().is_finite()
+                    && energy.gradients.len() == atoms
+                    && energy.gradients.iter().all(finite) =>
+            {
+                energy
+            }
             Ok(_) => {
                 self.virial_current = virial_was_current;
                 return Err(invalid("nonfinite explicit energy; checkpoint retained"));
@@ -1831,13 +1911,13 @@ impl<'a> ExplicitSimulation<'a> {
                 return Err(error);
             }
         };
-        self.commit(
-            next_coords,
-            next_vel,
-            energy.components.total(),
-            energy.gradients,
-            energy.virial,
-        )?;
+        // The new state takes the buffers and leaves the old ones for the
+        // next step.
+        std::mem::swap(&mut self.state.coordinates, next_coords);
+        std::mem::swap(&mut self.state.velocities, next_vel);
+        self.state.potential_energy = energy.components.total();
+        self.state.gradient = energy.gradients;
+        self.state.virial_kcal_mol = energy.virial;
         self.state.box_angstrom = new_box.as_array();
         self.state.coupling = Some(coupling);
         if let Some(bar) = pressure {

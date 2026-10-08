@@ -34,6 +34,11 @@ const CHUNKS_PER_THREAD: usize = 4;
 /// Fewest atoms a parallel task of a per-atom loop takes: these loops are a
 /// few nanoseconds per atom, less than the cost of handing out a task.
 const PER_ATOM_TASK: usize = 512;
+/// Below this many atoms the per-atom loops run on the calling thread:
+/// waking the pool for one of them takes longer than the loop itself.
+const PARALLEL_ATOMS: usize = 32_768;
+/// The same for combining the force buffers, counted in buffer entries.
+const PARALLEL_SUMS: usize = 400_000;
 const SORT_CELL_ANGSTROM: f64 = 3.0;
 const MAX_SORT_BITS: u32 = 7;
 /// Polynomial terms of the Ewald direct-space corrections.
@@ -475,14 +480,19 @@ impl ClusterPairEngine {
             return true;
         }
         let limit = allowance * allowance;
-        wrapped
-            .par_iter()
-            .zip(self.reference.par_iter())
-            .with_min_len(PER_ATOM_TASK)
-            .any(|(p, r)| {
-                let d = box_vec.displacement(*p, *r);
-                d.x * d.x + d.y * d.y + d.z * d.z > limit
-            })
+        let moved = |(p, r): (&Vec3, &Vec3)| {
+            let d = box_vec.displacement(*p, *r);
+            d.x * d.x + d.y * d.y + d.z * d.z > limit
+        };
+        if wrapped.len() >= PARALLEL_ATOMS {
+            wrapped
+                .par_iter()
+                .zip(self.reference.par_iter())
+                .with_min_len(PER_ATOM_TASK)
+                .any(moved)
+        } else {
+            wrapped.iter().zip(self.reference.iter()).any(moved)
+        }
     }
 
     fn rebuild(&mut self, wrapped: &[Vec3], box_vec: &BoxVectors) -> Result<()> {
@@ -793,29 +803,39 @@ impl ClusterPairEngine {
         {
             return Err(EnergyError::NonFiniteCoordinate);
         }
-        let wrapped: Vec<Vec3> = coordinates
-            .par_iter()
-            .with_min_len(PER_ATOM_TASK)
-            .map(|p| box_vec.wrap(*p))
-            .collect();
+        let parallel = coordinates.len() >= PARALLEL_ATOMS;
+        let wrapped: Vec<Vec3> = if parallel {
+            coordinates
+                .par_iter()
+                .with_min_len(PER_ATOM_TASK)
+                .map(|p| box_vec.wrap(*p))
+                .collect()
+        } else {
+            coordinates.iter().map(|p| box_vec.wrap(*p)).collect()
+        };
         if self.needs_rebuild(&wrapped, box_vec) {
             self.rebuild(&wrapped, box_vec)?;
         }
         let order = &self.order;
         let charge = &self.charge;
         self.sorted.resize(order.len(), [0.0; 4]);
-        self.sorted
-            .par_iter_mut()
-            .zip(order.par_iter())
-            .with_min_len(PER_ATOM_TASK)
-            .for_each(|(slot, &atom)| {
-                *slot = if atom == u32::MAX {
-                    [0.0; 4]
-                } else {
-                    let p = wrapped[atom as usize];
-                    [p.x as f32, p.y as f32, p.z as f32, charge[atom as usize]]
-                };
-            });
+        let place = |(slot, &atom): (&mut [f32; 4], &u32)| {
+            *slot = if atom == u32::MAX {
+                [0.0; 4]
+            } else {
+                let p = wrapped[atom as usize];
+                [p.x as f32, p.y as f32, p.z as f32, charge[atom as usize]]
+            };
+        };
+        if parallel {
+            self.sorted
+                .par_iter_mut()
+                .zip(order.par_iter())
+                .with_min_len(PER_ATOM_TASK)
+                .for_each(place);
+        } else {
+            self.sorted.iter_mut().zip(order.iter()).for_each(place);
+        }
         // One contiguous chunk of clusters per worker, balanced by listed
         // entries; each chunk owns a sorted-slot force buffer.
         // Several chunks per worker let work stealing balance hybrid cores;
@@ -884,24 +904,29 @@ impl ClusterPairEngine {
         let buffers = &self.buffers;
         // Map sorted slots back to atoms, combining the chunks that wrote a
         // slot in chunk order.
-        gradients
-            .par_iter_mut()
-            .zip(plan.rank.par_iter())
-            .with_min_len(PER_ATOM_TASK)
-            .for_each(|(gradient, &slot)| {
-                let mut sum = [0.0f64; 3];
-                let writers = plan.offsets[slot as usize] as usize
-                    ..plan.offsets[slot as usize + 1] as usize;
-                for &chunk in &plan.writers[writers] {
-                    let value = buffers[chunk as usize][slot as usize];
-                    sum[0] += f64::from(value[0]);
-                    sum[1] += f64::from(value[1]);
-                    sum[2] += f64::from(value[2]);
-                }
-                gradient.x += sum[0];
-                gradient.y += sum[1];
-                gradient.z += sum[2];
-            });
+        let combine = |(gradient, &slot): (&mut Vec3, &u32)| {
+            let mut sum = [0.0f64; 3];
+            let writers =
+                plan.offsets[slot as usize] as usize..plan.offsets[slot as usize + 1] as usize;
+            for &chunk in &plan.writers[writers] {
+                let value = buffers[chunk as usize][slot as usize];
+                sum[0] += f64::from(value[0]);
+                sum[1] += f64::from(value[1]);
+                sum[2] += f64::from(value[2]);
+            }
+            gradient.x += sum[0];
+            gradient.y += sum[1];
+            gradient.z += sum[2];
+        };
+        if plan.writers.len() >= PARALLEL_SUMS {
+            gradients
+                .par_iter_mut()
+                .zip(plan.rank.par_iter())
+                .with_min_len(PER_ATOM_TASK)
+                .for_each(combine);
+        } else {
+            gradients.iter_mut().zip(plan.rank.iter()).for_each(combine);
+        }
         // 1-4 exceptions in f64; plain Coulomb scaled by 1/scee.
         let cutoff2 = self.cutoff * self.cutoff;
         for exception in &self.exceptions {
