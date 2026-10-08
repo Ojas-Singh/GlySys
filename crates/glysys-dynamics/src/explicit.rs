@@ -20,6 +20,7 @@ use glysys_energy::pbc::{
     classify_waters, molecules,
 };
 use glysys_energy::pbc_cluster::ClusterPairEngine;
+use glysys_energy::pme::{PmeEngine, PmeParameters};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -70,10 +71,105 @@ pub fn cutoff_angstrom(protocol: &SimulationProtocol) -> f64 {
     protocol.cutoff_angstrom.unwrap_or(9.0)
 }
 
+/// GROMACS defaults of `ewald-rtol`, `fourierspacing` and `pme-order`.
+pub const DEFAULT_EWALD_TOLERANCE: f64 = 1e-5;
+pub const DEFAULT_FOURIER_SPACING_ANGSTROM: f64 = 1.2;
+pub const DEFAULT_PME_ORDER: usize = 4;
+
+/// Mesh Ewald settings of a protocol for a prepared system. The grid comes
+/// from the box the system was prepared with, so a run and its restarts use
+/// the same one whatever a barostat has done to the box since.
+pub fn pme_parameters(
+    system: &ParameterizedSystem,
+    protocol: &SimulationProtocol,
+) -> Result<PmeParameters> {
+    let prepared_box = BoxVectors::from_system(system).map_err(Error::Energy)?;
+    PmeParameters::for_box(
+        &prepared_box,
+        cutoff_angstrom(protocol),
+        protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE),
+        protocol
+            .fourier_spacing_angstrom
+            .unwrap_or(DEFAULT_FOURIER_SPACING_ANGSTROM),
+        protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER),
+    )
+    .map_err(Error::Energy)
+}
+
+/// Electrostatics of one run: the reaction-field pair function, or the mesh
+/// Ewald engine with its grids and work buffers.
+enum Electrostatics {
+    ReactionField(ReactionField),
+    Pme(Box<PmeEngine>),
+}
+
+impl Electrostatics {
+    fn new(system: &ParameterizedSystem, protocol: &SimulationProtocol) -> Result<Self> {
+        match protocol.electrostatics {
+            ElectrostaticsModel::ReactionField => Ok(Self::ReactionField(rf_backend(protocol)?)),
+            ElectrostaticsModel::Pme => {
+                if protocol.has_npt() && !protocol.uses_leapfrog() {
+                    return Err(invalid(
+                        "PME at constant pressure needs the Nose-Hoover leap-frog integrator with Parrinello-Rahman; the Monte Carlo barostat evaluates reaction field only",
+                    ));
+                }
+                let engine = PmeEngine::new(system, pme_parameters(system, protocol)?)
+                    .map_err(Error::Energy)?;
+                Ok(Self::Pme(Box::new(engine)))
+            }
+        }
+    }
+
+    /// The reaction-field function, for the Monte Carlo barostat and the
+    /// pressure probe, which are written for it.
+    fn reaction_field(&self) -> Result<ReactionField> {
+        match self {
+            Self::ReactionField(backend) => Ok(*backend),
+            Self::Pme(_) => Err(invalid("this path evaluates reaction field only")),
+        }
+    }
+
+    /// Energy, gradient and virial on the f64 reference path.
+    fn reference(
+        &mut self,
+        field: &PbcForceField,
+        coordinates: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        protocol: &SimulationProtocol,
+        dispersion_coefficient: f64,
+    ) -> Result<glysys_energy::pbc::PbcEnergy> {
+        let cutoff = cutoff_angstrom(protocol);
+        match self {
+            Self::ReactionField(backend) => field
+                .evaluate_with_dispersion_coefficient(
+                    coordinates,
+                    box_vec,
+                    pairs,
+                    backend,
+                    cutoff,
+                    dispersion_coefficient,
+                    protocol.dispersion_correction,
+                )
+                .map_err(Error::Energy),
+            Self::Pme(engine) => {
+                let mut energy = field
+                    .evaluate_pme(engine, coordinates, box_vec, pairs, cutoff)
+                    .map_err(Error::Energy)?;
+                if protocol.dispersion_correction {
+                    energy.components.dispersion_correction =
+                        dispersion_coefficient / box_vec.volume();
+                }
+                Ok(energy)
+            }
+        }
+    }
+}
+
 pub fn rf_backend(protocol: &SimulationProtocol) -> Result<ReactionField> {
     if protocol.electrostatics != ElectrostaticsModel::ReactionField {
         return Err(invalid(
-            "PME was requested, but the CPU reciprocal-space evaluator is not installed yet; use reaction-field until the PME gate passes",
+            "this path evaluates reaction-field electrostatics only",
         ));
     }
     ReactionField::new(
@@ -90,8 +186,9 @@ fn electrostatics_kind(protocol: &SimulationProtocol) -> NonbondedElectrostatics
             solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
         },
         ElectrostaticsModel::Pme => NonbondedElectrostatics::Pme {
-            // This value is used only to keep fingerprints descriptive while
-            // rf_backend emits the capability error above.
+            // Fingerprint label only: the settings that fix alpha and the
+            // grid (cutoff, tolerance, spacing, order, prepared box) are
+            // hashed with the protocol and the system.
             alpha_per_angstrom: 0.35,
             grid: [0, 0, 0],
             interpolation_order: 4,
@@ -670,7 +767,7 @@ pub struct ExplicitSimulation<'a> {
     settle: Option<SettleWaters>,
     waters: Vec<[usize; 3]>,
     molecules: Vec<Vec<usize>>,
-    backend: ReactionField,
+    electrostatics: Electrostatics,
     pairs: PbcNeighborList,
     /// Single-precision cluster-pair engine for the dynamics force loop.
     /// `None` keeps the f64 reference pair list for every evaluation.
@@ -703,7 +800,7 @@ impl<'a> ExplicitSimulation<'a> {
             settle: self.settle,
             waters: self.waters,
             molecules: self.molecules,
-            backend: self.backend,
+            electrostatics: self.electrostatics,
             pairs: self.pairs,
             cluster: self.cluster,
             force_only: self.force_only,
@@ -797,7 +894,7 @@ impl<'a> ExplicitSimulation<'a> {
         } else {
             0.0
         };
-        let backend = rf_backend(&protocol)?;
+        let mut electrostatics = Electrostatics::new(system, &protocol)?;
         let waters = classify_waters(system);
         if waters.is_empty() {
             return Err(invalid(
@@ -829,7 +926,7 @@ impl<'a> ExplicitSimulation<'a> {
             coordinates = minimize(
                 &field,
                 &box_vec,
-                &backend,
+                &mut electrostatics,
                 coordinates,
                 &protocol,
                 dispersion_coefficient,
@@ -861,17 +958,14 @@ impl<'a> ExplicitSimulation<'a> {
         let wrapped: Vec<Vec3> = coordinates.iter().map(|p| box_vec.wrap(*p)).collect();
         let pairs = PbcNeighborList::build(&wrapped, &box_vec, cutoff, SKIN_ANGSTROM)
             .map_err(Error::Energy)?;
-        let energy = field
-            .evaluate_with_dispersion_coefficient(
-                &coordinates,
-                &box_vec,
-                &pairs.pairs,
-                &backend,
-                cutoff_angstrom(&protocol),
-                dispersion_coefficient,
-                protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = electrostatics.reference(
+            &field,
+            &coordinates,
+            &box_vec,
+            &pairs.pairs,
+            &protocol,
+            dispersion_coefficient,
+        )?;
         let mut rng = protocol.seed;
         let mut velocities = masses
             .iter()
@@ -904,7 +998,7 @@ impl<'a> ExplicitSimulation<'a> {
             settle,
             waters,
             molecules,
-            backend,
+            electrostatics,
             pairs,
             cluster,
             force_only: false,
@@ -1003,7 +1097,7 @@ impl<'a> ExplicitSimulation<'a> {
         } else {
             0.0
         };
-        let backend = rf_backend(&state.protocol)?;
+        let mut electrostatics = Electrostatics::new(system, &state.protocol)?;
         let waters = classify_waters(system);
         let masses: Vec<_> = system.atoms().iter().map(|a| a.mass()).collect();
         let h_bonds = solute_h_bonds(system, &waters);
@@ -1044,17 +1138,14 @@ impl<'a> ExplicitSimulation<'a> {
             SKIN_ANGSTROM,
         )
         .map_err(Error::Energy)?;
-        let reference = field
-            .evaluate_with_dispersion_coefficient(
-                &state.coordinates,
-                &box_vec,
-                &pairs.pairs,
-                &backend,
-                cutoff_angstrom(&state.protocol),
-                dispersion_coefficient,
-                state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let reference = electrostatics.reference(
+            &field,
+            &state.coordinates,
+            &box_vec,
+            &pairs.pairs,
+            &state.protocol,
+            dispersion_coefficient,
+        )?;
         if (reference.components.total() - state.potential_energy).abs()
             > 1e-3 + 1e-4 * reference.components.total().abs()
         {
@@ -1076,7 +1167,7 @@ impl<'a> ExplicitSimulation<'a> {
             settle,
             waters,
             molecules,
-            backend,
+            electrostatics,
             pairs,
             cluster,
             force_only: false,
@@ -1200,16 +1291,18 @@ impl<'a> ExplicitSimulation<'a> {
                     .barostat_step_counter
                     .is_multiple_of(self.state.protocol.barostat_interval))
         {
-            match molecular_pressure_bar(
-                &self.field,
-                &self.backend,
-                &self.state.protocol,
-                &box_vec,
-                &self.state.coordinates,
-                &self.state.velocities,
-                &self.masses,
-                &self.molecules,
-            ) {
+            match self.electrostatics.reaction_field().and_then(|backend| {
+                molecular_pressure_bar(
+                    &self.field,
+                    &backend,
+                    &self.state.protocol,
+                    &box_vec,
+                    &self.state.coordinates,
+                    &self.state.velocities,
+                    &self.masses,
+                    &self.molecules,
+                )
+            }) {
                 Ok(value) => (value, "molecular-finite-difference"),
                 Err(_) => (
                     pressure_bar(
@@ -1788,18 +1881,14 @@ impl<'a> ExplicitSimulation<'a> {
             SKIN_ANGSTROM,
         )
         .map_err(Error::Energy)?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &proposed_coords,
-                &proposed_box,
-                &pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            &proposed_coords,
+            &proposed_box,
+            &pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
         let delta_g = barostat_work(
             self.state.potential_energy,
             energy.components.total(),
@@ -1877,18 +1966,16 @@ impl<'a> ExplicitSimulation<'a> {
             return Ok(energy);
         }
         self.refresh_pairs_in(coords, box_vec)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            coords,
+            box_vec,
+            &self.pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
         self.virial_current = true;
-        self.field
-            .evaluate_with_dispersion_coefficient(
-                coords,
-                box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)
+        Ok(energy)
     }
 
     fn refresh_pairs_in(&mut self, coords: &[Vec3], box_vec: &BoxVectors) -> Result<()> {
@@ -2003,18 +2090,14 @@ impl<'a> ExplicitSimulation<'a> {
         self.validate_external_state(&coordinates, &velocities, step)?;
         let box_vec = self.box_vectors()?;
         self.refresh_pairs_in(&coordinates, &box_vec)?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &coordinates,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            &coordinates,
+            &box_vec,
+            &self.pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
         self.state.coordinates = coordinates;
         self.state.velocities = velocities;
         self.state.step = step;
@@ -2166,7 +2249,7 @@ pub fn next_barostat_uniform(state: &mut u64) -> f64 {
 fn minimize<F>(
     field: &PbcForceField,
     box_vec: &BoxVectors,
-    backend: &ReactionField,
+    electrostatics: &mut Electrostatics,
     initial: Vec<Vec3>,
     protocol: &SimulationProtocol,
     dispersion_coefficient: f64,
@@ -2206,17 +2289,14 @@ where
             pairs = PbcNeighborList::build(&wrapped, box_vec, cutoff, min_skin)
                 .map_err(Error::Energy)?;
         }
-        let energy = field
-            .evaluate_with_dispersion_coefficient(
-                &coords,
-                box_vec,
-                &pairs.pairs,
-                backend,
-                cutoff,
-                dispersion_coefficient,
-                protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = electrostatics.reference(
+            field,
+            &coords,
+            box_vec,
+            &pairs.pairs,
+            protocol,
+            dispersion_coefficient,
+        )?;
         let submitted = optimizer.submit(
             energy.components.total(),
             energy
@@ -2770,7 +2850,13 @@ mod tests {
             let wrapped: Vec<Vec3> = coordinates.iter().map(|p| scaled_box.wrap(*p)).collect();
             let pairs = PbcNeighborList::build(&wrapped, &scaled_box, 4.0, SKIN_ANGSTROM).unwrap();
             sim.field
-                .evaluate(&coordinates, &scaled_box, &pairs.pairs, &sim.backend, 4.0)
+                .evaluate(
+                    &coordinates,
+                    &scaled_box,
+                    &pairs.pairs,
+                    &sim.electrostatics.reaction_field().unwrap(),
+                    4.0,
+                )
                 .unwrap()
                 .components
                 .total()
@@ -2815,5 +2901,58 @@ mod tests {
         );
         assert!((a.box_velocity[0] - b.box_velocity[0]).abs() < 1e-6);
         assert!((a.pressure_bar - b.pressure_bar).abs() < 1.0);
+    }
+
+    #[test]
+    fn pme_leapfrog_conserves_its_extended_energy_and_restarts() {
+        let system = solvated_dipeptide_padded(9.0);
+        let mut protocol = leapfrog_protocol(120);
+        protocol.cutoff_angstrom = Some(9.0);
+        protocol.electrostatics = ElectrostaticsModel::Pme;
+        protocol.temperature_coupling_interval = Some(1);
+        protocol.com_mode = Some("none".into());
+        protocol.com_groups.clear();
+        let parameters = pme_parameters(&system, &protocol).unwrap();
+        // GROMACS defaults: erfc(alpha rc) = 1e-5 and a grid no coarser than 1.2 A
+        assert!((parameters.alpha_per_angstrom - 0.3468).abs() < 2e-3);
+        assert_eq!(parameters.interpolation_order, 4);
+        for (points, length) in parameters.grid.iter().zip(system.box_angstrom()) {
+            assert!(length / *points as f64 <= 1.2 + 1e-9);
+        }
+        let mut sim = ExplicitSimulation::new(&system, protocol).unwrap();
+        let plan = sim.coupling_plan.clone().unwrap();
+        let mut previous = kinetic_energy(&sim.masses, &sim.state.velocities);
+        let mut series = Vec::new();
+        for step in 0..120 {
+            if step == 60 {
+                let json = serde_json::to_string(&sim.state).unwrap();
+                let restored: SimulationState = serde_json::from_str(&json).unwrap();
+                let again = ExplicitSimulation::restore(&system, restored).unwrap();
+                assert!((again.state.potential_energy - sim.state.potential_energy).abs() < 1e-6);
+            }
+            let potential = sim.state.potential_energy;
+            let thermostat = plan.thermostat_energy(sim.state.coupling.as_ref().unwrap());
+            sim.step().unwrap();
+            let next = kinetic_energy(&sim.masses, &sim.state.velocities);
+            series.push(potential + 0.5 * (previous + next) + thermostat);
+            previous = next;
+        }
+        let head = series[..20].iter().sum::<f64>() / 20.;
+        let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
+        let drift = ((tail - head) / sim.masses.len() as f64).abs();
+        assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+    }
+
+    #[test]
+    fn pme_with_the_monte_carlo_barostat_is_refused() {
+        let system = solvated_dipeptide();
+        let mut protocol = nve_protocol();
+        protocol.equilibration_ensemble = Ensemble::Npt;
+        protocol.production_ensemble = Ensemble::Npt;
+        protocol.timestep_fs = 2.0;
+        protocol.constraints = ConstraintModel::Settle;
+        protocol.friction_per_ps = 1.0;
+        protocol.electrostatics = ElectrostaticsModel::Pme;
+        assert!(ExplicitSimulation::new(&system, protocol).is_err());
     }
 }
