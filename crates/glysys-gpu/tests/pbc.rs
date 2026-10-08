@@ -19,7 +19,7 @@ use glysys_energy::pbc::{
     BoxVectors, NonbondedElectrostatics, PbcForceField, PbcNeighborList, ReactionField,
     classify_waters, water_equilibrium,
 };
-use glysys_gpu::pbc::{EnergyResult, PbcPacking, ResidentPbc};
+use glysys_gpu::pbc::{EnergyResult, PbcKernel, PbcPacking, ResidentPbc};
 use glysys_gpu::{GpuContext, GpuContextOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -1383,6 +1383,97 @@ fn fresh_lf_middle_initialization_uses_checkpoint_rng_words() {
         }
         let state = gpu.read_dynamics_checkpoint(box_xyz).await.unwrap();
         assert_eq!(state.rng_words, rng.words);
+    });
+}
+
+/// Crambin has three disulfide bonds, so its bonded exclusions reach across
+/// the atom list: the pairs the tile kernels clear in `far_exclusions`. The
+/// compact fixtures have none. The three nonbonded kernels must agree on the
+/// energy, the pair count and every force; a far exclusion left in place puts
+/// two sulfurs 2 A apart with a Lennard-Jones force of about 4,000 kcal/mol/A.
+///
+/// (This cannot catch a data race in a kernel on a device where the race
+/// happens not to lose: see `tests/shader_rules.rs` for that.)
+#[test]
+fn nonbonded_kernels_agree_on_a_protein_with_disulfide_bonds() {
+    pollster::block_on(async {
+        let _guard = gpu_test_guard();
+        let system = SystemBuilder::new(BuildOptions {
+            add_water: true,
+            add_ions: false,
+            padding_angstrom: 6.,
+            ..Default::default()
+        })
+        .unwrap()
+        .prepare_pdb_str(include_str!("../../../tests/fixtures/crambin.pdb"))
+        .unwrap();
+        let sulfur_bonds = system
+            .bonds()
+            .iter()
+            .filter(|bond| {
+                let [a, b] = bond.atoms();
+                system.atoms()[a].element() == 16 && system.atoms()[b].element() == 16
+            })
+            .map(|bond| bond.atoms())
+            .collect::<Vec<_>>();
+        assert_eq!(sulfur_bonds.len(), 3, "crambin has three disulfide bonds");
+        assert!(
+            sulfur_bonds.iter().all(|[a, b]| a.abs_diff(*b) > 32),
+            "the bonded sulfurs are far apart in the atom list: {sulfur_bonds:?}"
+        );
+
+        let cutoff = 9.0;
+        let skin = 1.5;
+        let coordinates = minimized_coords(&system);
+        let packing = PbcPacking::new(&system, cutoff, skin).unwrap();
+        let backend = NonbondedElectrostatics::ReactionField {
+            cutoff_angstrom: cutoff,
+            solvent_dielectric: 78.5,
+        };
+        let max_pairs = (system.atom_count() as u32 * 256).max(4096);
+        let box_vec = BoxVectors::from_system(&system).unwrap().as_array();
+        let cell = [box_vec[0] as f32, box_vec[1] as f32, box_vec[2] as f32];
+        let context = GpuContext::new(GpuContextOptions::default()).await.unwrap();
+        let mut results = Vec::new();
+        for kernel in [PbcKernel::Tiles, PbcKernel::Csr, PbcKernel::FixedRows] {
+            let gpu =
+                ResidentPbc::with_context_kernel(&context, &packing, &backend, max_pairs, kernel)
+                    .await
+                    .unwrap();
+            gpu.set_coordinates(&coordinates, cell, true);
+            let result = gpu.energy_and_forces(true).await.unwrap();
+            assert!(!result.neighbor_overflow, "{kernel:?}");
+            results.push((kernel, result));
+        }
+        let (_, tiles) = &results[0];
+        let tile_forces = tiles.gradients.as_ref().unwrap();
+        for (kernel, other) in &results[1..] {
+            assert!(
+                (tiles.lj - other.lj).abs() < 0.05,
+                "Lennard-Jones energy: tiles {} against {kernel:?} {}",
+                tiles.lj,
+                other.lj
+            );
+            assert!((tiles.rf - other.rf).abs() < 0.05, "{kernel:?}");
+            assert_eq!(tiles.evaluated_pairs, other.evaluated_pairs, "{kernel:?}");
+            let worst = tile_forces
+                .iter()
+                .zip(other.gradients.as_ref().unwrap())
+                .flat_map(|(a, b)| (0..3).map(move |k| (a[k] - b[k]).abs()))
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 0.05,
+                "largest force difference against {kernel:?}: {worst}"
+            );
+        }
+        // and the sulfurs feel no Lennard-Jones wall
+        for [a, b] in &sulfur_bonds {
+            for &atom in [a, b] {
+                let g = tile_forces[atom];
+                let size = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+                assert!(size < 100., "force on bonded sulfur {atom}: {size}");
+            }
+        }
     });
 }
 

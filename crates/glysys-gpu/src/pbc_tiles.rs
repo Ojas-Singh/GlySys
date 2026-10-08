@@ -539,7 +539,7 @@ impl TileEngine {
         sizing.work_bytes()
             + 32 * u64::from(sizing.blocks)
             + 512 * u64::from(sizing.blocks)
-            + 16 * u64::from(sizing.n.div_ceil(4))
+            + 16 * u64::from(sizing.n)
             + 4 * sizing.accumulator_words()
             + 16 * u64::from(sizing.n)
             + 16 * packing.atoms.len() as u64
@@ -578,7 +578,9 @@ impl TileEngine {
             label: Some("pbc tiles blocks"),
             size: 32 * u64::from(sizing.blocks)
                 + 16 * 32 * u64::from(sizing.blocks)
-                + 4 * u64::from(sizing.n.div_ceil(4)) * 4,
+                // the sorted slot of every atom: one element each, so that
+                // every invocation writes an element it alone owns
+                + 16 * u64::from(sizing.n),
             usage: storage | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
