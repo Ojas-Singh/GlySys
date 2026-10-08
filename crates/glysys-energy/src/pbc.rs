@@ -837,6 +837,68 @@ impl<'a> PbcForceField<'a> {
         })
     }
 
+    /// PME counterpart of [`Self::evaluate_with_cluster`] for dynamics: the
+    /// cluster engine in PME mode supplies Lennard-Jones, the `erfc`
+    /// direct-space sum and the 1-4 exceptions in single precision, `pme`
+    /// the long-range part in f64. Both must have been built for this
+    /// system with the same Ewald coefficient. The long-range energy is
+    /// added to `components.electrostatics` and its virial to the pair
+    /// entries; without `observables` only the gradients are exact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_cluster_pme(
+        &self,
+        engine: &mut crate::pbc_cluster::ClusterPairEngine,
+        pme: &mut crate::pme::PmeEngine,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        dispersion_coefficient: f64,
+        include_dispersion: bool,
+        observables: bool,
+    ) -> Result<PbcEnergy> {
+        if engine.ewald_alpha() != Some(pme.parameters().alpha_per_angstrom) {
+            return Err(EnergyError::InvalidConfiguration(
+                "cluster engine and PME engine need the same Ewald coefficient".into(),
+            ));
+        }
+        // The two parts only share the coordinates, so they run side by
+        // side: the long-range part is a handful of short parallel loops
+        // that would otherwise leave most workers idle. Each part reduces in
+        // its own fixed order and the sum below is ordered too.
+        let mut long_range_gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            unwrapped.len()
+        ];
+        let (short_range, long_range) = rayon::join(
+            || {
+                self.evaluate_with_cluster(
+                    engine,
+                    unwrapped,
+                    box_vec,
+                    dispersion_coefficient,
+                    include_dispersion,
+                    observables,
+                )
+            },
+            || pme.evaluate_into(unwrapped, box_vec, &mut long_range_gradients, observables),
+        );
+        let mut result = short_range?;
+        let long_range = long_range?;
+        for (total, extra) in result.gradients.iter_mut().zip(&long_range_gradients) {
+            total.x += extra.x;
+            total.y += extra.y;
+            total.z += extra.z;
+        }
+        result.components.electrostatics += long_range.energy;
+        result.virial_terms[3] += long_range.virial;
+        result.virial_pair_split[1] += long_range.virial;
+        result.virial = result.virial_terms.iter().sum();
+        Ok(result)
+    }
+
     /// The complete PME Hamiltonian on the f64 reference path: bonded terms,
     /// Lennard-Jones and the `erfc` direct-space sum inside `cutoff` from
     /// [`Self::evaluate`], plus the long-range part from `pme`, which must
