@@ -6,7 +6,7 @@
 //! catches atom-order, box, constraint, exception, and interaction-function
 //! changes before a native run is launched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -61,9 +61,10 @@ struct ParsedTop {
     bonds: BTreeSet<(usize, usize)>,
     angles: BTreeSet<(usize, usize, usize)>,
     dihedrals: Vec<([usize; 4], i32)>,
-    pairs: BTreeSet<(usize, usize)>,
+    /// 1-4 pairs with their charge scale and Lennard-Jones well (kJ/mol).
+    pairs: BTreeMap<(usize, usize), (f64, f64)>,
     settles: BTreeSet<usize>,
-    exclusions: BTreeSet<usize>,
+    exclusions: BTreeSet<(usize, usize)>,
 }
 
 fn field<'a>(line: &'a str, start: usize, end: usize, what: &str) -> Result<&'a str> {
@@ -326,14 +327,20 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
                 ));
             }
             "pairs" => {
-                if fields.len() < 3 || fields[2] != "1" {
+                // function 2: the charge scale and Lennard-Jones well of
+                // each pair are written out (see the topology writer)
+                if fields.len() != 8 || fields[2] != "2" {
                     bail!("unsupported GROMACS 1-4 pair function at line {line_number}");
                 }
                 let pair = canonical_pair(
                     parse_usize(fields[0], "pair atom")?,
                     parse_usize(fields[1], "pair atom")?,
                 );
-                if !parsed.pairs.insert(pair) {
+                let scales = (
+                    parse_f64(fields[3], "pair charge scale")?,
+                    parse_f64(fields[7], "pair epsilon")?,
+                );
+                if parsed.pairs.insert(pair, scales).is_some() {
                     bail!("duplicate GROMACS 1-4 pair at line {line_number}");
                 }
             }
@@ -352,20 +359,22 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
                 }
             }
             "exclusions" => {
-                if fields.len() != 3 {
-                    bail!("GlySys water exclusions must contain exactly three atoms");
+                // a row excludes its first atom from each of the others
+                if fields.len() < 2 {
+                    bail!("malformed GROMACS exclusion row at line {line_number}");
                 }
                 let atoms: Vec<usize> = fields
                     .iter()
                     .map(|value| parse_usize(value, "exclusion atom"))
                     .collect::<Result<_>>()?;
-                let oxygen = *atoms.iter().min().unwrap_or(&0);
-                if atoms.iter().collect::<BTreeSet<_>>().len() != 3
-                    || !parsed.exclusions.insert(oxygen)
-                {
-                    bail!(
-                        "duplicate or malformed GROMACS water exclusion row at line {line_number}"
-                    );
+                for &other in &atoms[1..] {
+                    if other == atoms[0]
+                        || !parsed.exclusions.insert(canonical_pair(atoms[0], other))
+                    {
+                        bail!(
+                            "duplicate or malformed GROMACS water exclusion row at line {line_number}"
+                        );
+                    }
                 }
             }
             "system" => {
@@ -391,12 +400,36 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
     Ok(parsed)
 }
 
-fn expected_pair_set(system: &ParameterizedSystem) -> BTreeSet<(usize, usize)> {
+/// 1-4 pairs of the snapshot with the charge scale `1/scee` and the scaled
+/// Lennard-Jones well in kJ/mol, as the topology states them.
+fn expected_pairs(system: &ParameterizedSystem) -> BTreeMap<(usize, usize), (f64, f64)> {
+    let atoms = system.atoms();
     system
         .one_four_pairs()
         .into_iter()
-        .map(|(pair, _, _)| canonical_pair(pair[0] + 1, pair[1] + 1))
+        .map(|(pair, scee, scnb)| {
+            let well = (atoms[pair[0]].lennard_jones_epsilon()
+                * atoms[pair[1]].lennard_jones_epsilon())
+            .sqrt()
+                * 4.184
+                / scnb;
+            (
+                canonical_pair(pair[0] + 1, pair[1] + 1),
+                (1.0 / scee, well),
+            )
+        })
         .collect()
+}
+
+fn same_pairs(
+    found: &BTreeMap<(usize, usize), (f64, f64)>,
+    expected: &BTreeMap<(usize, usize), (f64, f64)>,
+) -> bool {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1e-6);
+    found.len() == expected.len()
+        && found.iter().zip(expected).all(|((pair, scales), (other, wanted))| {
+            pair == other && close(scales.0, wanted.0) && close(scales.1, wanted.1)
+        })
 }
 
 fn is_water_atom(system: &ParameterizedSystem, atom: usize) -> bool {
@@ -499,7 +532,7 @@ pub fn verify_bundle(
     }
     let expected_bonds = expected_bond_set(system);
     let expected_angles = expected_angle_set(system);
-    let expected_pairs = expected_pair_set(system);
+    let expected_pairs = expected_pairs(system);
     if top.bonds != expected_bonds {
         bail!("GROMACS bond set differs from the snapshot");
     }
@@ -517,8 +550,8 @@ pub fn verify_bundle(
             )
         })
         .collect();
-    if top.dihedrals != expected_dihedrals || top.pairs != expected_pairs {
-        bail!("GROMACS dihedral or 1-4 pair set differs from the snapshot");
+    if top.dihedrals != expected_dihedrals || !same_pairs(&top.pairs, &expected_pairs) {
+        bail!("GROMACS dihedrals, 1-4 pairs or their scale factors differ from the snapshot");
     }
     let expected_water_oxygens: BTreeSet<usize> = system
         .residues()
@@ -526,7 +559,11 @@ pub fn verify_bundle(
         .filter(|residue| residue.name() == "WAT" && residue.atom_range().len() == 3)
         .map(|residue| residue.atom_range().start + 1)
         .collect();
-    if top.settles != expected_water_oxygens || top.exclusions != expected_water_oxygens {
+    let expected_exclusions: BTreeSet<(usize, usize)> = expected_water_oxygens
+        .iter()
+        .flat_map(|&oxygen| [(oxygen, oxygen + 1), (oxygen, oxygen + 2), (oxygen + 1, oxygen + 2)])
+        .collect();
+    if top.settles != expected_water_oxygens || top.exclusions != expected_exclusions {
         bail!("GROMACS SETTLE/exclusion declarations differ from the snapshot");
     }
     Ok(VerificationReport {
