@@ -1506,11 +1506,14 @@ mod tests {
     #[test]
     fn gradients_match_finite_differences_of_the_energy() {
         let box_vec = BoxVectors::new(BOX[0], BOX[1], BOX[2]).unwrap();
-        let (charges, mut coords) = random_system(0x1234_5678_9abc_def1, 12, 0.4);
+        let (mut charges, mut coords) = random_system(0x1234_5678_9abc_def1, 12, 0.4);
         // One excluded pair almost on top of each other: the r -> 0 series.
         coords[6] = v(coords[5].x + 2e-3, coords[5].y - 1e-3, coords[5].z + 1e-3);
         let mut excluded = BONDED.to_vec();
         excluded.push((5, 6));
+        // An uncharged atom is skipped on the mesh and feels nothing.
+        charges[9] = 0.;
+        excluded.push((8, 9));
         for order in MIN_ORDER..=MAX_ORDER {
             let parameters = PmeParameters::new(0.45, [16, 18, 15], order).unwrap();
             let mut engine = PmeEngine::from_charges(&charges, &excluded, parameters).unwrap();
@@ -1518,6 +1521,7 @@ mod tests {
             engine
                 .evaluate_into(&coords, &box_vec, &mut gradients, true)
                 .unwrap();
+            assert_eq!(gradients[9], v(0., 0., 0.));
             let mut energy = |coords: &[Vec3]| {
                 let mut scratch = zeros(coords.len());
                 engine
