@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Explicit-solvent dynamics on the CPU gains what the GOTW (GROMACS) recipe
+  uses: smooth particle-mesh Ewald electrostatics (`glysys_energy::pme`, a PME
+  mode of the cluster-pair kernel), Nose–Hoover temperature coupling per group
+  and isotropic Parrinello–Rahman pressure coupling in a leap-frog integrator
+  that follows GROMACS' `md`, with center-of-mass motion removed per group.
+  Checked against OpenMM (PME energies and forces) and GROMACS (thermostat
+  response, density).
+- `glysys-md --gromacs-mdp` can be given once per file: a minimisation and one
+  stage per dynamics file. `--trajectory dcd`, `--trajectory-atoms solute` and
+  `--checkpoint-ps` write compact output for long runs.
+- GROMACS topology: 1-4 pairs carry their own scale factors (function 2).
+  They were written with function 1, so GROMACS applied the ff14SB factors
+  (Lennard-Jones 0.5, electrostatics 1/1.2) to GLYCAM06 pairs, which are not
+  scaled. The Amber files and the native engines were not affected. The
+  hydrogens of a water are now excluded from each other as well.
+- Faster explicit CPU steps: force buffers combined over the slots a chunk
+  writes, pair lists kept across small box changes and rebuilt faster, SETTLE
+  solved in place, step buffers reused.
+- A barostat pressure computed from forces takes the virial of the truncated
+  Lennard-Jones tail (`PbcForceField::dispersion_pressure_coefficient`).
+
 - Add `glysysbuilder fix` / `StructureFixer`, a PDBFixer-equivalent structure
   repair: alternate-location and microheterogeneity resolution, modified-residue
   replacement (MODRES, PDBFixer table, CCD parents), missing-residue modelling

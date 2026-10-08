@@ -56,13 +56,40 @@ cap, while `--gpu-memory-mib N` sets an explicit aggregate budget. `devices`
 prints adapter type, features, and limits so a Vulkan device can be audited
 before a benchmark.
 
-The current validated explicit periodic model is reaction-field with the
-existing constrained Langevin/v-rescale and Monte Carlo paths. The protocol
-and GROMACS resolver preserve PME, Nose–Hoover, and Parrinello–Rahman as
-explicit choices, but those choices stop with a capability error until the
-independent PME/coupling parity gates pass. GlySys therefore cannot yet claim
-to replace the GOTW GROMACS production recipe; use the opt-in native Slurm
-adapter in `GlycoShape-Cookbook/API/GOTW_Scripts` for qualification runs.
+Explicit periodic dynamics runs with reaction-field or smooth particle-mesh
+Ewald (PME) electrostatics on the CPU. Three integrators are available:
+velocity Verlet / BAOAB Langevin with the Monte Carlo barostat, OpenMM's
+LF-middle Langevin scheme (constant volume), and the leap-frog integrator of
+GROMACS' `md` with Nose–Hoover temperature coupling per group and isotropic
+Parrinello–Rahman pressure coupling. The last one runs the GOTW recipe as its
+GROMACS parameter files state it:
+
+```console
+glysys-md run --input prepared --output replica-01 --backend cpu --threads 8 \
+  --gromacs-mdp minimisation.mdp --gromacs-mdp equilibration_nvt.mdp \
+  --gromacs-mdp equilibration_npt.mdp --gromacs-mdp production.mdp \
+  --trajectory dcd --trajectory-atoms solute
+```
+
+Each dynamics file becomes one stage of the protocol (`pcoupl = no` is a
+constant-volume stage); a minimisation file sets the minimisation budget.
+`--trajectory dcd` writes `trajectory.dcd`, `trajectory.pdb` and `frames.jsonl`
+(energies, temperature, pressure, density and box per frame) instead of JSON
+text frames, and `--trajectory-atoms solute` keeps the solute only and writes
+its dry Amber and GROMACS files to `solute/`.
+
+PME matches OpenMM's Reference platform on a 7,714-atom glycan box (Ewald
+energy to 4e-8 kcal/mol, forces to 1e-11 of their RMS;
+[`benchmarks/results/pme-20261008.json`](benchmarks/results/pme-20261008.json)).
+Started from GROMACS' own minimised coordinates, the temperature under
+Nose–Hoover coupling follows GROMACS' within the spread of random velocities,
+and the density under Parrinello–Rahman coupling agrees to 0.05%.
+The GPU engines evaluate reaction field with Langevin dynamics only; PME,
+Nose–Hoover and Parrinello–Rahman run on the CPU. On one 192-core node an
+8,900-atom box reaches about 60 ns/day per 8-thread process (24 processes per
+node); GROMACS runs the same recipe at 900 to 1,100 ns/day on 48 cores, so
+GlySys is not yet a replacement for it on CPU clusters. The Slurm adapter is in
+`GlycoShape-Cookbook/API/GOTW_Scripts`.
 
 The output bundle contains:
 
@@ -72,9 +99,9 @@ The output bundle contains:
 - `manifest.json` with options, provenance, detected glycans, system counts,
   charge, box dimensions, and warnings
 
-`resolve-mdp` records the supported GOTW settings without changing units or
-silently mapping PME/Nose–Hoover/Parrinello–Rahman to reaction field. Those
-models remain capability-gated until their independent parity tests pass.
+`resolve-mdp` records the supported GOTW settings of one parameter file
+without changing units; settings that would change the model (a force switch,
+another thermostat) are refused rather than mapped.
 `verify-gromacs` is a strict, read-only cross-check: it compares the emitted
 `.gro` coordinates/box and `.top` atom order, interactions, exclusions,
 1–4 pairs, and SETTLE declarations with the lossless snapshot before a native
