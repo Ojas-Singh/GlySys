@@ -38,7 +38,7 @@ const PER_ATOM_TASK: usize = 512;
 /// waking the pool for one of them takes longer than the loop itself.
 const PARALLEL_ATOMS: usize = 32_768;
 /// The same for combining the force buffers, counted in buffer entries.
-const PARALLEL_SUMS: usize = 400_000;
+const PARALLEL_SUMS: usize = 100_000;
 const SORT_CELL_ANGSTROM: f64 = 3.0;
 const MAX_SORT_BITS: u32 = 7;
 /// Polynomial terms of the Ewald direct-space corrections.
