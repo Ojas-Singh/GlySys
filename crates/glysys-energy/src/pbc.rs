@@ -8,9 +8,9 @@
 //! pressure exact across box crossings and feeds reporting and the Monte
 //! Carlo barostat directly.
 //!
-//! Reaction field is the first electrostatics backend. PME arrives later
-//! behind the same [`ElectrostaticsBackend`] trait, reusing these pair lists,
-//! exclusions, and 1-4 scales without touching integration or analysis.
+//! Reaction field and particle-mesh Ewald share the [`ElectrostaticsBackend`]
+//! trait for the pair part, with the same pair lists, exclusions, and 1-4
+//! scales; the PME long-range part lives in [`crate::pme`].
 use crate::{EnergyComponents, EnergyError, HarmonicRestraint, Result};
 use glysys::{ParameterizedSystem, Vec3};
 use serde::{Deserialize, Serialize};
@@ -153,9 +153,12 @@ impl ElectrostaticsBackend for ReactionField {
     }
 }
 
-/// Reserved PME insertion point. Constructing an evaluation with this backend
-/// fails with a clear error until the mesh implementation lands; pair lists,
-/// exclusions, 1-4 scales, and virial plumbing are shared with reaction field.
+/// Direct-space part of particle-mesh Ewald: `E = qq erfc(alpha r)/r` inside
+/// the cutoff. Pair lists, exclusions, 1-4 scales, and virial plumbing are
+/// shared with reaction field; the long-range remainder (reciprocal sum, self
+/// energy, excluded-pair correction) comes from [`crate::pme::PmeEngine`]
+/// with the same `alpha`, and [`PbcForceField::evaluate_pme`] adds the two.
+/// The grid and interpolation order only matter to the mesh part.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PmeBackend {
     pub alpha_per_angstrom: f64,
@@ -168,8 +171,14 @@ impl ElectrostaticsBackend for PmeBackend {
         "pme"
     }
 
-    fn pair(&self, _r: f64, _qq: f64) -> (f64, f64) {
-        unimplemented!("PME direct/reciprocal kernels are a later milestone")
+    fn pair(&self, r: f64, qq: f64) -> (f64, f64) {
+        let alpha = self.alpha_per_angstrom;
+        let screened = crate::pme::erfc(alpha * r);
+        // d/dr erfc(alpha r) = -(2 alpha/sqrt(pi)) exp(-alpha^2 r^2).
+        let gauss = 2. * alpha / std::f64::consts::PI.sqrt() * (-(alpha * r).powi(2)).exp();
+        let energy = qq * screened / r;
+        let derivative = -qq * (screened / (r * r) + gauss / r);
+        (energy, derivative)
     }
 }
 
@@ -826,6 +835,29 @@ impl<'a> PbcForceField<'a> {
             virial_terms,
             virial_pair_split: pairs.virial_pair_split,
         })
+    }
+
+    /// The complete PME Hamiltonian on the f64 reference path: bonded terms,
+    /// Lennard-Jones and the `erfc` direct-space sum inside `cutoff` from
+    /// [`Self::evaluate`], plus the long-range part from `pme`, which must
+    /// have been built for this system. The long-range energy is added to
+    /// `components.electrostatics` and its virial to the pair entries.
+    pub fn evaluate_pme(
+        &self,
+        pme: &mut crate::pme::PmeEngine,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        cutoff: f64,
+    ) -> Result<PbcEnergy> {
+        let backend = pme.parameters().backend();
+        let mut result = self.evaluate(unwrapped, box_vec, pairs, &backend, cutoff)?;
+        let long_range = pme.evaluate_into(unwrapped, box_vec, &mut result.gradients, true)?;
+        result.components.electrostatics += long_range.energy;
+        result.virial_terms[3] += long_range.virial;
+        result.virial_pair_split[1] += long_range.virial;
+        result.virial = result.virial_terms.iter().sum();
+        Ok(result)
     }
 
     pub fn evaluate(

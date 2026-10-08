@@ -6,6 +6,7 @@ pub mod implicit_cluster;
 mod obc2;
 pub mod pbc;
 pub mod pbc_cluster;
+pub mod pme;
 pub mod prior;
 pub mod scoring;
 
