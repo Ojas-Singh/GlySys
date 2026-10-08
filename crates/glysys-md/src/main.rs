@@ -234,6 +234,10 @@ struct TrajectoryArgs {
     /// `solute/`.
     #[arg(long = "trajectory-atoms", value_enum, default_value_t = TrajectoryAtoms::All)]
     atoms: TrajectoryAtoms,
+    /// Simulated time between restart checkpoints, in ps. A checkpoint is a
+    /// few megabytes; long production runs can space them further apart.
+    #[arg(long, default_value_t = 5.0)]
+    checkpoint_ps: f64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -730,6 +734,7 @@ fn run_loop(
             .write_bundle(output.join("solute"))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
+    let checkpoint_ps = trajectory.checkpoint_ps;
     let mut trajectory = TrajectoryWriter::open(
         output,
         system,
@@ -771,10 +776,15 @@ fn run_loop(
     let initial_file_output_seconds = initial_file_output.elapsed().as_secs_f64();
     file_output_seconds += initial_file_output_seconds;
     // Keep restart I/O off the per-100-step submission cadence. Five
-    // simulated picoseconds bounds recovery loss while avoiding thousands of
-    // multi-megabyte checkpoint rewrites in a nanosecond qualification run.
-    let checkpoint_interval =
-        ((5.0 / (session.state().protocol.timestep_fs * 0.001)).round() as usize).max(1);
+    // simulated picoseconds (the default) bounds recovery loss while avoiding
+    // thousands of multi-megabyte checkpoint rewrites in a nanosecond
+    // qualification run.
+    if !(checkpoint_ps.is_finite() && checkpoint_ps > 0.) {
+        bail!("--checkpoint-ps must be positive");
+    }
+    let checkpoint_interval = ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001))
+        .round() as usize)
+        .max(1);
     let masses: Vec<_> = system.atoms().iter().map(|atom| atom.mass()).collect();
     let starting_step = session.current_step();
     let simulation_started = Instant::now();
