@@ -196,23 +196,30 @@ fn electrostatics_kind(protocol: &SimulationProtocol) -> NonbondedElectrostatics
     }
 }
 
-/// Cluster-pair engine for reaction-field dynamics. Setting the environment
-/// variable `GLYSYS_CPU_REFERENCE_PAIRS` keeps the f64 reference pair loop
-/// (for validation runs); PME has no cluster kernel yet.
+/// Cluster-pair engine for the dynamics force loop, in reaction-field or
+/// PME mode. Setting the environment variable `GLYSYS_CPU_REFERENCE_PAIRS`
+/// keeps the f64 reference pair loop (for validation runs).
 fn cluster_engine(
     system: &ParameterizedSystem,
     protocol: &SimulationProtocol,
 ) -> Result<Option<ClusterPairEngine>> {
-    if protocol.electrostatics != ElectrostaticsModel::ReactionField || reference_pairs_requested()
-    {
+    if reference_pairs_requested() {
         return Ok(None);
     }
-    ClusterPairEngine::new(
-        system,
-        cutoff_angstrom(protocol),
-        SKIN_ANGSTROM,
-        protocol.rf_dielectric.unwrap_or(78.5),
-    )
+    match protocol.electrostatics {
+        ElectrostaticsModel::ReactionField => ClusterPairEngine::new(
+            system,
+            cutoff_angstrom(protocol),
+            SKIN_ANGSTROM,
+            protocol.rf_dielectric.unwrap_or(78.5),
+        ),
+        ElectrostaticsModel::Pme => ClusterPairEngine::new_pme(
+            system,
+            cutoff_angstrom(protocol),
+            SKIN_ANGSTROM,
+            pme_parameters(system, protocol)?.alpha_per_angstrom,
+        ),
+    }
     .map(Some)
     .map_err(Error::Energy)
 }
@@ -1951,17 +1958,26 @@ impl<'a> ExplicitSimulation<'a> {
         if (!self.state.protocol.has_npt() || self.coupling_plan.is_some())
             && let Some(engine) = &mut self.cluster
         {
-            let energy = self
-                .field
-                .evaluate_with_cluster(
+            let energy = match &mut self.electrostatics {
+                Electrostatics::ReactionField(_) => self.field.evaluate_with_cluster(
                     engine,
                     coords,
                     box_vec,
                     self.dispersion_coefficient,
                     self.state.protocol.dispersion_correction,
                     !self.force_only,
-                )
-                .map_err(Error::Energy)?;
+                ),
+                Electrostatics::Pme(pme) => self.field.evaluate_with_cluster_pme(
+                    engine,
+                    pme,
+                    coords,
+                    box_vec,
+                    self.dispersion_coefficient,
+                    self.state.protocol.dispersion_correction,
+                    !self.force_only,
+                ),
+            }
+            .map_err(Error::Energy)?;
             self.virial_current = !self.force_only;
             return Ok(energy);
         }
