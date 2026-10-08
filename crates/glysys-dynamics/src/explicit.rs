@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub const SKIN_ANGSTROM: f64 = 1.5;
+/// Fewest atoms a parallel task of a per-atom loop takes; such loops cost a
+/// few nanoseconds per atom, less than handing out a task does.
+const PER_ATOM_TASK: usize = 512;
 /// 1 fs for flexible waters, 2 fs with SETTLE. Larger requests are rejected
 /// rather than silently integrated.
 pub fn max_timestep_fs(constraints: ConstraintModel) -> f64 {
@@ -1710,6 +1713,7 @@ impl<'a> ExplicitSimulation<'a> {
                 .par_iter_mut()
                 .zip(trial.par_iter_mut())
                 .enumerate()
+                .with_min_len(PER_ATOM_TASK)
                 .for_each(|(i, (velocity, position))| {
                     let f = friction[groups[i] as usize];
                     let kick = -dt * ACCEL / masses[i];
@@ -1732,6 +1736,7 @@ impl<'a> ExplicitSimulation<'a> {
                 .par_iter_mut()
                 .zip(next_coords.par_iter())
                 .zip(trial.par_iter())
+                .with_min_len(PER_ATOM_TASK)
                 .for_each(|((velocity, next), unconstrained)| {
                     *velocity = add(
                         *velocity,
@@ -1759,6 +1764,7 @@ impl<'a> ExplicitSimulation<'a> {
             .par_iter()
             .zip(next_vel.par_iter())
             .zip(old_coords.par_iter())
+            .with_min_len(PER_ATOM_TASK)
             .any(|((next, velocity), old)| {
                 !finite(next) || !finite(velocity) || norm2(add(*next, scale(*old, -1.))) > 1.
             });
@@ -1789,7 +1795,7 @@ impl<'a> ExplicitSimulation<'a> {
             old_box
         } else {
             let scale_by = [1. + drag[0], 1. + drag[1], 1. + drag[2]];
-            next_coords.par_iter_mut().for_each(|p| {
+            next_coords.par_iter_mut().with_min_len(PER_ATOM_TASK).for_each(|p| {
                 p.x *= scale_by[0];
                 p.y *= scale_by[1];
                 p.z *= scale_by[2];
