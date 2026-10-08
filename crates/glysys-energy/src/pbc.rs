@@ -571,6 +571,28 @@ impl<'a> PbcForceField<'a> {
     /// correction: all particle pairs use Lorentz-Berthelot mixing and no
     /// atom-pair matrix is materialized.
     pub fn dispersion_coefficient(&self, cutoff: f64) -> Result<f64> {
+        let [repulsion, dispersion] = self.dispersion_terms(cutoff)?;
+        Ok(repulsion + dispersion)
+    }
+
+    /// Coefficient of the pressure the truncated Lennard-Jones tail adds to
+    /// a pressure computed from forces, in kcal mol^-1 Å^3: the correction
+    /// is `coefficient / volume^2`.
+    ///
+    /// This is the virial of the tail, `-(2 pi / 3) rho^2 * integral of
+    /// r^3 u'(r)`, which is twice the tail energy over the volume for the
+    /// r^-6 term and four times for the r^-12 term. It is not the volume
+    /// derivative of the tail energy: forces do not see the step of the
+    /// truncated potential at the cutoff, and the tail virial accounts for
+    /// it. A barostat that compares energies (Monte Carlo) sees that step
+    /// itself and needs only the energy correction.
+    pub fn dispersion_pressure_coefficient(&self, cutoff: f64) -> Result<f64> {
+        let [repulsion, dispersion] = self.dispersion_terms(cutoff)?;
+        Ok(4. * repulsion + 2. * dispersion)
+    }
+
+    /// The r^-12 and r^-6 parts of [`Self::dispersion_coefficient`].
+    fn dispersion_terms(&self, cutoff: f64) -> Result<[f64; 2]> {
         if !cutoff.is_finite() || cutoff <= 0. {
             return Err(EnergyError::InvalidConfiguration(
                 "dispersion correction needs a positive cutoff".into(),
@@ -616,17 +638,16 @@ impl<'a> PbcForceField<'a> {
         }
         let n = self.sigma.len() as f64;
         if n == 0. {
-            return Ok(0.);
+            return Ok([0.; 2]);
         }
         // OpenMM normalizes the class sums by the number of unordered
         // particle pairs, then multiplies by 8πN².
         let pair_norm = n * (n + 1.0) * 0.5;
-        Ok(8.0
-            * std::f64::consts::PI
-            * n
-            * n
-            * (sum12 / pair_norm / (9.0 * cutoff.powi(9))
-                - sum6 / pair_norm / (3.0 * cutoff.powi(3))))
+        let scale = 8.0 * std::f64::consts::PI * n * n;
+        Ok([
+            scale * sum12 / pair_norm / (9.0 * cutoff.powi(9)),
+            -scale * sum6 / pair_norm / (3.0 * cutoff.powi(3)),
+        ])
     }
 
     /// Evaluate the cutoff Hamiltonian and optionally add the homogeneous

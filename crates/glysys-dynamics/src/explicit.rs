@@ -792,6 +792,9 @@ pub struct ExplicitSimulation<'a> {
     /// cutoff. It is a volume-only term and therefore adds no Cartesian
     /// force in the fixed-box integrator.
     dispersion_coefficient: f64,
+    /// Its counterpart for a pressure computed from forces
+    /// ([`PbcForceField::dispersion_pressure_coefficient`]).
+    dispersion_pressure_coefficient: f64,
     /// Unconstrained velocity DOF: 3N minus one per distance constraint.
     degrees_of_freedom: usize,
     /// Temperature groups and coupling intervals of the leap-frog
@@ -830,6 +833,7 @@ impl<'a> ExplicitSimulation<'a> {
             cluster: self.cluster,
             force_only: self.force_only,
             dispersion_coefficient: self.dispersion_coefficient,
+            dispersion_pressure_coefficient: self.dispersion_pressure_coefficient,
             degrees_of_freedom: self.degrees_of_freedom,
             coupling_plan: self.coupling_plan,
             constraint_anchor: self.constraint_anchor,
@@ -917,6 +921,13 @@ impl<'a> ExplicitSimulation<'a> {
         let dispersion_coefficient = if protocol.dispersion_correction {
             field
                 .dispersion_coefficient(cutoff)
+                .map_err(Error::Energy)?
+        } else {
+            0.0
+        };
+        let dispersion_pressure_coefficient = if protocol.dispersion_correction {
+            field
+                .dispersion_pressure_coefficient(cutoff)
                 .map_err(Error::Energy)?
         } else {
             0.0
@@ -1031,6 +1042,7 @@ impl<'a> ExplicitSimulation<'a> {
             cluster,
             force_only: false,
             dispersion_coefficient,
+            dispersion_pressure_coefficient,
             degrees_of_freedom,
             coupling_plan,
             constraint_anchor,
@@ -1126,6 +1138,13 @@ impl<'a> ExplicitSimulation<'a> {
         } else {
             0.0
         };
+        let dispersion_pressure_coefficient = if state.protocol.dispersion_correction {
+            field
+                .dispersion_pressure_coefficient(cutoff_angstrom(&state.protocol))
+                .map_err(Error::Energy)?
+        } else {
+            0.0
+        };
         let mut electrostatics = Electrostatics::new(system, &state.protocol)?;
         let waters = classify_waters(system);
         let masses: Vec<_> = system.atoms().iter().map(|a| a.mass()).collect();
@@ -1202,6 +1221,7 @@ impl<'a> ExplicitSimulation<'a> {
             cluster,
             force_only: false,
             dispersion_coefficient,
+            dispersion_pressure_coefficient,
             degrees_of_freedom,
             coupling_plan,
             constraint_anchor,
@@ -1857,7 +1877,7 @@ impl<'a> ExplicitSimulation<'a> {
             let mut value =
                 (2. * kinetic + self.state.virial_kcal_mol + constraint_virial) / (3. * volume);
             if self.state.protocol.dispersion_correction {
-                value += self.dispersion_coefficient / (volume * volume);
+                value += self.dispersion_pressure_coefficient / (volume * volume);
             }
             let bar = value * BAR_PER_KCAL_MOL_A3;
             coupling.pressure_bar = bar;
@@ -3043,6 +3063,31 @@ mod tests {
         let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
         let drift = ((tail - head) / sim.masses.len() as f64).abs();
         assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+    }
+
+    #[test]
+    fn force_based_pressure_takes_the_virial_of_the_dispersion_tail() {
+        // One Lennard-Jones class with N atoms: the tail energy per volume is
+        // (8/3) pi N^2 eps sigma^3 [ (1/3)(sigma/rc)^9 - (sigma/rc)^3 ] / V and
+        // the tail pressure (16/3) pi N^2 eps sigma^3 [ (2/3)(sigma/rc)^9 -
+        // (sigma/rc)^3 ] / V^2 (Allen and Tildesley), with N^2 counted as the
+        // N (N + 1) / 2 pairs of the energy correction.
+        let system = solvated_dipeptide();
+        let field = PbcForceField::new(&system, Vec::new()).unwrap();
+        let cutoff = 9.0;
+        let energy = field.dispersion_coefficient(cutoff).unwrap();
+        let pressure = field.dispersion_pressure_coefficient(cutoff).unwrap();
+        // dominated by the attractive term, for which the factor is two
+        assert!(energy < 0. && pressure < 0.);
+        let ratio = pressure / energy;
+        assert!(ratio > 1.99 && ratio < 2.0, "tail pressure / tail energy = {ratio}");
+        // and exactly 4 E12 + 2 E6 with E12 + E6 the energy coefficient at
+        // two cutoffs, which separates the two powers of the cutoff
+        let (e1, e2) = (energy, field.dispersion_coefficient(2. * cutoff).unwrap());
+        // E12 scales as rc^-9 and E6 as rc^-3
+        let e12 = (e2 - e1 / 8.) / (1. / 512. - 1. / 8.);
+        let e6 = e1 - e12;
+        assert!((pressure - (4. * e12 + 2. * e6)).abs() < 1e-9 * pressure.abs());
     }
 
     #[test]
