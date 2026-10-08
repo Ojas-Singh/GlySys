@@ -2,6 +2,7 @@
 //! Distances Å, time ps, energy kcal/mol.
 pub mod accumulators;
 pub mod analysis;
+pub mod coupling;
 pub mod explicit;
 pub mod minimization;
 pub mod resident_rng;
@@ -30,6 +31,9 @@ pub const EXPLICIT_MODEL_VERSION: &str = "tip3p-rf-md-v1";
 /// historical NVE/NVT checkpoints, while new NPT/dispersion runs use v2.
 pub const EXPLICIT_NPT_MODEL_VERSION: &str = "tip3p-rf-md-npt-v2";
 pub const EXPLICIT_LF_MIDDLE_MODEL_VERSION: &str = "tip3p-rf-lf-middle-v1";
+/// Leap-frog with Nose–Hoover temperature coupling and, for NPT stages,
+/// Parrinello–Rahman pressure coupling (the GROMACS `md` integrator).
+pub const EXPLICIT_LEAPFROG_MODEL_VERSION: &str = "tip3p-leapfrog-nh-pr-v1";
 /// Browser requests retain a bounded schedule so an untrusted page cannot
 /// accidentally enqueue an effectively unending job. Native/HPC sessions
 /// use the larger bound below and still rely on checkpoints and signals for
@@ -111,10 +115,16 @@ pub enum VelocityConvention {
     #[default]
     LegacyFullStep,
     LfMiddleCentered,
+    /// Leap-frog: the stored velocities belong to the half step before the
+    /// stored positions.
+    LeapfrogHalfStep,
 }
 
 impl VelocityConvention {
     pub fn for_protocol(protocol: &SimulationProtocol) -> Self {
+        if protocol.uses_leapfrog() {
+            return Self::LeapfrogHalfStep;
+        }
         match protocol.langevin_discretization {
             LangevinDiscretization::Baoab => Self::LegacyFullStep,
             LangevinDiscretization::LfMiddle => Self::LfMiddleCentered,
@@ -153,6 +163,8 @@ pub enum PressureCoupling {
 /// temperature exactly and is the production default with constraints.
 /// SETTLE carries the position-constraint impulse into the half-step
 /// velocity, and the closed-form RATTLE projection is applied after kicks.
+/// Nose–Hoover selects the leap-frog integrator of [`coupling`], with one
+/// thermostat per temperature group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Thermostat {
@@ -162,9 +174,9 @@ pub enum Thermostat {
     NoseHoover,
 }
 
-/// One temperature-coupling group retained from an imported native protocol.
-/// The group is part of the protocol identity even while the corresponding
-/// Nose–Hoover implementation is still behind its validation gate.
+/// One temperature-coupling group of a Nose–Hoover protocol. `name` selects
+/// the atoms (see [`coupling::CouplingPlan`]): the waters, everything else,
+/// or the whole system.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThermostatGroup {
@@ -256,6 +268,28 @@ pub struct SimulationProtocol {
     /// Center-of-mass groups from a native recipe.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub com_groups: Vec<String>,
+    /// Steps between Nose–Hoover updates (GROMACS `nsttcouple`). Absent
+    /// means 10, or fewer when the coupling time needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_coupling_interval: Option<usize>,
+    /// Steps between Parrinello–Rahman updates (GROMACS `nstpcouple`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_coupling_interval: Option<usize>,
+    /// Steps between removals of center-of-mass motion (GROMACS `nstcomm`).
+    /// Absent means 100 for the leap-frog integrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub com_removal_interval: Option<usize>,
+    /// Relative strength of the direct-space Ewald term at the cutoff
+    /// (GROMACS `ewald-rtol`, default 1e-5). PME only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ewald_tolerance: Option<f64>,
+    /// Largest PME grid spacing in angstrom (GROMACS `fourierspacing`,
+    /// default 1.2). PME only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fourier_spacing_angstrom: Option<f64>,
+    /// PME B-spline order (GROMACS `pme-order`, default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pme_order: Option<usize>,
 }
 impl Default for SimulationProtocol {
     fn default() -> Self {
@@ -288,11 +322,23 @@ impl Default for SimulationProtocol {
             pressure_compressibility_bar_inverse: Vec::new(),
             com_mode: None,
             com_groups: Vec::new(),
+            temperature_coupling_interval: None,
+            pressure_coupling_interval: None,
+            com_removal_interval: None,
+            ewald_tolerance: None,
+            fourier_spacing_angstrom: None,
+            pme_order: None,
         }
     }
 }
 
 impl SimulationProtocol {
+    /// True for the leap-frog integrator with Nose–Hoover coupling, whose
+    /// velocities live on half steps.
+    pub fn uses_leapfrog(&self) -> bool {
+        self.solvent == SolventModel::Explicit && self.thermostat == Thermostat::NoseHoover
+    }
+
     /// Return the execution stages without mutating the compatibility fields.
     pub fn execution_stages(&self) -> Vec<SimulationStage> {
         self.stages.clone().unwrap_or_else(|| {
@@ -433,6 +479,9 @@ pub struct SimulationState {
     /// On-the-fly water occupancy grid over production frames, if enabled.
     #[serde(default)]
     pub water_occupancy: Option<accumulators::WaterOccupancy>,
+    /// Thermostat and barostat variables of the leap-frog integrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupling: Option<coupling::CouplingState>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -663,7 +712,47 @@ impl SimulationProtocol {
         if self.pressure_coupling == PressureCoupling::ParrinelloRahman && !self.has_npt() {
             return Err(invalid("Parrinello-Rahman is only valid for an NPT stage"));
         }
-        if self.langevin_discretization == LangevinDiscretization::LfMiddle {
+        if self.thermostat == Thermostat::NoseHoover {
+            if self.solvent != SolventModel::Explicit {
+                return Err(invalid("Nose-Hoover requires solvent=explicit"));
+            }
+            if self.constraints != ConstraintModel::Settle {
+                return Err(invalid("Nose-Hoover requires constraints=settle"));
+            }
+            if self.has_npt() && self.pressure_coupling != PressureCoupling::ParrinelloRahman {
+                return Err(invalid(
+                    "Nose-Hoover NPT stages use pressureCoupling=parrinello-rahman",
+                ));
+            }
+        } else if self.pressure_coupling == PressureCoupling::ParrinelloRahman {
+            return Err(invalid(
+                "Parrinello-Rahman requires thermostat=nose-hoover (the leap-frog integrator)",
+            ));
+        }
+        if [
+            self.temperature_coupling_interval,
+            self.pressure_coupling_interval,
+            self.com_removal_interval,
+        ]
+        .contains(&Some(0))
+        {
+            return Err(invalid("coupling intervals must be positive"));
+        }
+        if self
+            .ewald_tolerance
+            .is_some_and(|t| !t.is_finite() || t <= 0. || t >= 1.)
+            || self
+                .fourier_spacing_angstrom
+                .is_some_and(|s| !s.is_finite() || s <= 0.)
+            || self.pme_order.is_some_and(|order| !(4..=6).contains(&order))
+        {
+            return Err(invalid(
+                "PME needs 0 < ewaldTolerance < 1, a positive grid spacing and order 4 to 6",
+            ));
+        }
+        if self.thermostat != Thermostat::NoseHoover
+            && self.langevin_discretization == LangevinDiscretization::LfMiddle
+        {
             if self.has_npt()
                 || self
                     .execution_stages()
@@ -1163,6 +1252,7 @@ impl<'a> CpuSimulation<'a> {
             barostat_step_counter: 0,
             barostat_frozen: false,
             water_occupancy: None,
+            coupling: None,
         };
         let implicit_engine = implicit_engine(&evaluator)?;
         Ok(Self {
@@ -1741,6 +1831,7 @@ mod tests {
             barostat_step_counter: 0,
             barostat_frozen: false,
             water_occupancy: None,
+            coupling: None,
         }
     }
     #[test]
