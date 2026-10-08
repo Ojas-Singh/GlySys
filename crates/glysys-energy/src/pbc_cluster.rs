@@ -18,6 +18,11 @@
 //! Work is split into one contiguous chunk of clusters per worker with a
 //! private force buffer; chunks are combined in a fixed order, so results are
 //! reproducible for a given thread count.
+//!
+//! In PME mode ([`ClusterPairEngine::new_pme`]) regular pairs use the Ewald
+//! direct-space term `erfc(alpha r)/r` instead of the reaction field; the
+//! long-range remainder comes from [`crate::pme::PmeEngine`]. 1-4 exceptions
+//! are plain Coulomb in both modes.
 use crate::pbc::{BoxVectors, COULOMB};
 use crate::{EnergyError, Result};
 use glysys::{ParameterizedSystem, Vec3};
@@ -28,6 +33,160 @@ const LANES: usize = 8;
 const CHUNKS_PER_THREAD: usize = 4;
 const SORT_CELL_ANGSTROM: f64 = 3.0;
 const MAX_SORT_BITS: u32 = 7;
+/// Polynomial terms of the Ewald direct-space corrections.
+const EWALD_TERMS: usize = 16;
+/// Largest accepted error of the single-precision Ewald pair force, as a
+/// fraction of the pair's bare Coulomb force.
+const EWALD_FORCE_TOLERANCE: f64 = 1e-5;
+
+/// Pair electrostatics of the two engine modes.
+enum PairElectrostatics {
+    ReactionField { solvent_dielectric: f64 },
+    Ewald { alpha_per_angstrom: f64 },
+}
+
+/// Single-precision Ewald direct-space pair term of the PME mode.
+///
+/// `erfc(alpha r)/r = 1/r - alpha P_V(t)` and its `(dE/dr)/r` is
+/// `alpha^3 P_F(t) - 1/r^3`, with `t = (alpha r)^2` and `P_V`, `P_F` the
+/// smooth long-range functions of [`crate::pme`]. The kernel already has
+/// `1/r` and `1/r^3`, so it only needs the two corrections: polynomials of
+/// degree 15 in `u = 2 r^2/rc^2 - 1` on [-1, 1], interpolated at Chebyshev
+/// nodes for this `alpha` and cutoff and evaluated with Estrin's scheme
+/// (a short dependency chain, no table lookups). The f32 result carries
+/// rounding of a few 1e-7 of the bare Coulomb term, like every other pair
+/// quantity in this kernel; `error` records what the fit achieves.
+#[derive(Clone, Copy, Debug)]
+struct EwaldKernel {
+    alpha: f64,
+    /// `2/rc^2`: maps `r^2` onto `u + 1`.
+    scale: f32,
+    /// `alpha^3 P_F` and `alpha P_V` as monomials in `u`.
+    force: [f32; EWALD_TERMS],
+    energy: [f32; EWALD_TERMS],
+    /// Largest errors of the pair force and energy over (0, rc], relative to
+    /// the bare Coulomb force and energy of the pair.
+    error: [f64; 2],
+}
+
+/// Stand-in for the reaction-field instantiations, which never read it.
+static NO_EWALD: EwaldKernel = EwaldKernel {
+    alpha: 0.,
+    scale: 0.,
+    force: [0.; EWALD_TERMS],
+    energy: [0.; EWALD_TERMS],
+    error: [0.; 2],
+};
+
+impl EwaldKernel {
+    fn new(alpha: f64, cutoff: f64) -> Result<Self> {
+        if !alpha.is_finite() || alpha <= 0. {
+            return Err(EnergyError::InvalidConfiguration(
+                "Ewald coefficient must be positive".into(),
+            ));
+        }
+        let kernel = Self::fit(alpha, cutoff);
+        if !kernel.error[0].is_finite() || kernel.error[0] > EWALD_FORCE_TOLERANCE {
+            return Err(EnergyError::InvalidConfiguration(format!(
+                "alpha * cutoff = {:.2} is too large for the single-precision Ewald kernel",
+                alpha * cutoff
+            )));
+        }
+        Ok(kernel)
+    }
+
+    /// Interpolate the corrections for one `alpha` and cutoff and measure
+    /// the pair terms exactly as the kernel forms them.
+    fn fit(alpha: f64, cutoff: f64) -> Self {
+        let reach = (alpha * cutoff).powi(2);
+        let at = |u: f64| crate::pme::long_range_pair_functions(0.5 * reach * (u + 1.));
+        let mut kernel = Self {
+            alpha,
+            scale: (2. / (cutoff * cutoff)) as f32,
+            force: chebyshev_monomials(|u| alpha.powi(3) * at(u).1).map(|c| c as f32),
+            energy: chebyshev_monomials(|u| alpha * at(u).0).map(|c| c as f32),
+            error: [0.; 2],
+        };
+        const SAMPLES: usize = 4096;
+        for sample in 1..=SAMPLES {
+            let r = (cutoff * sample as f64 / SAMPLES as f64) as f32;
+            let r2 = r * r;
+            let inv_r2 = 1.0 / r2;
+            let inv_r = inv_r2.sqrt();
+            let u = (r2 * kernel.scale - 1.0).min(1.0);
+            let force = ewald_polynomial(&kernel.force, u) - inv_r * inv_r2;
+            let energy = inv_r - ewald_polynomial(&kernel.energy, u);
+            let exact_r = f64::from(r2).sqrt();
+            let (potential, slope) =
+                crate::pme::long_range_pair_functions((alpha * exact_r).powi(2));
+            let exact_force = alpha.powi(3) * slope - exact_r.powi(-3);
+            let exact_energy = 1. / exact_r - alpha * potential;
+            kernel.error[0] =
+                kernel.error[0].max((f64::from(force) - exact_force).abs() * exact_r.powi(3));
+            kernel.error[1] =
+                kernel.error[1].max((f64::from(energy) - exact_energy).abs() * exact_r);
+        }
+        kernel
+    }
+}
+
+/// Monomial coefficients of the polynomial that interpolates `f` at the
+/// `EWALD_TERMS` Chebyshev nodes of [-1, 1].
+fn chebyshev_monomials(f: impl Fn(f64) -> f64) -> [f64; EWALD_TERMS] {
+    let n = EWALD_TERMS;
+    let angle = |k: usize| std::f64::consts::PI * (k as f64 + 0.5) / n as f64;
+    let values: [f64; EWALD_TERMS] = std::array::from_fn(|k| f(angle(k).cos()));
+    // T_0 = 1, T_1 = u, T_{j+1} = 2 u T_j - T_{j-1}.
+    let mut previous = [0f64; EWALD_TERMS];
+    let mut current = [0f64; EWALD_TERMS];
+    let mut monomials = [0f64; EWALD_TERMS];
+    for j in 0..n {
+        let sum: f64 = (0..n)
+            .map(|k| values[k] * (j as f64 * angle(k)).cos())
+            .sum();
+        let coefficient = if j == 0 { sum } else { 2. * sum } / n as f64;
+        let mut next = [0f64; EWALD_TERMS];
+        match j {
+            0 => next[0] = 1.,
+            1 => next[1] = 1.,
+            _ => {
+                for k in 0..n {
+                    next[k] = if k > 0 { 2. * current[k - 1] } else { 0. } - previous[k];
+                }
+            }
+        }
+        for k in 0..n {
+            monomials[k] += coefficient * next[k];
+        }
+        previous = current;
+        current = next;
+    }
+    monomials
+}
+
+/// Degree-15 polynomial by Estrin's scheme. The AVX2 kernel performs the
+/// same operations in the same order.
+#[inline(always)]
+fn ewald_polynomial(c: &[f32; EWALD_TERMS], u: f32) -> f32 {
+    let u2 = u * u;
+    let u4 = u2 * u2;
+    let u8 = u4 * u4;
+    let p0 = c[0] + c[1] * u;
+    let p1 = c[2] + c[3] * u;
+    let p2 = c[4] + c[5] * u;
+    let p3 = c[6] + c[7] * u;
+    let p4 = c[8] + c[9] * u;
+    let p5 = c[10] + c[11] * u;
+    let p6 = c[12] + c[13] * u;
+    let p7 = c[14] + c[15] * u;
+    let q0 = p0 + p1 * u2;
+    let q1 = p2 + p3 * u2;
+    let q2 = p4 + p5 * u2;
+    let q3 = p6 + p7 * u2;
+    let r0 = q0 + q1 * u4;
+    let r1 = q2 + q3 * u4;
+    r0 + r1 * u8
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Exception {
@@ -73,6 +232,7 @@ pub struct ClusterPairEngine {
     skin: f64,
     krf: f64,
     crf: f64,
+    ewald: Option<EwaldKernel>,
     charge: Vec<f32>,
     sigma: Vec<f32>,
     sqrt_epsilon: Vec<f32>,
@@ -100,6 +260,30 @@ impl ClusterPairEngine {
         skin: f64,
         solvent_dielectric: f64,
     ) -> Result<Self> {
+        let electrostatics = PairElectrostatics::ReactionField { solvent_dielectric };
+        Self::build(system, cutoff, skin, electrostatics)
+    }
+
+    /// PME mode: regular pairs inside the cutoff interact through the Ewald
+    /// direct-space term `qq erfc(alpha r)/r`. Pair it with a
+    /// [`crate::pme::PmeEngine`] of the same `alpha` for the long-range part
+    /// ([`crate::pbc::PbcForceField::evaluate_with_cluster_pme`]).
+    pub fn new_pme(
+        system: &ParameterizedSystem,
+        cutoff: f64,
+        skin: f64,
+        alpha_per_angstrom: f64,
+    ) -> Result<Self> {
+        let electrostatics = PairElectrostatics::Ewald { alpha_per_angstrom };
+        Self::build(system, cutoff, skin, electrostatics)
+    }
+
+    fn build(
+        system: &ParameterizedSystem,
+        cutoff: f64,
+        skin: f64,
+        electrostatics: PairElectrostatics,
+    ) -> Result<Self> {
         let n = system.atom_count();
         if n == 0 || n >= u32::MAX as usize / 2 {
             return Err(EnergyError::InvalidConfiguration(
@@ -111,14 +295,22 @@ impl ClusterPairEngine {
                 "neighbor cutoff must be positive and skin non-negative".into(),
             ));
         }
-        if !solvent_dielectric.is_finite() || solvent_dielectric < 1. {
-            return Err(EnergyError::InvalidConfiguration(
-                "reaction-field dielectric must be at least one".into(),
-            ));
-        }
-        let e = solvent_dielectric;
-        let krf = (e - 1.) / (2. * e + 1.) / cutoff.powi(3);
-        let crf = 3. * e / (2. * e + 1.) / cutoff;
+        let (krf, crf, ewald) = match electrostatics {
+            PairElectrostatics::ReactionField { solvent_dielectric } => {
+                if !solvent_dielectric.is_finite() || solvent_dielectric < 1. {
+                    return Err(EnergyError::InvalidConfiguration(
+                        "reaction-field dielectric must be at least one".into(),
+                    ));
+                }
+                let e = solvent_dielectric;
+                let krf = (e - 1.) / (2. * e + 1.) / cutoff.powi(3);
+                let crf = 3. * e / (2. * e + 1.) / cutoff;
+                (krf, crf, None)
+            }
+            PairElectrostatics::Ewald { alpha_per_angstrom } => {
+                (0., 0., Some(EwaldKernel::new(alpha_per_angstrom, cutoff)?))
+            }
+        };
         let molecule = molecule_ids(system);
         let mut window = vec![0u64; n];
         let mut far = Vec::new();
@@ -174,6 +366,7 @@ impl ClusterPairEngine {
             skin,
             krf,
             crf,
+            ewald,
             charge: atoms.iter().map(|a| a.charge() as f32).collect(),
             sigma: atoms
                 .iter()
@@ -201,6 +394,19 @@ impl ClusterPairEngine {
 
     pub fn cutoff(&self) -> f64 {
         self.cutoff
+    }
+
+    /// Ewald coefficient (1/angstrom) of an engine in PME mode; `None` for
+    /// reaction field.
+    pub fn ewald_alpha(&self) -> Option<f64> {
+        self.ewald.map(|ewald| ewald.alpha)
+    }
+
+    /// Largest errors of the single-precision Ewald pair force and energy
+    /// over all distances up to the cutoff, as fractions of the pair's bare
+    /// Coulomb force and energy (PME mode only).
+    pub fn ewald_pair_error(&self) -> Option<[f64; 2]> {
+        self.ewald.map(|ewald| ewald.error)
     }
 
     /// Completed list builds since construction.
@@ -530,6 +736,7 @@ impl ClusterPairEngine {
         let sorted_lj = &self.sorted_lj;
         let cluster_list = &self.clusters;
         let lists = &self.lists;
+        let ewald = self.ewald;
         let chunk_totals: Vec<[f64; 5]> = self
             .buffers
             .par_iter_mut()
@@ -540,16 +747,15 @@ impl ClusterPairEngine {
                 let range = bounds[chunk]..bounds[chunk + 1];
                 for (cluster, data) in cluster_list[range.clone()].iter().enumerate() {
                     let index = range.start + cluster;
-                    let result = run_cluster(
-                        &params,
-                        index,
-                        data,
-                        sorted,
-                        sorted_lj,
-                        &lists[index].atoms,
-                        &lists[index].masks,
-                        buffer,
-                    );
+                    let (atoms, masks) = (&lists[index].atoms, &lists[index].masks);
+                    let result = match &ewald {
+                        None => run_cluster(
+                            &params, index, data, sorted, sorted_lj, atoms, masks, buffer,
+                        ),
+                        Some(ewald) => run_cluster_pme(
+                            &params, ewald, index, data, sorted, sorted_lj, atoms, masks, buffer,
+                        ),
+                    };
                     for (total, value) in totals.iter_mut().zip(result) {
                         *total += f64::from(value);
                     }
@@ -654,9 +860,9 @@ fn run_cluster(
                 ($obs:expr, $per_pair:expr) => {
                     // SAFETY: AVX2 support was detected at runtime.
                     unsafe {
-                        avx2::cluster::<$obs, $per_pair>(
-                            params, index, cluster, sorted, sorted_lj, list_atoms, list_masks,
-                            buffer,
+                        avx2::cluster::<$obs, $per_pair, false>(
+                            params, &NO_EWALD, index, cluster, sorted, sorted_lj, list_atoms,
+                            list_masks, buffer,
                         )
                     }
                 };
@@ -674,13 +880,53 @@ fn run_cluster(
     )
 }
 
+/// [`run_cluster`] for the PME mode.
+#[allow(clippy::too_many_arguments)]
+fn run_cluster_pme(
+    params: &KernelParams,
+    ewald: &EwaldKernel,
+    index: usize,
+    cluster: &Cluster,
+    sorted: &[[f32; 4]],
+    sorted_lj: &[[f32; 2]],
+    list_atoms: &[u32],
+    list_masks: &[u8],
+    buffer: &mut [[f32; 3]],
+) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            macro_rules! call {
+                ($obs:expr, $per_pair:expr) => {
+                    // SAFETY: AVX2 support was detected at runtime.
+                    unsafe {
+                        avx2::cluster::<$obs, $per_pair, true>(
+                            params, ewald, index, cluster, sorted, sorted_lj, list_atoms,
+                            list_masks, buffer,
+                        )
+                    }
+                };
+            }
+            return match (params.observables, cluster.per_pair) {
+                (false, false) => call!(false, false),
+                (false, true) => call!(false, true),
+                (true, false) => call!(true, false),
+                (true, true) => call!(true, true),
+            };
+        }
+    }
+    cluster_kernel_mode::<true>(
+        params, ewald, index, cluster, sorted, sorted_lj, list_atoms, list_masks, buffer,
+    )
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     //! Explicit AVX2 form of [`super::cluster_kernel`]. Every lane performs
     //! the same IEEE operations in the same order as the portable kernel (no
     //! fused multiply-add, ties-to-even rounding), so both produce identical
     //! bits.
-    use super::{Cluster, KernelParams, LANES};
+    use super::{Cluster, EWALD_TERMS, EwaldKernel, KernelParams, LANES};
     use std::arch::x86_64::*;
 
     #[inline]
@@ -699,8 +945,9 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn cluster<const OBS: bool, const PER_PAIR: bool>(
+    pub(super) fn cluster<const OBS: bool, const PER_PAIR: bool, const PME: bool>(
         params: &KernelParams,
+        ewald: &EwaldKernel,
         index: usize,
         cluster: &Cluster,
         sorted: &[[f32; 4]],
@@ -751,6 +998,43 @@ mod avx2 {
         let lx_v = _mm256_set1_ps(l[0]);
         let ly_v = _mm256_set1_ps(l[1]);
         let lz_v = _mm256_set1_ps(l[2]);
+        // Ewald corrections of the PME mode, broadcast once per cluster.
+        let ewald_scale = _mm256_set1_ps(ewald.scale);
+        let mut ewald_force = [_mm256_setzero_ps(); EWALD_TERMS];
+        let mut ewald_energy = [_mm256_setzero_ps(); EWALD_TERMS];
+        if PME {
+            for term in 0..EWALD_TERMS {
+                ewald_force[term] = _mm256_set1_ps(ewald.force[term]);
+                if OBS {
+                    ewald_energy[term] = _mm256_set1_ps(ewald.energy[term]);
+                }
+            }
+        }
+        // `super::ewald_polynomial`, operation for operation.
+        macro_rules! polynomial {
+            ($c:expr, $u:expr) => {{
+                let c = &$c;
+                let u = $u;
+                let u2 = _mm256_mul_ps(u, u);
+                let u4 = _mm256_mul_ps(u2, u2);
+                let u8 = _mm256_mul_ps(u4, u4);
+                let p0 = _mm256_add_ps(c[0], _mm256_mul_ps(c[1], u));
+                let p1 = _mm256_add_ps(c[2], _mm256_mul_ps(c[3], u));
+                let p2 = _mm256_add_ps(c[4], _mm256_mul_ps(c[5], u));
+                let p3 = _mm256_add_ps(c[6], _mm256_mul_ps(c[7], u));
+                let p4 = _mm256_add_ps(c[8], _mm256_mul_ps(c[9], u));
+                let p5 = _mm256_add_ps(c[10], _mm256_mul_ps(c[11], u));
+                let p6 = _mm256_add_ps(c[12], _mm256_mul_ps(c[13], u));
+                let p7 = _mm256_add_ps(c[14], _mm256_mul_ps(c[15], u));
+                let q0 = _mm256_add_ps(p0, _mm256_mul_ps(p1, u2));
+                let q1 = _mm256_add_ps(p2, _mm256_mul_ps(p3, u2));
+                let q2 = _mm256_add_ps(p4, _mm256_mul_ps(p5, u2));
+                let q3 = _mm256_add_ps(p6, _mm256_mul_ps(p7, u2));
+                let r0 = _mm256_add_ps(q0, _mm256_mul_ps(q1, u4));
+                let r1 = _mm256_add_ps(q2, _mm256_mul_ps(q3, u4));
+                _mm256_add_ps(r0, _mm256_mul_ps(r1, u8))
+            }};
+        }
         let mut fx = _mm256_setzero_ps();
         let mut fy = _mm256_setzero_ps();
         let mut fz = _mm256_setzero_ps();
@@ -813,7 +1097,20 @@ mod avx2 {
                     ),
                     inv_r2,
                 );
-                let f_coul = _mm256_mul_ps(qq, _mm256_sub_ps(krf2, _mm256_mul_ps(inv_r, inv_r2)));
+                // Masked lanes can lie beyond the cutoff: clamp to the fit.
+                let u = if PME {
+                    _mm256_min_ps(_mm256_sub_ps(_mm256_mul_ps(r2, ewald_scale), one), one)
+                } else {
+                    one
+                };
+                let f_coul = if PME {
+                    _mm256_mul_ps(
+                        qq,
+                        _mm256_sub_ps(polynomial!(ewald_force, u), _mm256_mul_ps(inv_r, inv_r2)),
+                    )
+                } else {
+                    _mm256_mul_ps(qq, _mm256_sub_ps(krf2, _mm256_mul_ps(inv_r, inv_r2)))
+                };
                 let fmag = _mm256_add_ps(f_lj, f_coul);
                 let gx = _mm256_mul_ps(fmag, dx);
                 let gy = _mm256_mul_ps(fmag, dy);
@@ -829,13 +1126,20 @@ mod avx2 {
                             _mm256_sub_ps(_mm256_mul_ps(s6, s6), _mm256_mul_ps(two, s6)),
                         ),
                     );
-                    e_rf = _mm256_add_ps(
-                        e_rf,
-                        _mm256_mul_ps(
-                            qq,
-                            _mm256_sub_ps(_mm256_add_ps(inv_r, _mm256_mul_ps(krf, r2)), crf),
-                        ),
-                    );
+                    e_rf = if PME {
+                        _mm256_add_ps(
+                            e_rf,
+                            _mm256_mul_ps(qq, _mm256_sub_ps(inv_r, polynomial!(ewald_energy, u))),
+                        )
+                    } else {
+                        _mm256_add_ps(
+                            e_rf,
+                            _mm256_mul_ps(
+                                qq,
+                                _mm256_sub_ps(_mm256_add_ps(inv_r, _mm256_mul_ps(krf, r2)), crf),
+                            ),
+                        )
+                    };
                     w_all = _mm256_sub_ps(w_all, _mm256_mul_ps(fmag, r2));
                     w_lj = _mm256_sub_ps(w_lj, _mm256_mul_ps(f_lj, r2));
                 }
@@ -906,6 +1210,26 @@ fn cluster_kernel(
     list_masks: &[u8],
     buffer: &mut [[f32; 3]],
 ) -> [f32; 4] {
+    cluster_kernel_mode::<false>(
+        params, &NO_EWALD, index, cluster, sorted, sorted_lj, list_atoms, list_masks, buffer,
+    )
+}
+
+/// [`cluster_kernel`] with reaction-field (`PME = false`) or Ewald
+/// direct-space (`PME = true`) electrostatics.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn cluster_kernel_mode<const PME: bool>(
+    params: &KernelParams,
+    ewald: &EwaldKernel,
+    index: usize,
+    cluster: &Cluster,
+    sorted: &[[f32; 4]],
+    sorted_lj: &[[f32; 2]],
+    list_atoms: &[u32],
+    list_masks: &[u8],
+    buffer: &mut [[f32; 3]],
+) -> [f32; 4] {
     let base = index * LANES;
     let c = cluster.center;
     let l = params.box_len;
@@ -938,8 +1262,9 @@ fn cluster_kernel(
             for lane in 1..LANES {
                 let mask = cluster.diagonal[lane];
                 if mask != 0 {
-                    interact::<$obs, $per_pair>(
+                    interact::<$obs, $per_pair, PME>(
                         params,
+                        ewald,
                         cluster,
                         &lanes,
                         &mut acc,
@@ -952,8 +1277,9 @@ fn cluster_kernel(
                 }
             }
             for entry in 0..list_atoms.len() {
-                interact::<$obs, $per_pair>(
+                interact::<$obs, $per_pair, PME>(
                     params,
+                    ewald,
                     cluster,
                     &lanes,
                     &mut acc,
@@ -1019,11 +1345,13 @@ fn lane_sum(v: [f32; LANES]) -> f32 {
 }
 
 /// The cluster lanes against one partner slot (broadcast). Branch-free so
-/// the lane loop compiles to SIMD; `OBS` adds energies and virials.
+/// the lane loop compiles to SIMD; `OBS` adds energies and virials, `PME`
+/// swaps the reaction field for the Ewald direct-space term.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn interact<const OBS: bool, const PER_PAIR: bool>(
+fn interact<const OBS: bool, const PER_PAIR: bool, const PME: bool>(
     params: &KernelParams,
+    ewald: &EwaldKernel,
     cluster: &Cluster,
     lanes: &Lanes,
     acc: &mut Accumulators,
@@ -1071,14 +1399,28 @@ fn interact<const OBS: bool, const PER_PAIR: bool>(
         let s6 = s2 * s2 * s2;
         let qq = lanes.q[lane] * qj * keep;
         let f_lj = 12.0 * eps * (s6 - s6 * s6) * inv_r2;
-        let f_coul = qq * (krf2 - inv_r * inv_r2);
+        // Masked lanes can lie beyond the cutoff: clamp to the fit.
+        let u = if PME {
+            (r2 * ewald.scale - 1.0).min(1.0)
+        } else {
+            1.0
+        };
+        let f_coul = if PME {
+            qq * (ewald_polynomial(&ewald.force, u) - inv_r * inv_r2)
+        } else {
+            qq * (krf2 - inv_r * inv_r2)
+        };
         let fmag = f_lj + f_coul;
         gx[lane] = fmag * dx;
         gy[lane] = fmag * dy;
         gz[lane] = fmag * dz;
         if OBS {
             acc.e_lj[lane] += eps * (s6 * s6 - 2.0 * s6);
-            acc.e_rf[lane] += qq * (inv_r + params.krf * r2 - params.crf);
+            acc.e_rf[lane] += if PME {
+                qq * (inv_r - ewald_polynomial(&ewald.energy, u))
+            } else {
+                qq * (inv_r + params.krf * r2 - params.crf)
+            };
             acc.w_all[lane] -= fmag * r2;
             acc.w_lj[lane] -= f_lj * r2;
         }
@@ -1380,6 +1722,336 @@ mod tests {
                 .map(|axis| pair[0][axis].abs_diff(pair[1][axis]))
                 .sum();
             assert_eq!(distance, 1, "{:?} -> {:?}", pair[0], pair[1]);
+        }
+    }
+
+    /// [`compare`] for the PME mode: direct-space pair and exception terms
+    /// against the f64 evaluator with the `erfc` backend.
+    fn compare_pme(system: &ParameterizedSystem, coordinates: &[Vec3], cutoff: f64) {
+        let box_vec = BoxVectors::from_system(system).unwrap();
+        let field = PbcForceField::new(system, vec![]).unwrap();
+        let alpha = crate::pme::ewald_coefficient(cutoff, 1e-5).unwrap();
+        let backend = crate::pbc::PmeBackend {
+            alpha_per_angstrom: alpha,
+            grid: [16; 3],
+            interpolation_order: 4,
+        };
+        let wrapped: Vec<Vec3> = coordinates.iter().map(|p| box_vec.wrap(*p)).collect();
+        let list = PbcNeighborList::build(&wrapped, &box_vec, cutoff, 1.5).unwrap();
+        let full = field
+            .evaluate(coordinates, &box_vec, &list.pairs, &backend, cutoff)
+            .unwrap();
+        let bonded = field
+            .evaluate(coordinates, &box_vec, &[], &backend, cutoff)
+            .unwrap();
+        let mut engine = ClusterPairEngine::new_pme(system, cutoff, 1.5, alpha).unwrap();
+        assert_eq!(engine.ewald_alpha(), Some(alpha));
+        let mut gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            system.atom_count()
+        ];
+        let totals = engine
+            .evaluate_into(coordinates, &box_vec, &mut gradients, true)
+            .unwrap();
+        let lj = full.components.van_der_waals;
+        let direct = full.components.electrostatics;
+        assert!(
+            (totals.van_der_waals - lj).abs() <= 1e-4 * lj.abs().max(10.),
+            "LJ {} vs {lj}",
+            totals.van_der_waals
+        );
+        assert!(
+            (totals.electrostatics - direct).abs() <= 1e-4 * direct.abs().max(10.),
+            "direct space {} vs {direct}",
+            totals.electrostatics
+        );
+        let virial = full.virial_terms[3];
+        assert!(
+            (totals.virial - virial).abs() <= 1e-3 * virial.abs().max(10.),
+            "pair virial {} vs {virial}",
+            totals.virial
+        );
+        let coulomb_virial = full.virial_pair_split[1];
+        assert!(
+            (totals.virial_pair_split[1] - coulomb_virial).abs()
+                <= 1e-3 * coulomb_virial.abs().max(10.),
+            "electrostatic virial {} vs {coulomb_virial}",
+            totals.virial_pair_split[1]
+        );
+        let mut error2 = 0.;
+        let mut reference2 = 0.;
+        for (atom, ((g, f), b)) in gradients
+            .iter()
+            .zip(&full.gradients)
+            .zip(&bonded.gradients)
+            .enumerate()
+        {
+            for (got, want) in [(g.x, f.x - b.x), (g.y, f.y - b.y), (g.z, f.z - b.z)] {
+                let delta = got - want;
+                assert!(
+                    delta.abs() <= 2e-3 + 2e-4 * want.abs(),
+                    "atom {atom}: gradient {got} vs {want}"
+                );
+                error2 += delta * delta;
+                reference2 += want * want;
+            }
+        }
+        assert!(
+            (error2 / reference2).sqrt() < 2e-5,
+            "force RMS {}",
+            (error2 / reference2).sqrt()
+        );
+        // Force-only steps give the same gradients.
+        let mut silent = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            system.atom_count()
+        ];
+        engine
+            .evaluate_into(coordinates, &box_vec, &mut silent, false)
+            .unwrap();
+        assert_eq!(silent, gradients);
+    }
+
+    #[test]
+    fn pme_mode_matches_the_f64_reference_on_solvated_systems() {
+        let system = solvated(6.0, false);
+        let mut coordinates = system.coordinates();
+        compare_pme(&system, &coordinates, 4.0);
+        jitter(&mut coordinates, 7, 0.4);
+        compare_pme(&system, &coordinates, 4.0);
+        let ions = solvated(9.0, true);
+        let mut coordinates = ions.coordinates();
+        jitter(&mut coordinates, 11, 0.3);
+        compare_pme(&ions, &coordinates, 9.0 - 1.0);
+        // Close to half the box: clusters fall back to per-pair images.
+        compare_pme(&ions, &coordinates, 10.0);
+    }
+
+    #[test]
+    fn pme_simd_and_portable_kernels_agree_bitwise() {
+        let system = solvated(6.0, false);
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let mut coordinates = system.coordinates();
+        jitter(&mut coordinates, 5, 0.3);
+        let alpha = crate::pme::ewald_coefficient(4.0, 1e-5).unwrap();
+        let mut engine = ClusterPairEngine::new_pme(&system, 4.0, 1.5, alpha).unwrap();
+        let mut g = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            system.atom_count()
+        ];
+        engine
+            .evaluate_into(&coordinates, &box_vec, &mut g, true)
+            .unwrap();
+        let ewald = engine.ewald.unwrap();
+        for observables in [true, false] {
+            let params = KernelParams {
+                cutoff2: 16.0,
+                krf: 0.0,
+                crf: 0.0,
+                box_len: box_vec.as_array().map(|v| v as f32),
+                observables,
+            };
+            for per_pair in [false, true] {
+                for (index, cluster) in engine.clusters.iter().enumerate() {
+                    let mut cluster = *cluster;
+                    cluster.per_pair = per_pair;
+                    let mut portable = vec![[0f32; 3]; engine.sorted.len()];
+                    let mut dispatched = portable.clone();
+                    let list = &engine.lists[index];
+                    let a = cluster_kernel_mode::<true>(
+                        &params,
+                        &ewald,
+                        index,
+                        &cluster,
+                        &engine.sorted,
+                        &engine.sorted_lj,
+                        &list.atoms,
+                        &list.masks,
+                        &mut portable,
+                    );
+                    let b = run_cluster_pme(
+                        &params,
+                        &ewald,
+                        index,
+                        &cluster,
+                        &engine.sorted,
+                        &engine.sorted_lj,
+                        &list.atoms,
+                        &list.masks,
+                        &mut dispatched,
+                    );
+                    assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+                    for (x, y) in portable.iter().zip(&dispatched) {
+                        assert_eq!(x.map(f32::to_bits), y.map(f32::to_bits));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ewald_pair_approximation_is_accurate() {
+        // GROMACS-default splitting for common cutoffs, a tighter tolerance,
+        // and OpenMM's default (alpha rc = 2.63).
+        for (cutoff, rtol) in [
+            (9.0, 1e-5),
+            (10.0, 1e-5),
+            (12.0, 1e-5),
+            (9.0, 1e-6),
+            (9.0, 2e-4),
+        ] {
+            let alpha = crate::pme::ewald_coefficient(cutoff, rtol).unwrap();
+            let kernel = EwaldKernel::new(alpha, cutoff).unwrap();
+            // Recorded errors, relative to the bare Coulomb force and energy
+            // (measured: 4e-7 to 7e-7 and 2e-7 to 3e-7).
+            assert!(kernel.error[0] < 1e-6, "force error {:e}", kernel.error[0]);
+            assert!(kernel.error[1] < 5e-7, "energy error {:e}", kernel.error[1]);
+            // The same against erfc directly, on points between the samples
+            // the constructor used, with the distance known only as r^2.
+            let two_over_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI;
+            let (mut worst_force, mut worst_energy, mut worst_at_cutoff) = (0f64, 0f64, 0f64);
+            for sample in 0..20_000 {
+                let r = (0.5 + (cutoff - 0.5) * (sample as f64 + 0.37) / 20_000.) as f32;
+                let r2 = r * r;
+                let inv_r2 = 1.0 / r2;
+                let inv_r = inv_r2.sqrt();
+                let u = (r2 * kernel.scale - 1.0).min(1.0);
+                let force = f64::from(ewald_polynomial(&kernel.force, u) - inv_r * inv_r2);
+                let energy = f64::from(inv_r - ewald_polynomial(&kernel.energy, u));
+                let d = f64::from(r2).sqrt();
+                let screened = crate::pme::erfc(alpha * d);
+                let gauss = two_over_sqrt_pi * alpha * (-(alpha * d).powi(2)).exp();
+                let exact_force = -(screened / d.powi(3) + gauss / (d * d));
+                let exact_energy = screened / d;
+                let force_error = (force - exact_force).abs() * d.powi(3);
+                worst_force = worst_force.max(force_error);
+                worst_energy = worst_energy.max((energy - exact_energy).abs() * d);
+                if d > cutoff - 1. {
+                    worst_at_cutoff = worst_at_cutoff.max(force_error);
+                }
+            }
+            assert!(
+                worst_force < 1e-6,
+                "rc {cutoff} rtol {rtol}: {worst_force:e}"
+            );
+            assert!(
+                worst_energy < 5e-7,
+                "rc {cutoff} rtol {rtol}: {worst_energy:e}"
+            );
+            assert!(worst_at_cutoff < 1e-6);
+        }
+        // The fit degrades with alpha * rc and is refused before it is poor.
+        assert!(EwaldKernel::new(4.0 / 9.0, 9.0).is_ok());
+        assert!(EwaldKernel::new(5.0 / 9.0, 9.0).is_err());
+        assert!(EwaldKernel::new(0., 9.0).is_err());
+        assert!(EwaldKernel::new(f64::NAN, 9.0).is_err());
+        let system = solvated(6.0, false);
+        assert!(ClusterPairEngine::new_pme(&system, 4.0, 1.5, 3.0).is_err());
+        let engine = ClusterPairEngine::new(&system, 4.0, 1.5, 78.5).unwrap();
+        assert_eq!(engine.ewald_alpha(), None);
+        assert_eq!(engine.ewald_pair_error(), None);
+    }
+
+    #[test]
+    fn cluster_pme_matches_the_reference_pme_hamiltonian() {
+        let system = solvated(6.0, false);
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let mut coordinates = system.coordinates();
+        jitter(&mut coordinates, 13, 0.3);
+        let cutoff = 7.0;
+        let parameters =
+            crate::pme::PmeParameters::for_box(&box_vec, cutoff, 1e-5, 1.0, 4).unwrap();
+        let alpha = parameters.alpha_per_angstrom;
+        let field = PbcForceField::new(&system, vec![]).unwrap();
+        let mut pme = crate::pme::PmeEngine::new(&system, parameters).unwrap();
+        let wrapped: Vec<Vec3> = coordinates.iter().map(|p| box_vec.wrap(*p)).collect();
+        let list = PbcNeighborList::build(&wrapped, &box_vec, cutoff, 1.5).unwrap();
+        let reference = field
+            .evaluate_pme(&mut pme, &coordinates, &box_vec, &list.pairs, cutoff)
+            .unwrap();
+        let mut engine = ClusterPairEngine::new_pme(&system, cutoff, 1.5, alpha).unwrap();
+        let fast = field
+            .evaluate_with_cluster_pme(
+                &mut engine,
+                &mut pme,
+                &coordinates,
+                &box_vec,
+                0.,
+                false,
+                true,
+            )
+            .unwrap();
+        let (want, got) = (reference.components, fast.components);
+        assert_eq!(got.bonds, want.bonds);
+        assert!((got.van_der_waals - want.van_der_waals).abs() <= 1e-4 * want.van_der_waals.abs());
+        assert!(
+            (got.electrostatics - want.electrostatics).abs() <= 1e-5 * want.electrostatics.abs(),
+            "electrostatics {} vs {}",
+            got.electrostatics,
+            want.electrostatics
+        );
+        for (got, want) in [
+            (fast.virial, reference.virial),
+            (fast.virial_terms[3], reference.virial_terms[3]),
+            (fast.virial_pair_split[1], reference.virial_pair_split[1]),
+        ] {
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(10.),
+                "{got} vs {want}"
+            );
+        }
+        let mut error2 = 0.;
+        let mut reference2 = 0.;
+        for (g, w) in fast.gradients.iter().zip(&reference.gradients) {
+            for (got, want) in [(g.x, w.x), (g.y, w.y), (g.z, w.z)] {
+                error2 += (got - want).powi(2);
+                reference2 += want * want;
+            }
+        }
+        assert!((error2 / reference2).sqrt() < 2e-5);
+        // Force-only steps: same gradients, no pair observables.
+        let silent = field
+            .evaluate_with_cluster_pme(
+                &mut engine,
+                &mut pme,
+                &coordinates,
+                &box_vec,
+                0.,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(silent.gradients, fast.gradients);
+        assert_eq!(silent.components.electrostatics, 0.);
+        // Engines of the other mode or another alpha are refused.
+        let mut reaction_field = ClusterPairEngine::new(&system, cutoff, 1.5, 78.5).unwrap();
+        let mut other = ClusterPairEngine::new_pme(&system, cutoff, 1.5, 1.1 * alpha).unwrap();
+        for wrong in [&mut reaction_field, &mut other] {
+            assert!(
+                field
+                    .evaluate_with_cluster_pme(
+                        wrong,
+                        &mut pme,
+                        &coordinates,
+                        &box_vec,
+                        0.,
+                        false,
+                        true
+                    )
+                    .is_err()
+            );
         }
     }
 }

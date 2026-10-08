@@ -26,6 +26,11 @@ Mode 2 (`--reference converged.json`): compare the Ewald part of one GlySys
 evaluation with another one (finer grid, larger cutoff), to measure the
 accuracy of a production setting.
 
+Mode 3 (`--prmtop system.prmtop --minimize relaxed.json`): relax the
+configuration with OpenMM's minimizer (CPU platform, same PME settings) and
+write it for `pme_snapshot --coordinates relaxed.json`, so that the
+comparisons above can also be made on a configuration without clashes.
+
 Exits nonzero when a tolerance in TOL is exceeded; always prints the report.
 """
 import argparse
@@ -56,7 +61,80 @@ def compare_forces(ours, theirs):
     }
 
 
-def openmm_parity(run, prmtop_path, platform_name):
+def build_system(prmtop, run, zero_particle_charges=False, zero_exception_charges=False):
+    """The GlySys Hamiltonian in OpenMM, with PME forced onto the GlySys settings."""
+    import openmm as mm
+    from openmm import app, unit
+
+    system = prmtop.createSystem(
+        nonbondedMethod=app.PME,
+        nonbondedCutoff=run["cutoffAngstrom"] / 10.0 * unit.nanometer,
+        constraints=None,
+        rigidWater=False,
+        removeCMMotion=False,
+    )
+    nb = [f for f in system.getForces() if isinstance(f, mm.NonbondedForce)][0]
+    nb.setUseSwitchingFunction(False)
+    nb.setUseDispersionCorrection(False)
+    nb.setPMEParameters(run["pme"]["alphaPerAngstrom"] * 10.0, *run["pme"]["grid"])
+    if zero_particle_charges:
+        for i in range(nb.getNumParticles()):
+            _, sigma, epsilon = nb.getParticleParameters(i)
+            nb.setParticleParameters(i, 0.0, sigma, epsilon)
+    if zero_exception_charges:
+        for i in range(nb.getNumExceptions()):
+            a, b, _, sigma, epsilon = nb.getExceptionParameters(i)
+            nb.setExceptionParameters(i, a, b, 0.0, sigma, epsilon)
+    for force in system.getForces():
+        group = {"HarmonicBondForce": 0, "HarmonicAngleForce": 1,
+                 "PeriodicTorsionForce": 2, "NonbondedForce": 3}.get(
+                     force.__class__.__name__, 4)
+        force.setForceGroup(group)
+    return system, nb
+
+
+def make_context(system, run, platform_name, threads=None):
+    import openmm as mm
+
+    platform = mm.Platform.getPlatformByName(platform_name)
+    properties = {"Threads": str(threads)} if platform_name == "CPU" and threads else {}
+    context = mm.Context(system, mm.VerletIntegrator(0.001), platform, properties)
+    lx, ly, lz = (v / 10.0 for v in run["boxAngstrom"])
+    context.setPeriodicBoxVectors(mm.Vec3(lx, 0, 0), mm.Vec3(0, ly, 0), mm.Vec3(0, 0, lz))
+    context.setPositions(np.array(run["coordinates"]) / 10.0)
+    return context
+
+
+def minimize(run, prmtop_path, out_path, iterations, threads):
+    """Relax the configuration and write it for `pme_snapshot --coordinates`."""
+    import openmm as mm
+    from openmm import app, unit
+
+    kcal = unit.kilocalories_per_mole
+    system, _ = build_system(app.AmberPrmtopFile(prmtop_path), run)
+    context = make_context(system, run, "CPU", threads)
+    before = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(kcal)
+    mm.LocalEnergyMinimizer.minimize(context, tolerance=10.0, maxIterations=iterations)
+    # Positions are not wrapped, so molecules stay whole.
+    state = context.getState(getEnergy=True, getPositions=True)
+    after = state.getPotentialEnergy().value_in_unit(kcal)
+    coordinates = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    report = {
+        "schemaVersion": 1,
+        "mode": "minimize",
+        "openmmVersion": mm.__version__,
+        "iterations": iterations,
+        "energyBeforeKcalMol": before,
+        "energyAfterKcalMol": after,
+        "boxAngstrom": run["boxAngstrom"],
+        "failures": [],
+    }
+    with open(out_path, "w") as handle:
+        json.dump({**report, "coordinates": coordinates.tolist()}, handle)
+    return report
+
+
+def openmm_parity(run, prmtop_path, platform_name, threads):
     import openmm as mm
     from openmm import app, unit
 
@@ -69,41 +147,11 @@ def openmm_parity(run, prmtop_path, platform_name):
     kcal = unit.kilocalories_per_mole
     prmtop = app.AmberPrmtopFile(prmtop_path)
 
-    def build(zero_particle_charges=False, zero_exception_charges=False):
-        system = prmtop.createSystem(
-            nonbondedMethod=app.PME,
-            nonbondedCutoff=run["cutoffAngstrom"] / 10.0 * unit.nanometer,
-            constraints=None,
-            rigidWater=False,
-            removeCMMotion=False,
-        )
-        nb = [f for f in system.getForces() if isinstance(f, mm.NonbondedForce)][0]
-        nb.setUseSwitchingFunction(False)
-        nb.setUseDispersionCorrection(False)
-        nb.setPMEParameters(alpha_nm, *grid)
-        if zero_particle_charges:
-            for i in range(nb.getNumParticles()):
-                _, sigma, epsilon = nb.getParticleParameters(i)
-                nb.setParticleParameters(i, 0.0, sigma, epsilon)
-        if zero_exception_charges:
-            for i in range(nb.getNumExceptions()):
-                a, b, _, sigma, epsilon = nb.getExceptionParameters(i)
-                nb.setExceptionParameters(i, a, b, 0.0, sigma, epsilon)
-        for force in system.getForces():
-            group = {"HarmonicBondForce": 0, "HarmonicAngleForce": 1,
-                     "PeriodicTorsionForce": 2, "NonbondedForce": 3}.get(
-                         force.__class__.__name__, 4)
-            force.setForceGroup(group)
-        return system, nb
-
-    positions = np.array(run["coordinates"]) / 10.0
-    lx, ly, lz = (v / 10.0 for v in run["boxAngstrom"])
-    platform = mm.Platform.getPlatformByName(platform_name)
+    def build(**zeroed):
+        return build_system(prmtop, run, **zeroed)
 
     def evaluate(system, nb, groups=(0, 1, 2, 3)):
-        context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
-        context.setPeriodicBoxVectors(mm.Vec3(lx, 0, 0), mm.Vec3(0, ly, 0), mm.Vec3(0, 0, lz))
-        context.setPositions(positions)
+        context = make_context(system, run, platform_name, threads)
         out = {"pmeInContext": list(nb.getPMEParametersInContext(context))}
         for g in groups:
             out[g] = context.getState(getEnergy=True, groups={g}).getPotentialEnergy().value_in_unit(kcal)
@@ -195,13 +243,19 @@ def main():
     parser.add_argument("--prmtop", help="Amber topology of the same system (OpenMM parity)")
     parser.add_argument("--reference", help="converged pme_snapshot JSON (accuracy of a setting)")
     parser.add_argument("--platform", default="Reference", choices=["Reference", "CPU"])
+    parser.add_argument("--minimize", metavar="OUT_JSON",
+                        help="with --prmtop: write an OpenMM-minimized configuration instead")
+    parser.add_argument("--iterations", type=int, default=2000, help="minimizer iterations")
+    parser.add_argument("--threads", type=int, default=8, help="threads of the CPU platform")
     parser.add_argument("--report", help="also write the report JSON to this file")
     args = parser.parse_args()
     if bool(args.prmtop) == bool(args.reference):
         parser.error("give exactly one of --prmtop and --reference")
     run = json.load(open(args.glysys_json))
-    if args.prmtop:
-        report = openmm_parity(run, args.prmtop, args.platform)
+    if args.minimize:
+        report = minimize(run, args.prmtop, args.minimize, args.iterations, args.threads)
+    elif args.prmtop:
+        report = openmm_parity(run, args.prmtop, args.platform, args.threads)
     else:
         report = glysys_convergence(run, json.load(open(args.reference)))
     text = json.dumps(report, indent=2)
