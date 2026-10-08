@@ -31,6 +31,9 @@ use std::collections::BTreeMap;
 
 const LANES: usize = 8;
 const CHUNKS_PER_THREAD: usize = 4;
+/// Fewest atoms a parallel task of a per-atom loop takes: these loops are a
+/// few nanoseconds per atom, less than the cost of handing out a task.
+const PER_ATOM_TASK: usize = 512;
 const SORT_CELL_ANGSTROM: f64 = 3.0;
 const MAX_SORT_BITS: u32 = 7;
 /// Polynomial terms of the Ewald direct-space corrections.
@@ -251,6 +254,31 @@ pub struct ClusterPairEngine {
     sorted: Vec<[f32; 4]>,
     sorted_lj: Vec<[f32; 2]>,
     buffers: Vec<Vec<[f32; 3]>>,
+    plan: WorkPlan,
+}
+
+/// How an evaluation is divided among workers. It depends on the lists and
+/// on the size of the thread pool only, so it is kept until either changes.
+///
+/// Every chunk of clusters adds forces into a buffer of its own. A chunk
+/// reaches its own atoms and their listed partners, a small part of the
+/// system, so the plan records which slots each chunk writes and, for every
+/// slot, which chunks write it. Clearing and combining the buffers then cost
+/// in proportion to the pair list, not to atoms times chunks.
+#[derive(Clone, Debug, Default)]
+struct WorkPlan {
+    workers: usize,
+    /// `rebuilds` of the lists this plan was made for.
+    lists: u64,
+    /// Chunk `c` evaluates clusters `bounds[c]..bounds[c + 1]`.
+    bounds: Vec<usize>,
+    /// Sorted slots chunk `c` writes.
+    touched: Vec<Vec<u32>>,
+    /// Chunks writing slot `s`, ascending: `writers[offsets[s]..offsets[s + 1]]`.
+    offsets: Vec<u32>,
+    writers: Vec<u32>,
+    /// Sorted slot of every atom.
+    rank: Vec<u32>,
 }
 
 impl ClusterPairEngine {
@@ -389,6 +417,7 @@ impl ClusterPairEngine {
             sorted: Vec::new(),
             sorted_lj: Vec::new(),
             buffers: Vec::new(),
+            plan: WorkPlan::default(),
         })
     }
 
@@ -425,13 +454,31 @@ impl ClusterPairEngine {
     }
 
     fn needs_rebuild(&self, wrapped: &[Vec3], box_vec: &BoxVectors) -> bool {
-        if self.box_at_build != Some(*box_vec) || self.reference.len() != wrapped.len() {
+        let Some(built) = self.box_at_build else {
+            return true;
+        };
+        if self.reference.len() != wrapped.len() {
             return true;
         }
-        let limit = (0.5 * self.skin).powi(2);
+        // A pair listed at separation r in the box of the build is now at
+        // least r - 2d - |dL| apart, with d the largest displacement and dL
+        // the change of the box lengths, so the lists hold while
+        // 2d + |dL| stays inside the skin. A barostat changes the box by a
+        // part in 10^5 at a time, far less than the skin; the margin on
+        // |dL| covers atoms re-imaged across the changed box.
+        let change = {
+            let (now, then) = (box_vec.as_array(), built.as_array());
+            (0..3).map(|d| (now[d] - then[d]).powi(2)).sum::<f64>().sqrt()
+        };
+        let allowance = 0.5 * (self.skin - 3.0 * change);
+        if allowance <= 0. {
+            return true;
+        }
+        let limit = allowance * allowance;
         wrapped
             .par_iter()
             .zip(self.reference.par_iter())
+            .with_min_len(PER_ATOM_TASK)
             .any(|(p, r)| {
                 let d = box_vec.displacement(*p, *r);
                 d.x * d.x + d.y * d.y + d.z * d.z > limit
@@ -657,6 +704,73 @@ impl ClusterPairEngine {
         Ok(())
     }
 
+    /// The division of the current lists among `workers` chunks.
+    fn work_plan(&self, workers: usize) -> WorkPlan {
+        let clusters = self.clusters.len();
+        let slots = self.order.len();
+        let total_work: usize = self.list_len() + clusters * LANES;
+        let mut bounds = Vec::with_capacity(workers + 1);
+        bounds.push(0usize);
+        let mut acc = 0usize;
+        let mut next = 1usize;
+        for (index, list) in self.lists.iter().enumerate() {
+            acc += list.atoms.len() + LANES;
+            while next < workers && acc * workers >= total_work * next {
+                bounds.push(index + 1);
+                next += 1;
+            }
+        }
+        while bounds.len() <= workers {
+            bounds.push(clusters);
+        }
+        let lists = &self.lists;
+        let touched: Vec<Vec<u32>> = (0..workers)
+            .into_par_iter()
+            .map(|chunk| {
+                let mut slots_of_chunk = Vec::new();
+                for index in bounds[chunk]..bounds[chunk + 1] {
+                    slots_of_chunk.extend((index * LANES..(index + 1) * LANES).map(|s| s as u32));
+                    slots_of_chunk.extend_from_slice(&lists[index].atoms);
+                }
+                slots_of_chunk.sort_unstable();
+                slots_of_chunk.dedup();
+                slots_of_chunk
+            })
+            .collect();
+        let mut offsets = vec![0u32; slots + 1];
+        for chunk in &touched {
+            for &slot in chunk {
+                offsets[slot as usize + 1] += 1;
+            }
+        }
+        for slot in 0..slots {
+            offsets[slot + 1] += offsets[slot];
+        }
+        let mut writers = vec![0u32; offsets[slots] as usize];
+        let mut cursor = offsets.clone();
+        for (chunk, slots_of_chunk) in touched.iter().enumerate() {
+            for &slot in slots_of_chunk {
+                writers[cursor[slot as usize] as usize] = chunk as u32;
+                cursor[slot as usize] += 1;
+            }
+        }
+        let mut rank = vec![0u32; self.n];
+        for (slot, &atom) in self.order.iter().enumerate() {
+            if atom != u32::MAX {
+                rank[atom as usize] = slot as u32;
+            }
+        }
+        WorkPlan {
+            workers,
+            lists: self.rebuilds,
+            bounds,
+            touched,
+            offsets,
+            writers,
+            rank,
+        }
+    }
+
     /// Add pair and 1-4 exception gradients for unwrapped coordinates to
     /// `gradients` and return the nonbonded totals. Energies and virials are
     /// accumulated only when `observables` is set.
@@ -679,7 +793,11 @@ impl ClusterPairEngine {
         {
             return Err(EnergyError::NonFiniteCoordinate);
         }
-        let wrapped: Vec<Vec3> = coordinates.par_iter().map(|p| box_vec.wrap(*p)).collect();
+        let wrapped: Vec<Vec3> = coordinates
+            .par_iter()
+            .with_min_len(PER_ATOM_TASK)
+            .map(|p| box_vec.wrap(*p))
+            .collect();
         if self.needs_rebuild(&wrapped, box_vec) {
             self.rebuild(&wrapped, box_vec)?;
         }
@@ -689,6 +807,7 @@ impl ClusterPairEngine {
         self.sorted
             .par_iter_mut()
             .zip(order.par_iter())
+            .with_min_len(PER_ATOM_TASK)
             .for_each(|(slot, &atom)| {
                 *slot = if atom == u32::MAX {
                     [0.0; 4]
@@ -705,22 +824,11 @@ impl ClusterPairEngine {
         let threads = rayon::current_num_threads().max(1);
         let memory_cap = ((256usize << 20) / (12 * self.order.len().max(1))).max(threads);
         let workers = (CHUNKS_PER_THREAD * threads).min(memory_cap).max(1);
-        let clusters = self.clusters.len();
-        let total_work: usize = self.list_len() + clusters * LANES;
-        let mut bounds = Vec::with_capacity(workers + 1);
-        bounds.push(0usize);
-        let mut acc = 0usize;
-        let mut next = 1usize;
-        for (index, list) in self.lists.iter().enumerate() {
-            acc += list.atoms.len() + LANES;
-            while next < workers && acc * workers >= total_work * next {
-                bounds.push(index + 1);
-                next += 1;
-            }
+        if self.plan.workers != workers || self.plan.lists != self.rebuilds {
+            self.plan = self.work_plan(workers);
         }
-        while bounds.len() <= workers {
-            bounds.push(clusters);
-        }
+        let plan = &self.plan;
+        let bounds = &plan.bounds;
         let slots = order.len();
         if self.buffers.len() != workers || self.buffers.first().is_some_and(|b| b.len() != slots) {
             self.buffers = (0..workers).map(|_| vec![[0.0f32; 3]; slots]).collect();
@@ -742,7 +850,9 @@ impl ClusterPairEngine {
             .par_iter_mut()
             .enumerate()
             .map(|(chunk, buffer)| {
-                buffer.fill([0.0; 3]);
+                for &slot in &plan.touched[chunk] {
+                    buffer[slot as usize] = [0.0; 3];
+                }
                 let mut totals = [0.0f64; 5];
                 let range = bounds[chunk]..bounds[chunk + 1];
                 for (cluster, data) in cluster_list[range.clone()].iter().enumerate() {
@@ -772,20 +882,18 @@ impl ClusterPairEngine {
             totals.virial_pair_split[1] += chunk[2] - chunk[3];
         }
         let buffers = &self.buffers;
-        // Map sorted slots back to atoms, combining chunks in order.
-        let mut rank = vec![0u32; self.n];
-        for (slot, &atom) in order.iter().enumerate() {
-            if atom != u32::MAX {
-                rank[atom as usize] = slot as u32;
-            }
-        }
+        // Map sorted slots back to atoms, combining the chunks that wrote a
+        // slot in chunk order.
         gradients
             .par_iter_mut()
-            .zip(rank.par_iter())
+            .zip(plan.rank.par_iter())
+            .with_min_len(PER_ATOM_TASK)
             .for_each(|(gradient, &slot)| {
                 let mut sum = [0.0f64; 3];
-                for buffer in buffers {
-                    let value = buffer[slot as usize];
+                let writers = plan.offsets[slot as usize] as usize
+                    ..plan.offsets[slot as usize + 1] as usize;
+                for &chunk in &plan.writers[writers] {
+                    let value = buffers[chunk as usize][slot as usize];
                     sum[0] += f64::from(value[0]);
                     sum[1] += f64::from(value[1]);
                     sum[2] += f64::from(value[2]);
@@ -1702,6 +1810,84 @@ mod tests {
         engine
             .evaluate_into(&coordinates, &box_vec, &mut second, false)
             .unwrap();
+        assert_eq!(engine.rebuild_count(), 2);
+    }
+
+    #[test]
+    fn lists_survive_the_small_box_changes_of_a_barostat() {
+        // A barostat scales the box and every coordinate by a part in 10^4
+        // or less per step. The lists of the old box still hold every pair
+        // inside the cutoff, so the forces have to equal those of an engine
+        // that builds its lists in the new box.
+        let system = solvated(9.0, true);
+        let box_vec = BoxVectors::from_system(&system).unwrap();
+        let mut coordinates = system.coordinates();
+        jitter(&mut coordinates, 5, 0.2);
+        let zeros = || {
+            vec![
+                Vec3 {
+                    x: 0.,
+                    y: 0.,
+                    z: 0.
+                };
+                system.atom_count()
+            ]
+        };
+        let mut engine = ClusterPairEngine::new(&system, 9.0, 1.5, 78.5).unwrap();
+        engine
+            .evaluate_into(&coordinates, &box_vec, &mut zeros(), false)
+            .unwrap();
+        let mut scale = 1.0;
+        for _ in 0..5 {
+            scale *= 1.0 - 2e-4;
+        }
+        let small = BoxVectors::new(box_vec.x * scale, box_vec.y * scale, box_vec.z * scale).unwrap();
+        let scaled: Vec<Vec3> = coordinates
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x * scale,
+                y: p.y * scale,
+                z: p.z * scale,
+            })
+            .collect();
+        let mut kept = zeros();
+        let kept_totals = engine.evaluate_into(&scaled, &small, &mut kept, true).unwrap();
+        assert_eq!(engine.rebuild_count(), 1, "a 0.1% box change kept the lists");
+        let mut fresh_engine = ClusterPairEngine::new(&system, 9.0, 1.5, 78.5).unwrap();
+        let mut fresh = zeros();
+        let fresh_totals = fresh_engine
+            .evaluate_into(&scaled, &small, &mut fresh, true)
+            .unwrap();
+        let scale_of = |values: &[Vec3]| {
+            (values.iter().map(|g| g.x * g.x + g.y * g.y + g.z * g.z).sum::<f64>()
+                / values.len() as f64)
+                .sqrt()
+        };
+        let difference: Vec<Vec3> = kept
+            .iter()
+            .zip(&fresh)
+            .map(|(a, b)| Vec3 {
+                x: a.x - b.x,
+                y: a.y - b.y,
+                z: a.z - b.z,
+            })
+            .collect();
+        assert!(scale_of(&difference) < 1e-5 * scale_of(&fresh));
+        assert!(
+            (kept_totals.electrostatics - fresh_totals.electrostatics).abs()
+                < 1e-5 * fresh_totals.electrostatics.abs()
+        );
+        // A change that uses up the skin forces new lists.
+        let far = BoxVectors::new(box_vec.x * 0.98, box_vec.y * 0.98, box_vec.z * 0.98).unwrap();
+        let shrunk: Vec<Vec3> = coordinates
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x * 0.98,
+                y: p.y * 0.98,
+                z: p.z * 0.98,
+            })
+            .collect();
+        engine.evaluate_into(&shrunk, &far, &mut zeros(), false).unwrap();
         assert_eq!(engine.rebuild_count(), 2);
     }
 
