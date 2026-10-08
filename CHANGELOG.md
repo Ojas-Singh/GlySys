@@ -31,6 +31,12 @@
   only (`analysis::rmsd_atoms`): water and single-atom ions are left out. In a
   water box it used to measure the solvent's diffusion. Add
   `ParameterizedSystem::solute_atom_count`.
+- Fix a data race in the tiled explicit kernels that made them wrong on Metal
+  (Safari): the sorted slots of four atoms shared one `vec4` and were stored
+  one component at a time, so slots were lost, far exclusions (disulfides,
+  glycan and other inter-residue links) were not applied, and bonded atoms
+  repelled each other. Each atom now has its own element. Other devices were
+  not affected.
 - In a browser, `GpuContext::uncaptured_errors` keeps what the device raised
   outside an error scope (a shader the browser's compiler rejected leaves an
   invalid pipeline whose passes silently do nothing).

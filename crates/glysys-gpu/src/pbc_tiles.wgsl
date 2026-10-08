@@ -79,11 +79,14 @@ fn min_image(d: vec3<f32>) -> vec3<f32> {
 fn position(atom: u32) -> vec3<f32> { return sys[2u * atom + 1u].xyz; }
 
 // `blocks` holds two vec4 per block, one cached sorted position per slot,
-// then the sorted slot of every atom packed four per vec4.
+// then the sorted slot of every atom, one element each (x: the slot's bits).
+// The slots must not share an element: a store to one component of a vector
+// may rewrite the whole vector, so two invocations writing different
+// components of one vec4 race, and on Metal the loser's slot is lost. Each
+// atom's element is written whole by the one invocation that owns the atom.
 fn sorted_idx(slot: u32) -> u32 { return 2u * n_blocks() + slot; }
-fn rank_of(atom: u32) -> u32 {
-  return bitcast<u32>(blocks[34u * n_blocks() + atom / 4u][atom % 4u]);
-}
+fn rank_idx(atom: u32) -> u32 { return 34u * n_blocks() + atom; }
+fn rank_of(atom: u32) -> u32 { return bitcast<u32>(blocks[rank_idx(atom)].x); }
 
 fn order_at(slot: u32) -> u32 { return atomicLoad(&work[tc.work.x + slot]); }
 
@@ -378,7 +381,7 @@ fn block_bounds(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocati
     atomicStore(&work[k + 1u], bits.y);
     atomicStore(&work[k + 2u], bits.z);
     cached = vec4<f32>(p, bitcast<f32>(atom));
-    blocks[34u * n_blocks() + atom / 4u][atom % 4u] = bitcast<f32>(32u * block + lid);
+    blocks[rank_idx(atom)] = vec4<f32>(bitcast<f32>(32u * block + lid), 0.0, 0.0, 0.0);
   }
   // Sorted copy of the rebuild positions (w = atom index bits, all-ones for
   // padding) so tile building reads candidate blocks contiguously and
@@ -736,9 +739,11 @@ fn nb_tiles(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_i
     }
     workgroupBarrier();
   }
-  pair_red[lid] = vec4<f32>(gradient, 0.0);
+  // One whole-element store per lane (see `rank_idx` on component stores).
+  var reduced = vec4<f32>(gradient, 0.0);
+  if (COMPUTE_ENERGY) { reduced.w = evaluated; }
+  pair_red[lid] = reduced;
   pair_red2[lid] = vec4<f32>(e_lj, e_rf, virial, pair_virial);
-  if (COMPUTE_ENERGY) { pair_red[lid].w = evaluated; }
   workgroupBarrier();
   if (quarter == 0u) {
     let total = ((pair_red[lane] + pair_red[lane + 32u]) + pair_red[lane + 64u]) + pair_red[lane + 96u];
