@@ -25,8 +25,12 @@
 use super::{Result, SimulationProtocol, invalid};
 use serde::{Deserialize, Serialize};
 
-/// GROMACS' default `nsttcouple` and `nstpcouple`.
-pub const DEFAULT_COUPLING_INTERVAL: usize = 10;
+/// Longest interval between thermostat updates, when the coupling time
+/// allows it: GROMACS 2026 chooses `nsttcouple` this way (25 steps for a
+/// 1 ps coupling time and a 2 fs step).
+pub const LONGEST_TEMPERATURE_INTERVAL: usize = 100;
+/// GROMACS' default `nstpcouple`.
+pub const DEFAULT_PRESSURE_INTERVAL: usize = 10;
 /// GROMACS' default `nstcomm`.
 pub const DEFAULT_COM_REMOVAL_INTERVAL: usize = 100;
 pub const DEFAULT_PRESSURE_TAU_PS: f64 = 5.0;
@@ -273,6 +277,7 @@ impl CouplingPlan {
         let shortest_tau = groups.iter().map(|g| g.tau_ps).fold(f64::INFINITY, f64::min);
         let temperature_interval = interval(
             protocol.temperature_coupling_interval,
+            LONGEST_TEMPERATURE_INTERVAL,
             shortest_tau,
             dt_ps,
             "temperature",
@@ -282,6 +287,7 @@ impl CouplingPlan {
         let pressure_interval = if has_pressure_coupling {
             interval(
                 protocol.pressure_coupling_interval,
+                DEFAULT_PRESSURE_INTERVAL,
                 pressure_tau_ps,
                 dt_ps,
                 "pressure",
@@ -289,7 +295,7 @@ impl CouplingPlan {
         } else {
             protocol
                 .pressure_coupling_interval
-                .unwrap_or(DEFAULT_COUPLING_INTERVAL)
+                .unwrap_or(DEFAULT_PRESSURE_INTERVAL)
         };
         let compressibility_per_bar = protocol
             .pressure_compressibility_bar_inverse
@@ -377,14 +383,20 @@ impl CouplingPlan {
 
 /// Coupling interval: the requested one if it resolves the coupling period,
 /// otherwise the default shortened to do so.
-fn interval(requested: Option<usize>, tau_ps: f64, dt_ps: f64, what: &str) -> Result<usize> {
+fn interval(
+    requested: Option<usize>,
+    default: usize,
+    tau_ps: f64,
+    dt_ps: f64,
+    what: &str,
+) -> Result<usize> {
     let longest = ((tau_ps / (STEPS_PER_PERIOD * dt_ps)).floor() as usize).max(1);
     match requested {
         Some(steps) if steps > longest => Err(invalid(format!(
             "{what} coupling every {steps} steps is too coarse for tau = {tau_ps} ps; use at most {longest}"
         ))),
         Some(steps) => Ok(steps),
-        None => Ok(DEFAULT_COUPLING_INTERVAL.min(longest)),
+        None => Ok(default.min(longest)),
     }
 }
 
@@ -443,7 +455,8 @@ mod tests {
         // waters: 2 x (9 - 3) - 3; solute: 15 - 1 - 3
         assert!((plan.groups[0].degrees_of_freedom - 9.).abs() < 1e-12);
         assert!((plan.groups[1].degrees_of_freedom - 11.).abs() < 1e-12);
-        assert_eq!(plan.temperature_interval, 10);
+        // tau = 1 ps at 2 fs: 500 steps per period, 20 updates in each
+        assert_eq!(plan.temperature_interval, 25);
         assert_eq!(plan.com_interval, 100);
 
         let mut whole = protocol();
@@ -480,6 +493,9 @@ mod tests {
         assert_eq!(plan.temperature_interval, 5);
         fast.temperature_coupling_interval = Some(10);
         assert!(CouplingPlan::new(&fast, &is_water, &constraints).is_err());
+        fast.temperature_coupling_interval = Some(2);
+        let plan = CouplingPlan::new(&fast, &is_water, &constraints).unwrap();
+        assert_eq!(plan.temperature_interval, 2);
         assert!(CouplingPlan::acts_on(1, 10) && CouplingPlan::acts_on(11, 10));
         assert!(!CouplingPlan::acts_on(0, 10) && !CouplingPlan::acts_on(10, 10));
         assert!(CouplingPlan::acts_on(0, 1));

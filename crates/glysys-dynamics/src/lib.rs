@@ -269,10 +269,11 @@ pub struct SimulationProtocol {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub com_groups: Vec<String>,
     /// Steps between Nose–Hoover updates (GROMACS `nsttcouple`). Absent
-    /// means 10, or fewer when the coupling time needs it.
+    /// means twenty updates per coupling time, at most 100 steps apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_coupling_interval: Option<usize>,
     /// Steps between Parrinello–Rahman updates (GROMACS `nstpcouple`).
+    /// Absent means 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure_coupling_interval: Option<usize>,
     /// Steps between removals of center-of-mass motion (GROMACS `nstcomm`).
