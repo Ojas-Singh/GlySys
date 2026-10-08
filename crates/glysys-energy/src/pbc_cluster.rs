@@ -618,23 +618,65 @@ impl ClusterPairEngine {
                     ranges[axis] = (low, low + span - 1);
                 }
                 let g = i64::from(grid);
+                // A cell index outside 0..grid is a periodic image: its atoms
+                // are that many box lengths away. When the scanned range does
+                // not wrap onto itself this is the nearest image, and it
+                // replaces a rounding per atom; a range clipped to the whole
+                // box falls back to the minimum-image vector.
+                let images = (0..3).all(|axis| ranges[axis].1 - ranges[axis].0 + 1 < g);
+                // Distance from the cluster's box to the slab of cells with
+                // one index; cells further than the list radius hold no
+                // partner and are skipped (a little under half of the cube).
+                const MARGIN: f64 = 1e-6;
+                let gap = |axis: usize, index: i64| -> f64 {
+                    let low = index as f64 * cell_size[axis];
+                    let high = low + cell_size[axis];
+                    ((center[axis] - half[axis]) - high)
+                        .max(low - (center[axis] + half[axis]))
+                        .max(0.)
+                        - MARGIN
+                };
                 for x in ranges[0].0..=ranges[0].1 {
+                    let gap_x = if images { gap(0, x).max(0.) } else { 0. };
+                    if gap_x * gap_x >= radius2 {
+                        continue;
+                    }
+                    let shift_x = x.div_euclid(g) as f64 * lengths[0] - center[0];
                     for y in ranges[1].0..=ranges[1].1 {
+                        let gap_y = if images { gap(1, y).max(0.) } else { 0. };
+                        let gap_xy = gap_x * gap_x + gap_y * gap_y;
+                        if gap_xy >= radius2 {
+                            continue;
+                        }
+                        let shift_y = y.div_euclid(g) as f64 * lengths[1] - center[1];
                         for z in ranges[2].0..=ranges[2].1 {
+                            let gap_z = if images { gap(2, z).max(0.) } else { 0. };
+                            if gap_xy + gap_z * gap_z >= radius2 {
+                                continue;
+                            }
+                            let shift_z = z.div_euclid(g) as f64 * lengths[2] - center[2];
                             let index = ((x.rem_euclid(g) * g + y.rem_euclid(g)) * g
                                 + z.rem_euclid(g)) as usize;
                             let key = cell_key[index] as usize;
                             let first = cell_start[key].max(((cluster + 1) * LANES) as u32);
                             for slot in first..cell_start[key + 1].max(first) {
                                 let p = positions[slot as usize];
-                                let d = box_vec.displacement(
-                                    p,
+                                let d = if images {
                                     Vec3 {
-                                        x: center[0],
-                                        y: center[1],
-                                        z: center[2],
-                                    },
-                                );
+                                        x: p.x + shift_x,
+                                        y: p.y + shift_y,
+                                        z: p.z + shift_z,
+                                    }
+                                } else {
+                                    box_vec.displacement(
+                                        p,
+                                        Vec3 {
+                                            x: center[0],
+                                            y: center[1],
+                                            z: center[2],
+                                        },
+                                    )
+                                };
                                 let gx = (d.x.abs() - half[0]).max(0.);
                                 let gy = (d.y.abs() - half[1]).max(0.);
                                 let gz = (d.z.abs() - half[2]).max(0.);
@@ -736,16 +778,29 @@ impl ClusterPairEngine {
         let lists = &self.lists;
         let touched: Vec<Vec<u32>> = (0..workers)
             .into_par_iter()
-            .map(|chunk| {
-                let mut slots_of_chunk = Vec::new();
-                for index in bounds[chunk]..bounds[chunk + 1] {
-                    slots_of_chunk.extend((index * LANES..(index + 1) * LANES).map(|s| s as u32));
-                    slots_of_chunk.extend_from_slice(&lists[index].atoms);
-                }
-                slots_of_chunk.sort_unstable();
-                slots_of_chunk.dedup();
-                slots_of_chunk
-            })
+            .map_init(
+                || vec![false; slots],
+                |seen, chunk| {
+                    // mark, then read the marks back in slot order
+                    let (mut low, mut high) = (slots, 0usize);
+                    let mut mark = |slot: usize| {
+                        seen[slot] = true;
+                        low = low.min(slot);
+                        high = high.max(slot + 1);
+                    };
+                    for index in bounds[chunk]..bounds[chunk + 1] {
+                        (index * LANES..(index + 1) * LANES).for_each(&mut mark);
+                        lists[index].atoms.iter().for_each(|&slot| mark(slot as usize));
+                    }
+                    let mut slots_of_chunk = Vec::new();
+                    for slot in low..high {
+                        if std::mem::take(&mut seen[slot]) {
+                            slots_of_chunk.push(slot as u32);
+                        }
+                    }
+                    slots_of_chunk
+                },
+            )
             .collect();
         let mut offsets = vec![0u32; slots + 1];
         for chunk in &touched {
