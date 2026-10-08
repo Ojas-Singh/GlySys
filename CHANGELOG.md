@@ -20,6 +20,8 @@
 - Faster explicit CPU steps: force buffers combined over the slots a chunk
   writes, pair lists kept across small box changes and rebuilt faster, SETTLE
   solved in place, step buffers reused.
+- The preparation report lists a branched GLYCAM-Web glycan (letter-coded
+  branch residues written as ATOM records) as one glycan.
 - A barostat pressure computed from forces takes the virial of the truncated
   Lennard-Jones tail (`PbcForceField::dispersion_pressure_coefficient`).
 
