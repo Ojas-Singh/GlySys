@@ -903,7 +903,9 @@ impl<'a> PbcForceField<'a> {
     /// Lennard-Jones and the `erfc` direct-space sum inside `cutoff` from
     /// [`Self::evaluate`], plus the long-range part from `pme`, which must
     /// have been built for this system. The long-range energy is added to
-    /// `components.electrostatics` and its virial to the pair entries.
+    /// `components.electrostatics` and its virial to the pair entries. As
+    /// with reaction field, a 1-4 pair is only evaluated inside the cutoff,
+    /// which must therefore exceed every 1-4 distance.
     pub fn evaluate_pme(
         &self,
         pme: &mut crate::pme::PmeEngine,
