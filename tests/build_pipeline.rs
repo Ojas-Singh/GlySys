@@ -586,3 +586,27 @@ fn distance(first: [f64; 3], second: [f64; 3]) -> f64 {
         .sum::<f64>()
         .sqrt()
 }
+
+#[test]
+fn a_branched_glycam_web_glycan_is_reported_as_one_glycan() {
+    // GLYCAM-Web writes sugars as ATOM records and names a residue linked at
+    // two positions with a letter (UYB, VMA, VMB). The manifest has to list
+    // the molecule once, whole, not as the pieces between its branch points.
+    let options = BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..Default::default()
+    };
+    let system = SystemBuilder::new(options)
+        .unwrap()
+        .prepare_pdb_str(include_str!("fixtures/glycam_web_branched_n_glycan.pdb"))
+        .unwrap();
+    let glycans = &system.report().glycans;
+    assert_eq!(glycans.len(), 1, "{glycans:?}");
+    assert_eq!(glycans[0].residue_count, 10);
+    assert!(glycans[0].attachment_site.is_none());
+    assert_eq!(
+        glycans[0].wurcs,
+        "WURCS=2.0/5,10,9/[a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2122h-1a_1-5][a1221m-1a_1-5]/1-1-2-3-3-3-3-3-4-5/a4-b1_a6-j1_b4-c1_c3-d1_c6-e1_e3-f1_e6-g1_g2-h1_h3-i1"
+    );
+}
