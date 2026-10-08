@@ -6,6 +6,10 @@
 //! original parameter provenance.  The resolver makes the physical choices in
 //! an `.mdp` explicit and refuses settings that would silently change the
 //! Hamiltonian or integrator.
+//!
+//! A GOTW run is four parameter files: an energy minimisation, an NVT and an
+//! NPT equilibration, and the NPT production. [`recipe`] turns them into one
+//! protocol with a stage per dynamics file.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,6 +50,16 @@ pub struct ResolvedMdp {
     pub pbc: String,
     pub com_mode: String,
     pub com_groups: Vec<String>,
+    /// `nsttcouple`, `nstpcouple` and `nstcomm` when the file sets them
+    /// (GROMACS' own defaults apply otherwise).
+    pub temperature_coupling_interval_steps: Option<usize>,
+    pub pressure_coupling_interval_steps: Option<usize>,
+    pub com_removal_interval_steps: Option<usize>,
+    /// `fourierspacing` (converted to angstrom), `pme-order` and
+    /// `ewald-rtol` when the file sets them.
+    pub fourier_spacing_angstrom: Option<f64>,
+    pub pme_order: Option<usize>,
+    pub ewald_tolerance: Option<f64>,
     /// Every parsed key/value is retained for audit output.  This makes a
     /// resolved run reproducible without depending on the source file later.
     pub raw: BTreeMap<String, String>,
@@ -100,9 +114,41 @@ fn equal_f64(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1.0e-9 * a.abs().max(b.abs()).max(1.0)
 }
 
-/// Parse a GROMACS parameter file and enforce the subset whose semantics are
-/// needed by the GOTW compatibility profile.
-pub fn parse(path: &Path) -> Result<ResolvedMdp> {
+/// An energy-minimisation parameter file. GlySys minimises with L-BFGS
+/// whatever the file's `integrator`; only the step limit is taken from it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Minimization {
+    pub source: String,
+    pub integrator: String,
+    pub steps: usize,
+    pub raw: BTreeMap<String, String>,
+}
+
+const MINIMIZERS: [&str; 3] = ["steep", "cg", "l-bfgs"];
+
+/// True when the file's `integrator` is an energy minimiser.
+pub fn is_minimization(path: &Path) -> Result<bool> {
+    let raw = read(path)?;
+    Ok(MINIMIZERS.contains(&value(&raw, "integrator")?.to_ascii_lowercase().as_str()))
+}
+
+pub fn parse_minimization(path: &Path) -> Result<Minimization> {
+    let raw = read(path)?;
+    let integrator = value(&raw, "integrator")?.to_ascii_lowercase();
+    if !MINIMIZERS.contains(&integrator.as_str()) {
+        bail!("{} is not an energy-minimisation recipe", path.display());
+    }
+    let steps = parse_usize(&raw, "nsteps")?;
+    Ok(Minimization {
+        source: path.display().to_string(),
+        integrator,
+        steps,
+        raw,
+    })
+}
+
+fn read(path: &Path) -> Result<BTreeMap<String, String>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading GROMACS mdp {}", path.display()))?;
     let mut raw = BTreeMap::new();
@@ -130,6 +176,34 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
             bail!("GROMACS .mdp contains duplicate key '{key}'");
         }
     }
+    Ok(raw)
+}
+
+/// GROMACS writes -1 for "use the default" in its interval settings.
+fn optional_interval(raw: &BTreeMap<String, String>, key: &str) -> Result<Option<usize>> {
+    let Some(value) = raw.get(key) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<i64>()
+        .with_context(|| format!("GROMACS .mdp key '{key}' must be an integer"))?;
+    Ok(usize::try_from(parsed).ok().filter(|steps| *steps > 0))
+}
+
+fn optional_f64(raw: &BTreeMap<String, String>, key: &str) -> Result<Option<f64>> {
+    raw.get(key)
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .with_context(|| format!("GROMACS .mdp key '{key}' must be a number"))
+        })
+        .transpose()
+}
+
+/// Parse a GROMACS dynamics parameter file and enforce the subset whose
+/// semantics are needed by the GOTW compatibility profile.
+pub fn parse(path: &Path) -> Result<ResolvedMdp> {
+    let raw = read(path)?;
 
     let integrator = value(&raw, "integrator")?.to_ascii_lowercase();
     if integrator != "md" {
@@ -176,14 +250,22 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
     if coulomb_type != "pme" {
         bail!("unsupported coulombtype='{coulomb_type}'; use the explicit PME path for GOTW");
     }
-    let vdw_type = value(&raw, "vdwtype")?.to_ascii_lowercase();
+    // The equilibration files of the recipe leave both at the GROMACS
+    // defaults: a plain cutoff whose potential is shifted to zero at the
+    // cutoff. The shift changes reported energies by a constant per pair and
+    // no force, so it is the same dynamics as `None`.
+    let vdw_type = raw
+        .get("vdwtype")
+        .map_or_else(|| "cut-off".to_owned(), |v| v.to_ascii_lowercase());
     if vdw_type != "cut-off" && vdw_type != "cutoff" {
         bail!("unsupported vdwtype='{vdw_type}' for the GOTW compatibility profile");
     }
-    let vdw_modifier = value(&raw, "vdw-modifier")?.to_ascii_lowercase();
-    if vdw_modifier != "none" {
+    let vdw_modifier = raw
+        .get("vdw-modifier")
+        .map_or_else(|| "potential-shift".to_owned(), |v| v.to_ascii_lowercase());
+    if vdw_modifier != "none" && vdw_modifier != "potential-shift" {
         bail!(
-            "unsupported vdw-modifier='{vdw_modifier}'; switching is intentionally disabled in the first GOTW profile"
+            "unsupported vdw-modifier='{vdw_modifier}'; force switching would change the dynamics"
         );
     }
     let dispersion_correction = value(&raw, "dispcorr")?.to_ascii_lowercase();
@@ -206,33 +288,50 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
     }
 
     let pressure_coupling = value(&raw, "pcoupl")?.to_ascii_lowercase();
-    if pressure_coupling != "parrinello-rahman" {
-        bail!(
-            "unsupported pcoupl='{pressure_coupling}'; the GOTW profile requires Parrinello-Rahman"
-        );
-    }
-    let pressure_coupling_type = value(&raw, "pcoupltype")?.to_ascii_lowercase();
-    if pressure_coupling_type != "isotropic" {
-        bail!(
-            "unsupported pcoupltype='{pressure_coupling_type}'; only isotropic coupling is in the first GOTW profile"
-        );
-    }
-    let pressure_tau_ps = Some(parse_f64(&raw, "tau-p")?);
-    let reference_pressure_bar = Some(parse_f64(&raw, "ref-p")?);
-    let compressibility_bar_inverse: Vec<f64> = parse_list(&raw, "compressibility")?;
-    if compressibility_bar_inverse.is_empty()
-        || compressibility_bar_inverse
-            .iter()
-            .any(|v| !v.is_finite() || *v <= 0.)
-    {
-        bail!("compressibility must contain positive finite values");
-    }
-    let com_mode = value(&raw, "comm-mode")?.to_ascii_lowercase();
-    let com_groups = parse_words(&raw, "comm-grps")?;
+    let (pressure_coupling_type, pressure_tau_ps, reference_pressure_bar, compressibility_bar_inverse) =
+        match pressure_coupling.as_str() {
+            "no" => (String::new(), None, None, Vec::new()),
+            "parrinello-rahman" => {
+                let coupling_type = value(&raw, "pcoupltype")?.to_ascii_lowercase();
+                if coupling_type != "isotropic" {
+                    bail!(
+                        "unsupported pcoupltype='{coupling_type}'; only isotropic coupling is in the first GOTW profile"
+                    );
+                }
+                let compressibility: Vec<f64> = parse_list(&raw, "compressibility")?;
+                if compressibility.is_empty()
+                    || compressibility.iter().any(|v| !v.is_finite() || *v <= 0.)
+                {
+                    bail!("compressibility must contain positive finite values");
+                }
+                (
+                    coupling_type,
+                    Some(parse_f64(&raw, "tau-p")?),
+                    Some(parse_f64(&raw, "ref-p")?),
+                    compressibility,
+                )
+            }
+            other => bail!(
+                "unsupported pcoupl='{other}'; the GOTW profile uses Parrinello-Rahman, or no for constant volume"
+            ),
+        };
+    let com_mode = raw
+        .get("comm-mode")
+        .map_or_else(|| "linear".to_owned(), |v| v.to_ascii_lowercase());
+    let com_groups = if raw.contains_key("comm-grps") {
+        parse_words(&raw, "comm-grps")?
+    } else {
+        Vec::new()
+    };
     if com_mode != "linear" {
         bail!("unsupported comm-mode='{com_mode}'; the GOTW profile requires linear COM removal");
     }
-
+    let temperature_coupling_interval_steps = optional_interval(&raw, "nsttcouple")?;
+    let pressure_coupling_interval_steps = optional_interval(&raw, "nstpcouple")?;
+    let com_removal_interval_steps = optional_interval(&raw, "nstcomm")?;
+    let fourier_spacing_angstrom = optional_f64(&raw, "fourierspacing")?.map(|nm| nm * 10.0);
+    let pme_order = optional_interval(&raw, "pme-order")?;
+    let ewald_tolerance = optional_f64(&raw, "ewald-rtol")?;
     Ok(ResolvedMdp {
         source: path.display().to_string(),
         integrator,
@@ -259,69 +358,153 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
         pbc,
         com_mode,
         com_groups,
+        temperature_coupling_interval_steps,
+        pressure_coupling_interval_steps,
+        com_removal_interval_steps,
+        fourier_spacing_angstrom,
+        pme_order,
+        ewald_tolerance,
         raw,
     })
 }
 
-impl ResolvedMdp {
-    /// Convert the resolved recipe to the versioned engine contract.  The
-    /// resulting protocol intentionally retains PME/Nose–Hoover/Parrinello–
-    /// Rahman as explicit choices; current drivers report a capability error
-    /// until those kernels pass their independent validation gates.
-    pub fn to_protocol(&self) -> Result<SimulationProtocol> {
-        let timestep_fs = self.timestep_ps * 1000.0;
-        if !timestep_fs.is_finite() || timestep_fs > 2.0 {
-            bail!("GOTW timestep {timestep_fs:.6} fs exceeds GlySys's validated 2 fs limit");
+/// One protocol from the dynamics files of a recipe, in the order they run,
+/// with an optional minimisation before them. The files may differ in length,
+/// output cadence and pressure coupling (`no` for a constant-volume stage);
+/// everything else has to agree, because GlySys keeps one model for a run.
+pub fn recipe(stages: &[ResolvedMdp], minimization: Option<&Minimization>) -> Result<SimulationProtocol> {
+    let Some(last) = stages.last() else {
+        bail!("a recipe needs at least one dynamics .mdp file");
+    };
+    for stage in stages {
+        let same = equal_f64(stage.timestep_ps, last.timestep_ps)
+            && equal_f64(stage.cutoff_angstrom, last.cutoff_angstrom)
+            && stage.temperature_groups == last.temperature_groups
+            && stage.temperature_tau_ps == last.temperature_tau_ps
+            && stage.reference_temperature_k == last.reference_temperature_k
+            && stage.com_groups == last.com_groups
+            && stage.com_removal_interval_steps == last.com_removal_interval_steps
+            && stage.temperature_coupling_interval_steps == last.temperature_coupling_interval_steps
+            && stage.fourier_spacing_angstrom == last.fourier_spacing_angstrom
+            && stage.pme_order == last.pme_order
+            && stage.ewald_tolerance == last.ewald_tolerance;
+        if !same {
+            bail!(
+                "{} and {} differ in time step, cutoff, PME or temperature-coupling settings; one run keeps one model",
+                stage.source,
+                last.source
+            );
         }
-        let protocol = SimulationProtocol {
-            temperature_k: self.reference_temperature_k[0],
-            timestep_fs,
-            equilibration_steps: 0,
-            production_steps: self.steps,
-            save_every: self
-                .compressed_coordinate_interval_steps
-                .or(self.energy_output_interval_steps)
-                .unwrap_or(1),
-            minimization_iterations: 0,
-            solvent: SolventModel::Explicit,
-            equilibration_ensemble: Ensemble::Nvt,
-            production_ensemble: Ensemble::Npt,
-            pressure_bar: self.reference_pressure_bar.unwrap_or(1.0),
-            constraints: ConstraintModel::Settle,
-            thermostat: Thermostat::NoseHoover,
-            electrostatics: ElectrostaticsModel::Pme,
-            pressure_coupling: PressureCoupling::ParrinelloRahman,
-            cutoff_angstrom: Some(self.cutoff_angstrom),
-            dispersion_correction: true,
-            thermostat_groups: self
-                .temperature_groups
-                .iter()
-                .zip(self.temperature_tau_ps.iter())
-                .zip(self.reference_temperature_k.iter())
-                .map(
-                    |((name, tau_ps), reference_temperature_k)| ThermostatGroup {
-                        name: name.clone(),
-                        tau_ps: *tau_ps,
-                        reference_temperature_k: *reference_temperature_k,
-                    },
-                )
-                .collect(),
-            pressure_tau_ps: self.pressure_tau_ps,
-            pressure_compressibility_bar_inverse: self.compressibility_bar_inverse.clone(),
-            com_mode: Some(self.com_mode.clone()),
-            com_groups: self.com_groups.clone(),
-            stages: Some(vec![SimulationStage {
-                id: "production".into(),
-                ensemble: Ensemble::Npt,
-                steps: self.steps,
-                barostat_adaptation: false,
-            }]),
-            ..SimulationProtocol::default()
-        };
-        protocol
-            .validate()
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        Ok(protocol)
+    }
+    let coupled: Vec<&ResolvedMdp> = stages
+        .iter()
+        .filter(|stage| stage.pressure_coupling != "no")
+        .collect();
+    if let Some(first) = coupled.first() {
+        for stage in &coupled {
+            if stage.pressure_tau_ps != first.pressure_tau_ps
+                || stage.reference_pressure_bar != first.reference_pressure_bar
+                || stage.compressibility_bar_inverse != first.compressibility_bar_inverse
+                || stage.pressure_coupling_interval_steps != first.pressure_coupling_interval_steps
+            {
+                bail!(
+                    "{} and {} differ in pressure-coupling settings",
+                    stage.source,
+                    first.source
+                );
+            }
+        }
+    }
+    let timestep_fs = last.timestep_ps * 1000.0;
+    if !timestep_fs.is_finite() || timestep_fs > 2.0 {
+        bail!("GOTW timestep {timestep_fs:.6} fs exceeds GlySys's validated 2 fs limit");
+    }
+    let stage_list: Vec<SimulationStage> = stages
+        .iter()
+        .map(|stage| SimulationStage {
+            id: Path::new(&stage.source)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("stage")
+                .to_owned(),
+            ensemble: if stage.pressure_coupling == "no" {
+                Ensemble::Nvt
+            } else {
+                Ensemble::Npt
+            },
+            steps: stage.steps,
+            barostat_adaptation: false,
+        })
+        .collect();
+    let production_ensemble = stage_list[stage_list.len() - 1].ensemble;
+    let protocol = SimulationProtocol {
+        temperature_k: last.reference_temperature_k[0],
+        timestep_fs,
+        equilibration_steps: stages[..stages.len() - 1].iter().map(|stage| stage.steps).sum(),
+        production_steps: last.steps,
+        save_every: last
+            .compressed_coordinate_interval_steps
+            .or(last.energy_output_interval_steps)
+            .unwrap_or(1),
+        minimization_iterations: minimization.map_or(0, |m| m.steps),
+        solvent: SolventModel::Explicit,
+        equilibration_ensemble: stage_list[0].ensemble,
+        production_ensemble,
+        pressure_bar: coupled
+            .first()
+            .and_then(|stage| stage.reference_pressure_bar)
+            .unwrap_or(1.0),
+        constraints: ConstraintModel::Settle,
+        thermostat: Thermostat::NoseHoover,
+        electrostatics: ElectrostaticsModel::Pme,
+        pressure_coupling: if coupled.is_empty() {
+            PressureCoupling::None
+        } else {
+            PressureCoupling::ParrinelloRahman
+        },
+        cutoff_angstrom: Some(last.cutoff_angstrom),
+        dispersion_correction: true,
+        thermostat_groups: last
+            .temperature_groups
+            .iter()
+            .zip(last.temperature_tau_ps.iter())
+            .zip(last.reference_temperature_k.iter())
+            .map(
+                |((name, tau_ps), reference_temperature_k)| ThermostatGroup {
+                    name: name.clone(),
+                    tau_ps: *tau_ps,
+                    reference_temperature_k: *reference_temperature_k,
+                },
+            )
+            .collect(),
+        pressure_tau_ps: coupled.first().and_then(|stage| stage.pressure_tau_ps),
+        pressure_compressibility_bar_inverse: coupled
+            .first()
+            .map(|stage| stage.compressibility_bar_inverse.clone())
+            .unwrap_or_default(),
+        com_mode: Some(last.com_mode.clone()),
+        com_groups: last.com_groups.clone(),
+        temperature_coupling_interval: last.temperature_coupling_interval_steps,
+        pressure_coupling_interval: coupled
+            .first()
+            .and_then(|stage| stage.pressure_coupling_interval_steps),
+        com_removal_interval: last.com_removal_interval_steps,
+        ewald_tolerance: last.ewald_tolerance,
+        fourier_spacing_angstrom: last.fourier_spacing_angstrom,
+        pme_order: last.pme_order,
+        stages: Some(stage_list),
+        ..SimulationProtocol::default()
+    };
+    protocol
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(protocol)
+}
+
+impl ResolvedMdp {
+    /// The protocol of this file run on its own.
+    pub fn to_protocol(&self) -> Result<SimulationProtocol> {
+        recipe(std::slice::from_ref(self), None)
     }
 }
 
@@ -363,6 +546,84 @@ mod tests {
         assert_eq!(resolved.temperature_groups.len(), 2);
         assert_eq!(resolved.com_mode, "linear");
         assert_eq!(resolved.raw["tau-t"], "1 1");
+    }
+
+    const EQUILIBRATION: &str = "integrator = md\nnsteps = 125000\ndt = 0.002\nnstenergy = 500\ncontinuation = no\nconstraint_algorithm = LINCS\nconstraints = h-bonds\ncutoff-scheme = Verlet\nnstlist = 10\nrvdw = 0.9\nrlist = 0.9\nDispCorr = EnerPres\ncoulombtype = PME\nrcoulomb = 0.9\ntcoupl = Nose-Hoover\ntc-grps = WAT System_&_!WAT\ntau_t = 1.0 1.0\nref_t = 300 300\npbc = xyz\ngen_vel = yes\nnstcomm = 100\ncomm_mode = linear\ncomm_grps = WAT System_&_!WAT\n";
+    const COUPLED: &str = "pcoupl = Parrinello-Rahman\npcoupltype = isotropic\ntau_p = 5.0\nref_p = 1.0\ncompressibility = 4.5e-5\n";
+
+    fn mdp(directory: &Path, name: &str, text: &str) -> std::path::PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_four_files_of_a_gotw_run_become_one_staged_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let minimisation = mdp(
+            directory.path(),
+            "minimisation.mdp",
+            "integrator = steep\nemtol = 1000.0\nnsteps = 5000\ncoulombtype = PME\n",
+        );
+        let nvt = mdp(
+            directory.path(),
+            "equilibration_nvt.mdp",
+            &format!("{EQUILIBRATION}pcoupl = no\n"),
+        );
+        let npt = mdp(
+            directory.path(),
+            "equilibration_npt.mdp",
+            &format!("{}{COUPLED}", EQUILIBRATION.replace("125000", "250000")),
+        );
+        let production = mdp(
+            directory.path(),
+            "production.mdp",
+            &format!(
+                "{}{COUPLED}nstxout-compressed = 5000\nvdwtype = Cut-off\nvdw-modifier = None\n",
+                EQUILIBRATION.replace("125000", "250000000").replace("nstenergy = 500", "nstenergy = 5000")
+            ),
+        );
+        assert!(is_minimization(&minimisation).unwrap());
+        assert!(!is_minimization(&nvt).unwrap());
+        let stages: Vec<ResolvedMdp> = [&nvt, &npt, &production]
+            .into_iter()
+            .map(|path| parse(path).unwrap())
+            .collect();
+        let protocol = recipe(&stages, Some(&parse_minimization(&minimisation).unwrap())).unwrap();
+        let listed = protocol.execution_stages();
+        assert_eq!(
+            listed.iter().map(|s| (s.id.as_str(), s.ensemble, s.steps)).collect::<Vec<_>>(),
+            vec![
+                ("equilibration_nvt", Ensemble::Nvt, 125_000),
+                ("equilibration_npt", Ensemble::Npt, 250_000),
+                ("production", Ensemble::Npt, 250_000_000),
+            ]
+        );
+        assert_eq!(protocol.minimization_iterations, 5000);
+        assert_eq!(protocol.save_every, 5000);
+        assert_eq!(protocol.com_removal_interval, Some(100));
+        assert_eq!(protocol.pressure_tau_ps, Some(5.0));
+        assert_eq!(protocol.pressure_coupling, PressureCoupling::ParrinelloRahman);
+
+        // a constant-volume recipe carries no barostat
+        let alone = recipe(&stages[..1], None).unwrap();
+        assert_eq!(alone.pressure_coupling, PressureCoupling::None);
+        assert!(!alone.has_npt());
+
+        // files that disagree on the model are refused
+        let other = mdp(
+            directory.path(),
+            "other.mdp",
+            &format!(
+                "{}{COUPLED}",
+                EQUILIBRATION
+                    .replace("rvdw = 0.9\nrlist = 0.9", "rvdw = 1.0\nrlist = 1.0")
+                    .replace("rcoulomb = 0.9", "rcoulomb = 1.0")
+            ),
+        );
+        let mut mixed = stages.clone();
+        mixed.push(parse(&other).unwrap());
+        assert!(recipe(&mixed, None).is_err());
     }
 
     #[test]
