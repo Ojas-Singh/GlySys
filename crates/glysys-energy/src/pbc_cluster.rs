@@ -2035,6 +2035,21 @@ mod tests {
             .unwrap();
         assert_eq!(silent.gradients, fast.gradients);
         assert_eq!(silent.components.electrostatics, 0.);
+        // The two parts run side by side; the result is reproducible.
+        let again = field
+            .evaluate_with_cluster_pme(
+                &mut engine,
+                &mut pme,
+                &coordinates,
+                &box_vec,
+                0.,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(again.gradients, fast.gradients);
+        assert_eq!(again.components, fast.components);
+        assert_eq!(again.virial.to_bits(), fast.virial.to_bits());
         // Engines of the other mode or another alpha are refused.
         let mut reaction_field = ClusterPairEngine::new(&system, cutoff, 1.5, 78.5).unwrap();
         let mut other = ClusterPairEngine::new_pme(&system, cutoff, 1.5, 1.1 * alpha).unwrap();

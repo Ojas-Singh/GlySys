@@ -860,16 +860,38 @@ impl<'a> PbcForceField<'a> {
                 "cluster engine and PME engine need the same Ewald coefficient".into(),
             ));
         }
-        let mut result = self.evaluate_with_cluster(
-            engine,
-            unwrapped,
-            box_vec,
-            dispersion_coefficient,
-            include_dispersion,
-            observables,
-        )?;
-        let long_range =
-            pme.evaluate_into(unwrapped, box_vec, &mut result.gradients, observables)?;
+        // The two parts only share the coordinates, so they run side by
+        // side: the long-range part is a handful of short parallel loops
+        // that would otherwise leave most workers idle. Each part reduces in
+        // its own fixed order and the sum below is ordered too.
+        let mut long_range_gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            unwrapped.len()
+        ];
+        let (short_range, long_range) = rayon::join(
+            || {
+                self.evaluate_with_cluster(
+                    engine,
+                    unwrapped,
+                    box_vec,
+                    dispersion_coefficient,
+                    include_dispersion,
+                    observables,
+                )
+            },
+            || pme.evaluate_into(unwrapped, box_vec, &mut long_range_gradients, observables),
+        );
+        let mut result = short_range?;
+        let long_range = long_range?;
+        for (total, extra) in result.gradients.iter_mut().zip(&long_range_gradients) {
+            total.x += extra.x;
+            total.y += extra.y;
+            total.z += extra.z;
+        }
         result.components.electrostatics += long_range.energy;
         result.virial_terms[3] += long_range.virial;
         result.virial_pair_split[1] += long_range.virial;
