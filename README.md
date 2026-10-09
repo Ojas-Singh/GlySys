@@ -8,7 +8,7 @@ force-field hydrogens, parameterizes proteins with ff14SB, carbohydrates with
 GLYCAM06j-1, DNA/RNA with OL15/OL3, structural metal ions with Li/Merz 12-6
 parameters and other small molecules (ligands, cofactors) with the generic
 OpenFF Sage 2.2.1 force field and AM1-BCC charges, solvates with TIP3P, adds
-neutralizing ions and 0.15 M NaCl, and writes files for OpenMM and GROMACS.
+ions for a neutral box at 0.15 M NaCl, and writes files for OpenMM and GROMACS.
 
 The workspace also contains reusable AGPL-3.0-only libraries:
 
@@ -47,6 +47,14 @@ glysys-md devices
 glysys-md resolve-mdp --mdp production.mdp --protocol-out resolved.protocol.json
 glysys-md verify-gromacs --input prepared
 ```
+
+`--salt` is the NaCl concentration of the bath the box stands for. The ion
+counts follow SLTCAP (Schmit et al., J. Chem. Theory Comput. 2018, 14, 1823):
+with N0 the ion pairs the water of the box holds at that concentration
+(55.34 mol/L of water) and Q the charge of the solute, the box gets
+sqrt(N0² + Q²/4) − Q/2 sodium and sqrt(N0² + Q²/4) + Q/2 chloride ions. A
+neutral solute gets N0 pairs, and `--salt 0` leaves only the neutralizing
+counter-ions.
 
 `glysys-md` is the native session adapter; it does not require WASM or a
 browser. `--threads` is per process, so a Slurm replica should receive only
