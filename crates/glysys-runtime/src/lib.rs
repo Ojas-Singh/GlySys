@@ -483,7 +483,17 @@ pub struct SimulationSession {
 }
 
 fn gpu_compatible(protocol: &SimulationProtocol) -> bool {
+    // Leap-frog with Nose-Hoover (and Parrinello-Rahman for NPT stages), with
+    // reaction-field or PME electrostatics and the dispersion correction.
+    if protocol.uses_leapfrog() {
+        return protocol.restraint_force == 0.0
+            && protocol.constraints == glysys_dynamics::ConstraintModel::Settle
+            && (!protocol.has_npt()
+                || protocol.pressure_coupling
+                    == glysys_dynamics::PressureCoupling::ParrinelloRahman);
+    }
     !protocol.has_npt()
+        && protocol.electrostatics == glysys_dynamics::ElectrostaticsModel::ReactionField
         && protocol.restraint_force == 0.0
         && !protocol.dispersion_correction
         && match protocol.solvent {
@@ -567,6 +577,131 @@ fn add_stage_timing(diagnostics: &mut ExecutionDiagnostics, stage: &str, millise
         .stage_timings_ms
         .entry(stage.to_owned())
         .or_default() += milliseconds;
+}
+
+/// Electrostatics of an explicit protocol for the resident evaluator.
+fn explicit_electrostatics(
+    system: &ParameterizedSystem,
+    protocol: &SimulationProtocol,
+) -> Result<NonbondedElectrostatics, SessionError> {
+    Ok(match protocol.electrostatics {
+        glysys_dynamics::ElectrostaticsModel::ReactionField => {
+            NonbondedElectrostatics::ReactionField {
+                cutoff_angstrom: protocol.cutoff_angstrom.unwrap_or(9.0),
+                solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
+            }
+        }
+        glysys_dynamics::ElectrostaticsModel::Pme => {
+            let parameters = glysys_dynamics::explicit::pme_parameters(system, protocol)?;
+            NonbondedElectrostatics::Pme {
+                alpha_per_angstrom: parameters.alpha_per_angstrom,
+                grid: parameters.grid,
+                interpolation_order: parameters.interpolation_order,
+            }
+        }
+    })
+}
+
+/// Box change (Å) a GPU pair list tolerates under a barostat before it is
+/// rebuilt; taken from the neighbor skin.
+const GPU_BOX_CHANGE_ALLOWANCE_ANGSTROM: f64 = 0.05;
+/// A barostat may compress a freshly solvated box by a third (the boxes of
+/// tleap start near 0.75 g/mL); the tile lists are sized for it.
+const GPU_NPT_DENSITY_HEADROOM: f64 = 1.4;
+
+/// The coupling plan of the CPU leap-frog integrator as the numbers the
+/// resident one takes, for the stage that contains `step`.
+fn leapfrog_coupling(
+    simulation: &ExplicitSimulation<'_>,
+    step: usize,
+) -> Result<glysys_gpu::pbc_leapfrog::LeapfrogCoupling, SessionError> {
+    let protocol = &simulation.state.protocol;
+    let Some(plan) = simulation.coupling_plan() else {
+        return Err(SessionError::new(
+            SessionErrorKind::InvalidInput,
+            "leap-frog protocol without a coupling plan",
+            false,
+        ));
+    };
+    if plan.groups.len() > 2 || plan.com_groups.len() > 2 {
+        return Err(SessionError::new(
+            SessionErrorKind::InvalidInput,
+            "the GPU leap-frog integrator takes at most two coupling groups",
+            true,
+        ));
+    }
+    let masses = simulation.masses();
+    let mut group_bits = plan.group_of_atom.clone();
+    let mut com_mass = [0.0; 2];
+    for (index, group) in plan.com_groups.iter().enumerate() {
+        for &atom in group {
+            group_bits[atom] |= (index as u32) << 1;
+            com_mass[index] += masses[atom];
+        }
+    }
+    let per_group = |value: &dyn Fn(&glysys_dynamics::coupling::TemperatureGroup) -> f64| {
+        [0, 1].map(|index| plan.groups.get(index).map_or(0.0, value))
+    };
+    let (_, _, ensemble, _, _) = protocol.stage_info(step);
+    Ok(glysys_gpu::pbc_leapfrog::LeapfrogCoupling {
+        group_bits,
+        inverse_q: per_group(&|group| group.inverse_mass()),
+        reference_temperature_k: per_group(&|group| group.reference_temperature_k),
+        degrees_of_freedom: per_group(&|group| group.degrees_of_freedom),
+        com_mass,
+        timestep_ps: protocol.timestep_fs * 0.001,
+        thermostat: ensemble != Ensemble::Nve,
+        barostat: ensemble == Ensemble::Npt,
+        temperature_interval: plan.temperature_interval,
+        pressure_interval: plan.pressure_interval,
+        com_interval: plan.com_interval,
+        barostat_coefficient: 4.0 * std::f64::consts::PI.powi(2) * plan.compressibility_per_bar
+            / (3.0 * plan.pressure_tau_ps * plan.pressure_tau_ps),
+        reference_pressure_bar: plan.reference_pressure_bar,
+        dispersion_pressure_coefficient: simulation.dispersion_pressure_coefficient(),
+        box_change_allowance: if protocol.has_npt() {
+            GPU_BOX_CHANGE_ALLOWANCE_ANGSTROM
+        } else {
+            0.0
+        },
+    })
+}
+
+/// Coupling variables of a host state for the resident integrator.
+fn leapfrog_variables(state: &SimulationState) -> glysys_gpu::pbc_leapfrog::LeapfrogVariables {
+    let mut variables = glysys_gpu::pbc_leapfrog::LeapfrogVariables {
+        box_angstrom: state.box_angstrom,
+        ..Default::default()
+    };
+    if let Some(coupling) = &state.coupling {
+        for (index, value) in coupling.thermostat_velocity.iter().take(2).enumerate() {
+            variables.thermostat_velocity[index] = *value;
+        }
+        for (index, value) in coupling.thermostat_position.iter().take(2).enumerate() {
+            variables.thermostat_position[index] = *value;
+        }
+        variables.box_velocity = coupling.box_velocity;
+        variables.pressure_bar = coupling.pressure_bar;
+        variables.pressure_pending =
+            state.step > 0 && coupling.pressure_step == Some(state.step - 1);
+    }
+    variables
+}
+
+/// The resident integrator's variables after the step before `step`, as the
+/// host records them.
+fn coupling_state(
+    variables: &glysys_gpu::pbc_leapfrog::LeapfrogVariables,
+    groups: usize,
+    step: usize,
+) -> glysys_dynamics::coupling::CouplingState {
+    glysys_dynamics::coupling::CouplingState {
+        thermostat_velocity: variables.thermostat_velocity[..groups].to_vec(),
+        thermostat_position: variables.thermostat_position[..groups].to_vec(),
+        box_velocity: variables.box_velocity,
+        pressure_bar: variables.pressure_bar,
+        pressure_step: (variables.pressure_pending && step > 0).then(|| step - 1),
+    }
 }
 
 fn gpu_total(
@@ -809,15 +944,16 @@ impl SimulationSession {
                 unreachable!("GPU compatibility implies explicit solvent");
             };
             let cutoff = protocol.cutoff_angstrom.unwrap_or(9.0);
-            let electro = NonbondedElectrostatics::ReactionField {
-                cutoff_angstrom: cutoff,
-                solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
-            };
+            let electro = explicit_electrostatics(&system, &protocol)?;
+            let leapfrog = protocol.uses_leapfrog();
             let neighbor_skin = options.explicit_gpu_neighbor_skin_angstrom;
-            let packing = glysys_gpu::pbc::PbcPacking::new(&system, cutoff, neighbor_skin)
+            let mut packing = glysys_gpu::pbc::PbcPacking::new(&system, cutoff, neighbor_skin)
                 .map_err(|e| {
                     SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false)
                 })?;
+            if protocol.has_npt() {
+                packing.tile_density_headroom = GPU_NPT_DENSITY_HEADROOM;
+            }
             let pair_capacity_scale = ((cutoff + neighbor_skin) / (cutoff + 1.5)).powi(3);
             let max_pairs = ((simulation
                 .pair_count()
@@ -864,6 +1000,12 @@ impl SimulationSession {
                 }
                 Err(error) => return Err(SessionError::from_gpu(error)),
             };
+            if leapfrog {
+                let coupling = leapfrog_coupling(&simulation, simulation.state.step)?;
+                gpu.configure_leapfrog(coupling)
+                    .await
+                    .map_err(SessionError::from_gpu)?;
+            }
             let box_xyz = simulation.state.box_angstrom.map(|value| value as f32);
             let initialize_result = if let Some(rng) = &simulation.state.resident_rng {
                 gpu.initialize_dynamics_with_rng(
@@ -932,7 +1074,28 @@ impl SimulationSession {
             let mut simulation = simulation;
             let coords = simulation.state.coordinates.clone();
             let velocities = simulation.state.velocities.clone();
-            simulation.install_evaluated_state(coords, velocities, 0, energy, gradients, virial)?;
+            if leapfrog {
+                let variables = leapfrog_variables(&simulation.state);
+                gpu.set_leapfrog_variables(&variables)
+                    .map_err(SessionError::from_gpu)?;
+                let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+                let coupling = coupling_state(&variables, groups, 0);
+                let box_angstrom = simulation.state.box_angstrom;
+                let energy = energy + simulation.dispersion_energy();
+                simulation.install_leapfrog_state(
+                    coords,
+                    velocities,
+                    0,
+                    energy,
+                    gradients,
+                    virial,
+                    box_angstrom,
+                    coupling,
+                )?;
+            } else {
+                simulation
+                    .install_evaluated_state(coords, velocities, 0, energy, gradients, virial)?;
+            }
             let diagnostics =
                 ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
             Ok(Self {
@@ -1144,18 +1307,19 @@ impl SimulationSession {
             unreachable!("GPU-compatible checkpoint must be explicit solvent");
         };
         let cutoff = protocol.cutoff_angstrom.unwrap_or(9.0);
-        let electro = NonbondedElectrostatics::ReactionField {
-            cutoff_angstrom: cutoff,
-            solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
-        };
+        let electro = explicit_electrostatics(&system, &protocol)?;
+        let leapfrog = protocol.uses_leapfrog();
         let neighbor_skin = options.explicit_gpu_neighbor_skin_angstrom;
-        let packing = glysys_gpu::pbc::PbcPacking::new_with_box(
+        let mut packing = glysys_gpu::pbc::PbcPacking::new_with_box(
             &system,
             state.box_angstrom,
             cutoff,
             neighbor_skin,
         )
         .map_err(|e| SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false))?;
+        if protocol.has_npt() {
+            packing.tile_density_headroom = GPU_NPT_DENSITY_HEADROOM;
+        }
         let pair_capacity_scale = ((cutoff + neighbor_skin) / (cutoff + 1.5)).powi(3);
         let max_pairs = ((simulation
             .pair_count()
@@ -1204,6 +1368,12 @@ impl SimulationSession {
             }
             Err(error) => return Err(SessionError::from_gpu(error)),
         };
+        if leapfrog {
+            let coupling = leapfrog_coupling(&simulation, state.step)?;
+            gpu.configure_leapfrog(coupling)
+                .await
+                .map_err(SessionError::from_gpu)?;
+        }
         let box_xyz = state.box_angstrom.map(|value| value as f32);
         let dt_ps = (protocol.timestep_fs * 0.001) as f32;
         if let Some(rng) = state.resident_rng.as_ref() {
@@ -1298,14 +1468,32 @@ impl SimulationSession {
             Err(error) => return Err(error),
         };
         let mut simulation = simulation;
-        simulation.install_evaluated_state(
-            state.coordinates.clone(),
-            state.velocities.clone(),
-            state.step,
-            energy,
-            gradients,
-            virial,
-        )?;
+        if leapfrog {
+            let variables = leapfrog_variables(&state);
+            gpu.set_leapfrog_variables(&variables)
+                .map_err(SessionError::from_gpu)?;
+            let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+            let energy = energy + simulation.dispersion_energy();
+            simulation.install_leapfrog_state(
+                state.coordinates.clone(),
+                state.velocities.clone(),
+                state.step,
+                energy,
+                gradients,
+                virial,
+                state.box_angstrom,
+                coupling_state(&variables, groups, state.step),
+            )?;
+        } else {
+            simulation.install_evaluated_state(
+                state.coordinates.clone(),
+                state.velocities.clone(),
+                state.step,
+                energy,
+                gradients,
+                virial,
+            )?;
+        }
         let diagnostics =
             ExecutionDiagnostics::gpu_dynamics(&options, &context, &simulation.state.protocol);
         Ok(Self {
@@ -1451,6 +1639,66 @@ impl SimulationSession {
                 let first = *device_step;
                 let (_, _, ensemble, _, _) = simulation.state.protocol.stage_info(first);
                 let integration_started = Instant::now();
+                if simulation.state.protocol.uses_leapfrog() {
+                    gpu.set_leapfrog_ensemble(ensemble != Ensemble::Nve, ensemble == Ensemble::Npt)
+                        .map_err(SessionError::from_gpu)?;
+                    gpu.dynamics_steps_leapfrog(first as u64, count)
+                        .await
+                        .map_err(SessionError::from_gpu)?;
+                    for (stage, milliseconds) in gpu.take_gpu_stage_timings_ms() {
+                        add_stage_timing(
+                            &mut self.diagnostics,
+                            &format!("gpu.{stage}"),
+                            milliseconds,
+                        );
+                    }
+                    let readback_started = Instant::now();
+                    // The box first: the snapshot is decoded with it.
+                    let variables = gpu
+                        .read_leapfrog_variables()
+                        .await
+                        .map_err(SessionError::from_gpu)?;
+                    add_stage_timing(
+                        &mut self.diagnostics,
+                        "productionIntegrationAndQueueWait",
+                        integration_started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    let (resident, energy) = gpu
+                        .read_dynamics_snapshot(variables.box_angstrom.map(|value| value as f32))
+                        .await
+                        .map_err(SessionError::from_gpu)?;
+                    add_stage_timing(
+                        &mut self.diagnostics,
+                        "readbackAndDecode",
+                        readback_started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    self.diagnostics.neighbor_rebuild_count = Some(resident.neighbor_rebuild_count);
+                    let (potential, gradients, virial) = gpu_total(&energy)?;
+                    let next_step = first + count;
+                    let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+                    simulation.state.box_angstrom = variables.box_angstrom;
+                    let potential = potential + simulation.dispersion_energy();
+                    simulation.install_leapfrog_state(
+                        resident.coordinates,
+                        resident.velocities,
+                        next_step,
+                        potential,
+                        gradients,
+                        virial,
+                        variables.box_angstrom,
+                        coupling_state(&variables, groups, next_step),
+                    )?;
+                    *device_step = next_step;
+                    self.gpu_advances = self.gpu_advances.saturating_add(1);
+                    let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
+                        || simulation.state.protocol.is_stage_boundary(next_step)
+                        || next_step == simulation.state.protocol.total_steps();
+                    return Ok(TrajectoryChunk {
+                        first_step: first,
+                        last_step: next_step,
+                        frames: save.then(|| simulation.frame()).into_iter().collect(),
+                    });
+                }
                 match ensemble {
                     Ensemble::Nve => gpu.dynamics_steps(count).await,
                     Ensemble::Nvt => match simulation.state.protocol.langevin_discretization {
@@ -1664,8 +1912,9 @@ impl SimulationSession {
 
         let gpu_scalar_supported = match &self.driver {
             SimulationDriver::ExplicitGpu { simulation, .. } => {
-                simulation.state.protocol.langevin_discretization
-                    == glysys_dynamics::LangevinDiscretization::LfMiddle
+                !simulation.state.protocol.uses_leapfrog()
+                    && simulation.state.protocol.langevin_discretization
+                        == glysys_dynamics::LangevinDiscretization::LfMiddle
             }
             SimulationDriver::ImplicitGpu { simulation, .. } => {
                 simulation.state.protocol.langevin_discretization

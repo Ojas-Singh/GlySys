@@ -3,6 +3,7 @@ pub(crate) mod adapter;
 pub mod context;
 pub mod device;
 pub mod pbc;
+pub mod pbc_leapfrog;
 pub(crate) mod pbc_tiles;
 pub mod topology;
 

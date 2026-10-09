@@ -72,6 +72,11 @@ const COULOMB: f32 = 332.063713299;
 const ACCEL: f32 = 418.4;
 const U32MAX: u32 = 4294967295u;
 const FIXED_NEIGHBOR_ROW_WIDTH: u32 = 640u;
+// The SETTLE/SHAKE pass also records the virial of its constraint forces for
+// a barostat: invocation k leaves sum(m dx . r) of solute component k and
+// water k, in amu A^2, in out[2n + k].x (the leap-frog reduction divides by
+// dt^2). Arms are relative positions at the start of the step.
+override CONSTRAINT_VIRIAL: bool = false;
 // A dense protein interior can legitimately have more than 512 atoms within
 // the Verlet radius at a 9 A cutoff.  Keep a bounded local gather, but leave
 // enough headroom for those valid systems; the resident host still reports a
@@ -796,6 +801,7 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
   let water_base = config.counts.x + 2u * config.counts.y + 2u * config.counts.z;
   let component_offset = bitcast<u32>(config.misc.w);
   let component_count = bitcast<u32>(config.thermo.w);
+  var constraint_virial = 0.0;
   if (id.x < component_count) {
     let component = bonded[component_offset + id.x];
     let component_base = bitcast<u32>(component.x);
@@ -831,10 +837,12 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
               / ((ia + ib) * projection);
           da = delta * ia * old_direction;
           db = -delta * ib * old_direction;
+          constraint_virial += delta * dot(old_direction, old_direction);
         } else {
           let lambda = (r - t.z) / (r * (ia + ib));
           da = -lambda * ia * d;
           db = lambda * ib * d;
+          constraint_virial -= lambda * dot(d, state[n + a].xyz - state[n + b].xyz);
         }
         sys[2u * a + 1u] = vec4<f32>(sys[2u * a + 1u].xyz + da, 0.0);
         sys[2u * b + 1u] = vec4<f32>(sys[2u * b + 1u].xyz + db, 0.0);
@@ -861,6 +869,7 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
       }
     }
   }
+  if (CONSTRAINT_VIRIAL && id.x < n) { out[2u * n + id.x] = vec4<f32>(constraint_virial, 0.0, 0.0, 0.0); }
   if (id.x >= u32(config.dynamic_.x)) { return; }
 
   let head = bonded[water_base + 2u * id.x];
@@ -949,6 +958,11 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
   state[o] = vec4<f32>(state[o].xyz + d_o * inv_dt, state[o].w);
   state[h1] = vec4<f32>(state[h1].xyz + d_1 * inv_dt, state[h1].w);
   state[h2] = vec4<f32>(state[h2].xyz + d_2 * inv_dt, state[h2].w);
+  if (CONSTRAINT_VIRIAL) {
+    // The oxygen is the arm's origin, so only the hydrogens contribute.
+    constraint_virial += mh1 * dot(d_1, xb0) + mh2 * dot(d_2, xc0);
+    out[2u * n + id.x] = vec4<f32>(constraint_virial, 0.0, 0.0, 0.0);
+  }
 }
 
 @compute @workgroup_size(64)

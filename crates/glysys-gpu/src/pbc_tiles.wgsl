@@ -10,6 +10,12 @@
 //! Excluded and 1-4 pairs are masked here; 1-4 pairs are evaluated by the
 //! per-term bonded kernel with their Amber scales (OpenMM exceptions).
 //!
+//! Electrostatics are reaction field or, with `PME`, the direct-space part of
+//! particle-mesh Ewald: regular pairs use `qq erfc(alpha r)/r` and every
+//! excluded pair (1-4 pairs included) gets the correction `-qq erf(alpha r)/r`
+//! from the bonded kernel, which removes what the mesh adds for that pair.
+//! The mesh itself is `pbc_pme.wgsl`.
+//!
 //! Bonded forces and all energies are accumulated as 64-bit two's-complement
 //! fixed point (scale 2^32) held in pairs of u32 words. Integer addition is
 //! associative, so totals do not depend on workgroup scheduling; pair
@@ -32,6 +38,12 @@ struct TileConfig {
   terms: vec4<u32>,     // exceptions, bonds, angles, torsions (all terms)
   dyn_terms: vec4<u32>, // bonds, angles without constrained terms; scan groups; far exclusions
   offsets: vec4<u32>,   // `terms` offsets: bonds, angles, torsions; exceptions offset in `atoms`
+  ewald: vec4<f32>,     // 2 / cutoff^2, Ewald coefficient, spare, spare
+  ewald_terms: vec4<u32>, // excluded-pair corrections: all, without rigid water; `terms` offset; spare
+  // Degree-15 polynomials in u = 2 r^2 / cutoff^2 - 1 (monomial coefficients,
+  // fitted on the host): alpha^3 P_F and alpha P_V of the Ewald pair term.
+  ewald_force: array<vec4<f32>, 4>,
+  ewald_energy: array<vec4<f32>, 4>,
 }
 
 struct Special { other: u32, scee: f32, scnb: f32, spare: u32 }
@@ -63,6 +75,7 @@ struct Special { other: u32, scee: f32, scnb: f32, spare: u32 }
 
 override COMPUTE_ENERGY: bool = false;
 override INCLUDE_CONSTRAINED: bool = true;
+override PME: bool = false;
 
 const U32MAX: u32 = 4294967295u;
 const COULOMB: f32 = 332.063713299;
@@ -77,6 +90,19 @@ fn min_image(d: vec3<f32>) -> vec3<f32> {
 }
 
 fn position(atom: u32) -> vec3<f32> { return sys[2u * atom + 1u].xyz; }
+
+// Degree-15 polynomial by Estrin's scheme, operation for operation the CPU
+// cluster kernel's `ewald_polynomial`.
+fn estrin16(c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>, u: f32) -> f32 {
+  let u2 = u * u;
+  let u4 = u2 * u2;
+  let u8 = u4 * u4;
+  let q0 = (c0.x + c0.y * u) + (c0.z + c0.w * u) * u2;
+  let q1 = (c1.x + c1.y * u) + (c1.z + c1.w * u) * u2;
+  let q2 = (c2.x + c2.y * u) + (c2.z + c2.w * u) * u2;
+  let q3 = (c3.x + c3.y * u) + (c3.z + c3.w * u) * u2;
+  return (q0 + q1 * u4) + (q2 + q3 * u4) * u8;
+}
 
 // `blocks` holds two vec4 per block, one cached sorted position per slot,
 // then the sorted slot of every atom, one element each (x: the slot's bits).
@@ -685,6 +711,11 @@ fn nb_tiles(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_i
   let cutoff2 = tc.box_.w * tc.box_.w;
   let krf2 = 2.0 * tc.rf.x;
   let qi = COULOMB * ai.z;
+  let ew_scale = tc.ewald.x;
+  let ef0 = tc.ewald_force[0];
+  let ef1 = tc.ewald_force[1];
+  let ef2 = tc.ewald_force[2];
+  let ef3 = tc.ewald_force[3];
   var gradient = vec3<f32>(0.0);
   var e_lj = 0.0;
   var e_rf = 0.0;
@@ -724,11 +755,19 @@ fn nb_tiles(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_i
           let s2 = sigma * sigma * inv_r2;
           let s6 = s2 * s2 * s2;
           let qq = qi * pj.w;
-          let fmag = 12.0 * eps * (s6 - s6 * s6) * inv_r2 + qq * (krf2 - inv_r * inv_r2);
+          var coulomb = krf2;
+          let u = min(r2 * ew_scale - 1.0, 1.0);
+          if (PME) { coulomb = estrin16(ef0, ef1, ef2, ef3, u); }
+          let fmag = 12.0 * eps * (s6 - s6 * s6) * inv_r2 + qq * (coulomb - inv_r * inv_r2);
           gradient += fmag * d;
           if (COMPUTE_ENERGY) {
             e_lj += eps * (s6 * s6 - 2.0 * s6);
-            e_rf += qq * (inv_r + tc.rf.x * r2 - tc.rf.y);
+            if (PME) {
+              e_rf += qq * (inv_r - estrin16(tc.ewald_energy[0], tc.ewald_energy[1],
+                                             tc.ewald_energy[2], tc.ewald_energy[3], u));
+            } else {
+              e_rf += qq * (inv_r + tc.rf.x * r2 - tc.rf.y);
+            }
             let w = -fmag * r2;
             virial += w;
             if (bitcast<u32>(ai.w) != bitcast<u32>(qj.w)) { pair_virial += w; }
@@ -804,6 +843,8 @@ fn bonded_terms(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocati
   let bonds = select(tc.dyn_terms.x, tc.terms.y, INCLUDE_CONSTRAINED);
   let angles = select(tc.dyn_terms.y, tc.terms.z, INCLUDE_CONSTRAINED);
   let torsions = tc.terms.w;
+  var corrections = 0u;
+  if (PME) { corrections = select(tc.ewald_terms.y, tc.ewald_terms.x, INCLUDE_CONSTRAINED); }
   var energy = vec4<f32>(0.0);  // bonds, angles, proper, improper
   var energy2 = vec4<f32>(0.0); // LJ, electrostatics, evaluated, virial
   if (index < exceptions) {
@@ -887,6 +928,20 @@ fn bonded_terms(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocati
     add_gradient(a3, -force3);
     let e = p.x * (1.0 + cos(arg));
     if (p.w != 0.0) { energy.w = e; } else { energy.z = e; }
+  } else if (index < exceptions + bonds + angles + torsions + corrections) {
+    // Ewald correction of an excluded pair: -qq erf(alpha r)/r. Both atoms
+    // are in one molecule, so the molecule frame gives their separation.
+    let t = terms[tc.ewald_terms.z + index - exceptions - bonds - angles - torsions];
+    let a = u32(t.x);
+    let b = u32(t.y);
+    let d = bcoords[a].xyz - bcoords[b].xyz;
+    let r2 = dot(d, d);
+    let u = min(r2 * tc.ewald.x - 1.0, 1.0);
+    let g = t.z * estrin16(tc.ewald_force[0], tc.ewald_force[1], tc.ewald_force[2], tc.ewald_force[3], u);
+    add_gradient(a, g * d);
+    add_gradient(b, -g * d);
+    energy2 = vec4<f32>(0.0, -t.z * estrin16(tc.ewald_energy[0], tc.ewald_energy[1],
+                                              tc.ewald_energy[2], tc.ewald_energy[3], u), 0.0, -g * r2);
   }
   if (COMPUTE_ENERGY) {
     bonded_red[lid] = energy;

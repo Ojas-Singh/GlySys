@@ -19,11 +19,15 @@
 //! implementation.
 use crate::context::{AllocationReservation, GpuContext};
 use crate::device::{Error, Special};
+use crate::pbc_leapfrog::{
+    LeapfrogCoupling, LeapfrogEngine, LeapfrogKernel, LeapfrogShared, LeapfrogVariables,
+};
 use crate::pbc_tiles::{SharedBuffers, TileEngine, TileKernel, TilePacking, TileSizing};
 use glysys::{ParameterizedSystem, Vec3};
 use glysys_energy::pbc::{
     BoxVectors, NonbondedElectrostatics, classify_waters, molecules, water_equilibrium,
 };
+use glysys_energy::pbc_cluster::{EwaldPairPolynomials, ewald_pair_polynomials};
 use std::collections::BTreeMap;
 use wgpu::util::DeviceExt;
 
@@ -37,6 +41,10 @@ pub const TILED_NEIGHBORS_PER_ATOM: u32 = 640;
 const INDIRECT_NEIGHBOR_DISPATCH: u32 = u32::MAX;
 /// Job codes at or above this value select a tiled-engine pipeline.
 const TILE_JOB: usize = 1000;
+/// Job codes of the leap-frog coupling kernels.
+const LEAPFROG_JOB: usize = 2000;
+/// SETTLE/SHAKE that also records the constraint virial.
+const SETTLE_VIRIAL: usize = 30;
 
 /// Explicit nonbonded implementation of a resident evaluator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,6 +90,9 @@ pub struct PbcPacking {
     pub cutoff: f64,
     /// Orthorhombic box the packing was built for (Å).
     pub box_angstrom: [f64; 3],
+    /// Size the tile lists for this many times the present density. A
+    /// barostat that compresses the box needs the room.
+    pub tile_density_headroom: f64,
 }
 
 impl PbcPacking {
@@ -353,6 +364,7 @@ impl PbcPacking {
             limit,
             cutoff,
             box_angstrom: b,
+            tile_density_headroom: 1.0,
         })
     }
 
@@ -361,10 +373,14 @@ impl PbcPacking {
     }
 }
 
-/// Reaction-field uniform parameters (method tag 0) or an explicit
-/// rejection for PME. Host-side f64 math, cast once, documented in the
-/// validation report.
-fn electrostatics_uniform(backend: &NonbondedElectrostatics) -> Result<[f32; 4], Error> {
+/// Reaction-field uniform parameters (method tag 0), or method tag 1 with
+/// the Ewald coefficient and the fitted direct-space pair polynomials for
+/// PME. Host-side f64 math, cast once, documented in the validation report.
+/// The PME variant carries no cutoff of its own: it uses the packing's.
+fn electrostatics_uniform(
+    backend: &NonbondedElectrostatics,
+    cutoff: f64,
+) -> Result<([f32; 4], Option<EwaldPairPolynomials>), Error> {
     match backend {
         NonbondedElectrostatics::ReactionField {
             cutoff_angstrom,
@@ -376,9 +392,23 @@ fn electrostatics_uniform(backend: &NonbondedElectrostatics) -> Result<[f32; 4],
             }
             let krf = (e - 1.) / (2. * e + 1.) / rc.powi(3);
             let crf = 3. * e / (2. * e + 1.) / rc;
-            Ok([0., rc as f32, krf as f32, crf as f32])
+            Ok(([0., rc as f32, krf as f32, crf as f32], None))
         }
-        NonbondedElectrostatics::Pme { .. } => Err(Error::Input("PME not yet implemented on GPU")),
+        NonbondedElectrostatics::Pme {
+            alpha_per_angstrom,
+            interpolation_order,
+            ..
+        } => {
+            if *interpolation_order != 4 {
+                return Err(Error::Input("GPU PME interpolates with order 4 only"));
+            }
+            let ewald = ewald_pair_polynomials(*alpha_per_angstrom, cutoff)
+                .map_err(|_| Error::Input("Ewald coefficient and cutoff"))?;
+            Ok((
+                [1., cutoff as f32, *alpha_per_angstrom as f32, 0.],
+                Some(ewald),
+            ))
+        }
     }
 }
 
@@ -493,6 +523,8 @@ fn dynamics_error(value: u32) -> Option<String> {
         6 => Some("GPU solute velocity-constraint projection failed to converge".into()),
         7 => Some("GPU SETTLE position projection failed its geometry check".into()),
         8 => Some("GPU SETTLE velocity projection failed its constraint check".into()),
+        9 => Some("the box shrank below twice the cutoff".into()),
+        10 => Some("the barostat changed the box by more than 10% in one coupling step".into()),
         _ => Some("GPU dynamics numerical error".into()),
     }
 }
@@ -524,6 +556,10 @@ pub struct ResidentPbc {
     tiled_nonbonded: bool,
     kernel: PbcKernel,
     tiles: Option<TileEngine>,
+    leapfrog: Option<LeapfrogEngine>,
+    /// PME: self energy (kcal/mol) and the coefficient of the uniform
+    /// background energy of a charged box (kcal Å³/mol, over the volume).
+    ewald_constants: Option<[f64; 2]>,
     box_xyz: std::sync::Mutex<[f32; 3]>,
     gpu_stage_timings_ms: std::sync::Mutex<BTreeMap<String, f64>>,
     dt_ps: f32,
@@ -544,7 +580,7 @@ fn pbc_stage_name(pipeline: usize) -> &'static str {
         2 => "nonbondedForces",
         3 => "reductions",
         4 | 9 => "bondedForces",
-        6..=8 => "constraints",
+        6..=8 | SETTLE_VIRIAL => "constraints",
         10 => "neighborClear",
         14 => "neighborCheck",
         15 => "neighborScan",
@@ -757,11 +793,14 @@ impl ResidentPbc {
         kernel: PbcKernel,
     ) -> Result<Self, Error> {
         let tiled_nonbonded = kernel == PbcKernel::FixedRows;
-        let electro = electrostatics_uniform(backend)?;
+        let (electro, ewald) = electrostatics_uniform(backend, packing.cutoff)?;
         // The packing cutoff and the backend cutoff must agree: cells are
         // sized for one limit, physics evaluated at one cutoff.
         if (electro[1] as f64 - packing.cutoff).abs() > 1e-6 {
             return Err(Error::Input("backend cutoff must match packing cutoff"));
+        }
+        if ewald.is_some() && kernel != PbcKernel::Tiles {
+            return Err(Error::Input("GPU PME needs the tiled pair kernel"));
         }
         let n = packing.dims[0];
         let ncells = packing.cell_count();
@@ -787,8 +826,10 @@ impl ResidentPbc {
             PbcKernel::Tiles => 64,
         };
         let tile_plan = if kernel == PbcKernel::Tiles {
-            let tile_packing = TilePacking::new(packing)?;
-            let sizing = TileSizing::new(n, packing.box_angstrom, packing.limit)?;
+            let tile_packing = TilePacking::new_for(packing, ewald.is_some())?;
+            let shrink = packing.tile_density_headroom.max(1.0).cbrt();
+            let sizing =
+                TileSizing::new(n, packing.box_angstrom.map(|b| b / shrink), packing.limit)?;
             if n > 4_000_000 {
                 return Err(Error::Capacity);
             }
@@ -880,10 +921,11 @@ impl ResidentPbc {
             })
         };
         let buffers = vec![
+            // A barostat kernel rewrites the box through a storage binding.
             buffer(
                 "pbc config",
                 128,
-                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | storage,
             ),
             buffer(
                 "pbc sys",
@@ -967,7 +1009,7 @@ impl ResidentPbc {
                 .into(),
             ),
         });
-        let pipelines = [
+        let mut pipelines: Vec<wgpu::ComputePipeline> = [
             "insert_atoms",
             "count_neighbors",
             if tiled_nonbonded {
@@ -1015,6 +1057,20 @@ impl ResidentPbc {
             })
         })
         .collect();
+        debug_assert_eq!(pipelines.len(), SETTLE_VIRIAL);
+        pipelines.push(
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("settle with constraint virial"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("settle"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[("CONSTRAINT_VIRIAL", 1.0)],
+                    ..Default::default()
+                },
+                cache: None,
+            }),
+        );
         for entry in [
             "insert_atoms",
             "count_neighbors",
@@ -1078,6 +1134,7 @@ impl ResidentPbc {
                     bcoords: &buffers[7],
                 },
                 electro,
+                ewald,
                 packing.limit as f32,
                 status_word,
                 status_word + 1,
@@ -1125,6 +1182,18 @@ impl ResidentPbc {
             tiled_nonbonded,
             kernel,
             tiles,
+            leapfrog: None,
+            ewald_constants: ewald.map(|ewald| {
+                let alpha = ewald.alpha_per_angstrom;
+                let charges = packing.params.iter().map(|p| f64::from(p[0]));
+                let squares: f64 = charges.clone().map(|q| q * q).sum();
+                let net: f64 = charges.sum();
+                const COULOMB: f64 = 332.063713299;
+                [
+                    -COULOMB * alpha / std::f64::consts::PI.sqrt() * squares,
+                    -COULOMB * std::f64::consts::PI * net * net / (2.0 * alpha * alpha),
+                ]
+            }),
             box_xyz: std::sync::Mutex::new(packing.box_angstrom.map(|v| v as f32)),
             gpu_stage_timings_ms: std::sync::Mutex::new(BTreeMap::new()),
             dt_ps: f64::NAN as f32,
@@ -1486,6 +1555,18 @@ impl ResidentPbc {
     }
 
     fn encode_job(&self, pass: &mut wgpu::ComputePass<'_>, pipeline: usize, groups: u32) {
+        if pipeline >= LEAPFROG_JOB {
+            let engine = self
+                .leapfrog
+                .as_ref()
+                .expect("leap-frog jobs are only planned for a configured integrator");
+            let (compute, bind_group) =
+                engine.kernel(LeapfrogKernel::from_job(pipeline - LEAPFROG_JOB));
+            pass.set_pipeline(compute);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+            return;
+        }
         if pipeline >= TILE_JOB {
             let tiles = self
                 .tiles
@@ -1517,7 +1598,9 @@ impl ResidentPbc {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn stage_name(&self, pipeline: usize) -> &'static str {
-        if pipeline >= TILE_JOB {
+        if pipeline >= LEAPFROG_JOB {
+            LeapfrogKernel::from_job(pipeline - LEAPFROG_JOB).stage_name()
+        } else if pipeline >= TILE_JOB {
             TileKernel::from_job(pipeline - TILE_JOB).stage_name()
         } else {
             pbc_stage_name(pipeline)
@@ -1709,6 +1792,13 @@ impl ResidentPbc {
                 self.expanded_jobs(jobs, final_energy && step + 1 == steps, true, resort)
             })
             .collect();
+        self.dispatch_plans_profiled(&plans).await
+    }
+
+    /// Encode every job of `plans` in its own timestamped pass, submit, and
+    /// add the per-stage device times to the accumulator.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn dispatch_plans_profiled(&self, plans: &[Vec<(usize, u32)>]) -> Result<(), Error> {
         let query_count = plans
             .iter()
             .map(Vec::len)
@@ -1742,7 +1832,7 @@ impl ResidentPbc {
             });
         let mut query_index = 0u32;
         let mut stages = Vec::with_capacity(query_count as usize / 2);
-        for expanded in &plans {
+        for expanded in plans {
             for &(pipeline, groups) in expanded {
                 let begin = query_index;
                 let end = begin + 1;
@@ -1910,11 +2000,11 @@ impl ResidentPbc {
         let mut state = self.decode_checkpoint(&bytes[..2 * n], &bytes[2 * n..3 * n], box_xyz);
         state.neighbor_rebuild_count =
             u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()) as u64;
-        let energy = Self::decode_observables(
+        let energy = self.with_ewald_constants(Self::decode_observables(
             &bytes[5 * n..5 * n + 32],
             Some(&bytes[3 * n..4 * n]),
             &bytes[4 * n..5 * n],
-        );
+        ));
         Ok((state, energy))
     }
 
@@ -2211,11 +2301,29 @@ impl ResidentPbc {
         let partial_bytes = self
             .readback(5, 3 * u64::from(self.n) * 16, u64::from(self.n) * 16)
             .await?;
-        Ok(Self::decode_observables(
+        Ok(self.with_ewald_constants(Self::decode_observables(
             &total_bytes,
             grad_bytes.as_deref(),
             &partial_bytes,
-        ))
+        )))
+    }
+
+    /// Add the position-independent parts of the Ewald sum: the self energy
+    /// and, for a charged box, the uniform background (energy and virial).
+    fn with_ewald_constants(&self, mut result: EnergyResult) -> EnergyResult {
+        if let Some([self_energy, background]) = self.ewald_constants {
+            let volume = self
+                .box_xyz
+                .lock()
+                .map(|b| f64::from(b[0]) * f64::from(b[1]) * f64::from(b[2]))
+                .unwrap_or(f64::NAN);
+            let background = background / volume;
+            result.rf += self_energy + background;
+            if let Some(virial) = &mut result.virial {
+                *virial += 3.0 * background;
+            }
+        }
+        result
     }
     fn decode_observables(
         total_bytes: &[u8],
@@ -2434,6 +2542,209 @@ impl ResidentPbc {
         )
         .await?;
         self.reduce_energy_once().await?;
+        if let Some(e) = crate::pop_error_scope(&self.device).await {
+            return Err(Error::Execution(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Set up the leap-frog integrator with Nose-Hoover and Parrinello-Rahman
+    /// coupling for the next segment. The resident coordinates, velocities
+    /// and forces are untouched; call [`Self::set_leapfrog_variables`] next.
+    pub async fn configure_leapfrog(&mut self, coupling: LeapfrogCoupling) -> Result<(), Error> {
+        let Some(tiles) = &self.tiles else {
+            return Err(Error::Input("GPU leap-frog needs the tiled pair kernel"));
+        };
+        let status_word = self.ncells + 3 * self.n + 1;
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
+        let engine = LeapfrogEngine::new(
+            &self.device,
+            LeapfrogShared {
+                sys: &self.buffers[1],
+                state: &self.buffers[8],
+                out: &self.buffers[5],
+                aux: &self.buffers[2],
+                pbc_config: &self.buffers[0],
+                tile_config: &tiles.uniform,
+                mesh_config: None,
+                status_word,
+                rebuild_word: status_word + 1,
+                cutoff: self.electro[1],
+            },
+            coupling,
+            self.n,
+        );
+        if let Some(error) = crate::pop_error_scope(&self.device).await {
+            return Err(Error::Execution(error.to_string()));
+        }
+        let engine = engine?;
+        self.set_timestep(engine.coupling.timestep_ps as f32)?;
+        // A barostat changes the box between list rebuilds; its allowance
+        // comes out of the skin. The next coordinate upload applies it.
+        if let Some(tiles) = &mut self.tiles {
+            tiles.skin_margin = engine.coupling.box_change_allowance as f32;
+        }
+        self.leapfrog = Some(engine);
+        Ok(())
+    }
+
+    /// Choose the couplings of the coming steps: none for a constant-energy
+    /// stage, the thermostat for NVT, both for NPT. Leaving NPT stops the
+    /// box. Call between advances, after [`Self::read_leapfrog_variables`].
+    pub fn set_leapfrog_ensemble(&mut self, thermostat: bool, barostat: bool) -> Result<(), Error> {
+        let Some(engine) = &mut self.leapfrog else {
+            return Err(Error::Input("leap-frog integrator is not configured"));
+        };
+        if engine.coupling.barostat && !barostat {
+            // box velocity; this step's drag and the pending-pressure flag
+            self.queue.write_buffer(&engine.cs, 32, &[0; 16]);
+            self.queue.write_buffer(&engine.cs, 80, &[0; 16]);
+        }
+        engine.coupling.thermostat = thermostat;
+        engine.coupling.barostat = barostat;
+        Ok(())
+    }
+
+    /// Upload the thermostat and barostat variables, with the box, for the
+    /// configured leap-frog integrator. The box must be the one of the last
+    /// coordinate upload.
+    pub fn set_leapfrog_variables(&self, variables: &LeapfrogVariables) -> Result<(), Error> {
+        let Some(engine) = &self.leapfrog else {
+            return Err(Error::Input("leap-frog integrator is not configured"));
+        };
+        // The device compares its rebuild counter with the one seen at the
+        // last box change; starting from an impossible value makes the first
+        // comparison a mismatch, which is the safe side.
+        engine.upload(&self.queue, variables, u32::MAX);
+        Ok(())
+    }
+
+    /// Thermostat and barostat variables and the current box.
+    pub async fn read_leapfrog_variables(&self) -> Result<LeapfrogVariables, Error> {
+        let Some(engine) = &self.leapfrog else {
+            return Err(Error::Input("leap-frog integrator is not configured"));
+        };
+        let bytes = self
+            .readback_buffer(&engine.cs, 0, LeapfrogEngine::coupling_bytes())
+            .await?;
+        let variables = LeapfrogEngine::decode(&bytes);
+        if let Ok(mut current) = self.box_xyz.lock() {
+            *current = variables.box_angstrom.map(|v| v as f32);
+        }
+        Ok(variables)
+    }
+
+    fn leapfrog_jobs(&self, engine: &LeapfrogEngine, step: u64) -> Vec<(usize, u32)> {
+        let plan = engine.coupling.plan(step);
+        let atoms = workgroups(self.n);
+        let groups = workgroups(self.n.max(self.ncells));
+        let job = |kernel: LeapfrogKernel| (LEAPFROG_JOB + kernel.job(), engine.groups(kernel));
+        let mut jobs = Vec::with_capacity(16);
+        if plan.thermostat || plan.pressure {
+            jobs.push(job(LeapfrogKernel::ReducePartialOld));
+            jobs.push(job(LeapfrogKernel::ReduceFinalOld));
+        }
+        match (plan.thermostat, plan.barostat) {
+            (true, true) => jobs.push(job(LeapfrogKernel::CoupleBoth)),
+            (true, false) => jobs.push(job(LeapfrogKernel::CoupleThermostat)),
+            (false, true) => jobs.push(job(LeapfrogKernel::CoupleBarostat)),
+            (false, false) => {}
+        }
+        jobs.push(job(if plan.thermostat || plan.barostat {
+            LeapfrogKernel::KickDriftCoupled
+        } else {
+            LeapfrogKernel::KickDrift
+        }));
+        // SETTLE/SHAKE with the constraint displacement added to velocities
+        jobs.push((if plan.pressure { SETTLE_VIRIAL } else { 6 }, groups));
+        if plan.pressure || plan.com {
+            jobs.push(job(LeapfrogKernel::ReducePartialNew));
+            jobs.push(job(LeapfrogKernel::ReduceFinalNew));
+        }
+        if plan.pressure {
+            jobs.push(job(LeapfrogKernel::Pressure));
+        }
+        if plan.barostat {
+            jobs.push(job(LeapfrogKernel::Scale));
+            jobs.push(job(LeapfrogKernel::ApplyBox));
+        }
+        if plan.com {
+            jobs.push(job(LeapfrogKernel::RemoveCom));
+        }
+        jobs.extend_from_slice(&[
+            (9, atoms),                       // molecule-centered bonded coordinates
+            (0, atoms),                       // neighbor maintenance
+            (2, self.eval_dispatch_groups()), // nonbonded forces at the new coordinates
+            (4, atoms),                       // bonded forces
+        ]);
+        jobs
+    }
+
+    /// Advance `steps` leap-frog steps, the first of which is step
+    /// `first_step` of the segment's schedule (thermostat, barostat and
+    /// center-of-mass removal act on fixed step numbers). The forces of the
+    /// resident state must come from an evaluation with energies when
+    /// `first_step` is a pressure step. The final step publishes energies.
+    pub async fn dynamics_steps_leapfrog(&self, first_step: u64, steps: usize) -> Result<(), Error> {
+        let Some(engine) = &self.leapfrog else {
+            return Err(Error::Input("leap-frog integrator is not configured"));
+        };
+        if steps == 0 {
+            return Err(Error::Input(
+                "leap-frog batch must contain at least one step",
+            ));
+        }
+        if !self.dt_ps.is_finite() || self.dt_ps <= 0.0 {
+            return Err(Error::Input("dynamics timestep is not configured"));
+        }
+        // SETTLE/SHAKE along the bond directions of the start of the step,
+        // with the whole displacement added to the velocities.
+        self.write_nvt_uniforms(300.0, 0.0, 1.0);
+        self.queue
+            .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
+        crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
+        let mut done = 0usize;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut previous: Option<wgpu::SubmissionIndex> = None;
+        while done < steps {
+            let batch = (steps - done).min(MAX_ENCODED_DYNAMICS_STEPS);
+            let plans: Vec<Vec<(usize, u32)>> = (0..batch)
+                .map(|offset| {
+                    let step = first_step + (done + offset) as u64;
+                    let last = done + offset + 1 == steps;
+                    let energy = last || engine.coupling.plan(step).virial_next;
+                    let resort = self.tiles.as_ref().is_some_and(TileEngine::take_resort);
+                    self.expanded_jobs(&self.leapfrog_jobs(engine, step), energy, true, resort)
+                })
+                .collect();
+            #[cfg(not(target_arch = "wasm32"))]
+            if self._context.gpu_timestamps_enabled() {
+                self.dispatch_plans_profiled(&plans).await?;
+                done += batch;
+                continue;
+            }
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            for &(pipeline, groups) in plans.iter().flatten() {
+                self.encode_job(&mut pass, pipeline, groups);
+            }
+            drop(pass);
+            let index = self.queue.submit(Some(encoder.finish()));
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(earlier) = previous.replace(index) {
+                self.device
+                    .poll(wgpu::PollType::WaitForSubmissionIndex(earlier))
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = index;
+            done += batch;
+        }
         if let Some(e) = crate::pop_error_scope(&self.device).await {
             return Err(Error::Execution(e.to_string()));
         }
