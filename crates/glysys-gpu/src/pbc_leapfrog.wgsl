@@ -13,6 +13,7 @@
 //!   pressure step       reduce (new), pressure
 //!   barostat step       scale, apply_box
 //!   COM removal step    reduce (new), remove_com
+//!   every hundredth     wrap
 //!   every step          forces at the new positions
 //!
 //! Thermostat and barostat variables live in `cs`, in f32. The box lengths
@@ -47,7 +48,8 @@ struct Coupling {
 // out[n + i] = gradient (w of atom 0: virial of the last energy pass);
 // out[2n + k].x = constraint virial of SETTLE/SHAKE invocation k.
 @group(0) @binding(3) var<storage, read> out: array<vec4<f32>>;
-// Bit 0: temperature group; bit 1: center-of-mass group.
+// Bit 0: temperature group; bit 1: center-of-mass group; the other bits:
+// the first atom of the atom's molecule.
 @group(0) @binding(4) var<storage, read> groups: array<u32>;
 // Three vec4 per partial group: (ke0, ke1, constraint virial, 0), p0, p1.
 @group(0) @binding(5) var<storage, read_write> partials: array<vec4<f32>>;
@@ -273,6 +275,23 @@ fn apply_box() {
     since = 0.0;
   }
   cs.list = vec4<f32>(since, cs.list.y, bitcast<f32>(rebuilds), 0.0);
+}
+
+// Bring every molecule back to the periodic cell around the origin, whole.
+// Positions are never wrapped otherwise (bonded terms and SETTLE need whole
+// molecules), and single precision loses the bond lengths of a molecule that
+// has diffused a few boxes away. Every atom of a molecule takes the shift of
+// its first atom's position at the start of the step, which no invocation of
+// this kernel writes; all other kernels see positions modulo the box.
+@compute @workgroup_size(64)
+fn wrap(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  let n = n_atoms();
+  if (i >= n) { return; }
+  let anchor = groups[i] >> 2u;
+  let b = cs.box_.xyz;
+  let shift = b * round(state[n + anchor].xyz / b);
+  sys[2u * i + 1u] = vec4<f32>(sys[2u * i + 1u].xyz - shift, 0.0);
 }
 
 @compute @workgroup_size(64)

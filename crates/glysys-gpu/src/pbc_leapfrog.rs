@@ -14,6 +14,9 @@ pub struct LeapfrogCoupling {
     /// Per atom: bit 0 is the temperature group, bit 1 the center-of-mass
     /// group.
     pub group_bits: Vec<u32>,
+    /// Per atom: the first atom of its molecule. Molecules are wrapped into
+    /// the box whole, by the position of that atom.
+    pub molecule_anchor: Vec<u32>,
     /// `1/Q` of the two thermostats, 1/(K ps²); zero for an unused group.
     pub inverse_q: [f64; 2],
     pub reference_temperature_k: [f64; 2],
@@ -64,9 +67,16 @@ pub(crate) struct StepPlan {
     pub barostat: bool,
     pub pressure: bool,
     pub com: bool,
+    /// Molecules are brought back into the box.
+    pub wrap: bool,
     /// The forces at the end of this step must come with their virial.
     pub virial_next: bool,
 }
+
+/// Steps between wraps of the molecules into the box. Atoms move a small
+/// fraction of an angstrom per step, so the cadence only has to be short
+/// against diffusion over a box length.
+const WRAP_INTERVAL: u64 = 100;
 
 fn acts_on(step: u64, interval: usize) -> bool {
     interval <= 1 || step % interval as u64 == 1
@@ -80,6 +90,7 @@ impl LeapfrogCoupling {
             barostat: self.barostat && acts_on(step, self.pressure_interval),
             pressure: self.barostat && step % pressure_interval == 0,
             com: self.com_interval > 0 && step % self.com_interval as u64 == 0,
+            wrap: step % WRAP_INTERVAL == 0,
             virial_next: self.barostat && (step + 1) % pressure_interval == 0,
         }
     }
@@ -88,6 +99,9 @@ impl LeapfrogCoupling {
         let finite = |values: &[f64]| values.iter().all(|v| v.is_finite() && *v >= 0.0);
         if self.group_bits.len() != atoms as usize
             || self.group_bits.iter().any(|bits| *bits > 3)
+            || self.molecule_anchor.len() != atoms as usize
+            || self.molecule_anchor.iter().any(|anchor| *anchor >= atoms)
+            || atoms >= 1 << 30
             || !finite(&self.inverse_q)
             || !finite(&self.reference_temperature_k)
             || !finite(&self.degrees_of_freedom)
@@ -106,7 +120,7 @@ impl LeapfrogCoupling {
 }
 
 /// Entry points with the global bindings each one statically uses.
-pub(crate) const KERNELS: [(&str, &[u32]); 8] = [
+pub(crate) const KERNELS: [(&str, &[u32]); 9] = [
     ("reduce_partial", &[0, 1, 2, 3, 4, 5]),
     ("reduce_final", &[0, 5]),
     ("couple", &[0, 9]),
@@ -114,6 +128,7 @@ pub(crate) const KERNELS: [(&str, &[u32]); 8] = [
     ("pressure", &[0, 3]),
     ("scale", &[0, 1]),
     ("apply_box", &[0, 6, 7, 8, 9]),
+    ("wrap", &[0, 1, 2, 4]),
     ("remove_com", &[0, 2, 4]),
 ];
 
@@ -132,10 +147,11 @@ pub(crate) enum LeapfrogKernel {
     Scale,
     ApplyBox,
     RemoveCom,
+    Wrap,
 }
 
 impl LeapfrogKernel {
-    pub(crate) const ALL: [LeapfrogKernel; 13] = [
+    pub(crate) const ALL: [LeapfrogKernel; 14] = [
         Self::ReducePartialOld,
         Self::ReduceFinalOld,
         Self::ReducePartialNew,
@@ -149,6 +165,7 @@ impl LeapfrogKernel {
         Self::Scale,
         Self::ApplyBox,
         Self::RemoveCom,
+        Self::Wrap,
     ];
 
     fn entry(self) -> &'static str {
@@ -161,6 +178,7 @@ impl LeapfrogKernel {
             Self::Scale => "scale",
             Self::ApplyBox => "apply_box",
             Self::RemoveCom => "remove_com",
+            Self::Wrap => "wrap",
         }
     }
 
@@ -250,9 +268,15 @@ impl LeapfrogEngine {
             usage: storage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let packed: Vec<u32> = coupling
+            .group_bits
+            .iter()
+            .zip(&coupling.molecule_anchor)
+            .map(|(bits, anchor)| bits | anchor << 2)
+            .collect();
         let groups = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pbc leapfrog groups"),
-            contents: bytemuck::cast_slice(&coupling.group_bits),
+            contents: bytemuck::cast_slice(&packed),
             usage: storage,
         });
         let partials = device.create_buffer(&wgpu::BufferDescriptor {
@@ -359,7 +383,8 @@ impl LeapfrogEngine {
             LeapfrogKernel::KickDrift
             | LeapfrogKernel::KickDriftCoupled
             | LeapfrogKernel::Scale
-            | LeapfrogKernel::RemoveCom => self.n.div_ceil(64).max(1),
+            | LeapfrogKernel::RemoveCom
+            | LeapfrogKernel::Wrap => self.n.div_ceil(64).max(1),
             _ => 1,
         }
     }
@@ -518,6 +543,7 @@ mod tests {
     fn coupling() -> LeapfrogCoupling {
         LeapfrogCoupling {
             group_bits: vec![0; 3],
+            molecule_anchor: vec![0; 3],
             inverse_q: [0.13, 0.0],
             reference_temperature_k: [300.0, 0.0],
             degrees_of_freedom: [6.0, 0.0],
@@ -545,6 +571,7 @@ mod tests {
         assert!(c.plan(10).pressure && c.plan(11).barostat && !c.plan(11).thermostat);
         assert!(c.plan(26).thermostat && !c.plan(26).barostat);
         assert!(c.plan(100).com && !c.plan(50).com);
+        assert!(c.plan(0).wrap && c.plan(200).wrap && !c.plan(150).wrap);
         let mut nvt = coupling();
         nvt.barostat = false;
         assert!(!nvt.plan(10).pressure && !nvt.plan(11).barostat && !nvt.plan(9).virial_next);

@@ -2634,10 +2634,20 @@ impl ResidentPbc {
     /// Set up the leap-frog integrator with Nose-Hoover and Parrinello-Rahman
     /// coupling for the next segment. The resident coordinates, velocities
     /// and forces are untouched; call [`Self::set_leapfrog_variables`] next.
-    pub async fn configure_leapfrog(&mut self, coupling: LeapfrogCoupling) -> Result<(), Error> {
+    pub async fn configure_leapfrog(
+        &mut self,
+        mut coupling: LeapfrogCoupling,
+    ) -> Result<(), Error> {
         let Some(tiles) = &self.tiles else {
             return Err(Error::Input("GPU leap-frog needs the tiled pair kernel"));
         };
+        // The evaluator's own molecules: the ones its bonded frame uses.
+        coupling.molecule_anchor = vec![0; self.n as usize];
+        for group in &self.molecules {
+            for &atom in group {
+                coupling.molecule_anchor[atom] = group[0] as u32;
+            }
+        }
         let status_word = self.ncells + 3 * self.n + 1;
         crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
         let engine = LeapfrogEngine::new(
@@ -2767,6 +2777,9 @@ impl ResidentPbc {
         }
         if plan.com {
             jobs.push(job(LeapfrogKernel::RemoveCom));
+        }
+        if plan.wrap {
+            jobs.push(job(LeapfrogKernel::Wrap));
         }
         jobs.extend_from_slice(&[
             (9, atoms),                       // molecule-centered bonded coordinates

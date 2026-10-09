@@ -102,6 +102,8 @@ fn coupling(plan: &CouplingPlan, masses: &[f64], ensemble: Ensemble, tail: f64) 
     }
     LeapfrogCoupling {
         group_bits,
+        // filled by the evaluator from its molecules
+        molecule_anchor: Vec::new(),
         inverse_q: [0, 1].map(|g| plan.groups[g].inverse_mass()),
         reference_temperature_k: [0, 1].map(|g| plan.groups[g].reference_temperature_k),
         degrees_of_freedom: [0, 1].map(|g| plan.groups[g].degrees_of_freedom),
@@ -124,6 +126,7 @@ struct Pair {
     cpu: ExplicitSimulation<'static>,
     gpu: ResidentPbc,
     plan: CouplingPlan,
+    molecules: Vec<Vec<usize>>,
 }
 
 /// A CPU simulation at step 0 and a resident evaluator holding the same
@@ -171,13 +174,22 @@ async fn start(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Pair 
         ..LeapfrogVariables::default()
     })
     .unwrap();
-    Pair { cpu, gpu, plan }
+    let molecules = glysys_energy::pbc::molecules(&system);
+    Pair { cpu, gpu, plan, molecules }
 }
 
-fn largest_distance(a: &[Vec3], b: &[Vec3]) -> f64 {
+/// Largest distance between corresponding atoms, modulo the box: the device
+/// keeps every molecule in the periodic cell around the origin.
+fn largest_distance(a: &[Vec3], b: &[Vec3], box_angstrom: [f64; 3]) -> f64 {
+    let image = |d: f64, length: f64| d - length * (d / length).round();
     a.iter()
         .zip(b)
-        .map(|(p, q)| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2) + (p.z - q.z).powi(2)).sqrt())
+        .map(|(p, q)| {
+            (image(p.x - q.x, box_angstrom[0]).powi(2)
+                + image(p.y - q.y, box_angstrom[1]).powi(2)
+                + image(p.z - q.z, box_angstrom[2]).powi(2))
+            .sqrt()
+        })
         .fold(0.0, f64::max)
 }
 
@@ -197,7 +209,11 @@ async fn advance_to(pair: &mut Pair, done: &mut usize, step: usize) -> (Leapfrog
         .read_dynamics_checkpoint(variables.box_angstrom.map(|v| v as f32))
         .await
         .unwrap();
-    let distance = largest_distance(&state.coordinates, &pair.cpu.state.coordinates);
+    let distance = largest_distance(
+        &state.coordinates,
+        &pair.cpu.state.coordinates,
+        pair.cpu.state.box_angstrom,
+    );
     (variables, distance)
 }
 
@@ -308,4 +324,59 @@ fn pme_nvt_follows_the_cpu_integrator() {
 #[test]
 fn pme_npt_follows_the_cpu_integrator() {
     follows_in_npt(ElectrostaticsModel::Pme);
+}
+
+/// Molecules that have left the box come back whole: the device wraps them by
+/// their first atom, and the step itself does not depend on where they were.
+#[test]
+fn molecules_come_back_into_the_box_whole() {
+    let _guard = gpu_test_guard();
+    pollster::block_on(async {
+        let mut pair = start(ElectrostaticsModel::Pme, Ensemble::Nvt).await;
+        let cell = pair.cpu.state.box_angstrom;
+        // every third molecule starts one to three boxes away along an axis
+        let mut displaced = pair.cpu.state.coordinates.clone();
+        for (index, molecule) in pair.molecules.iter().enumerate().filter(|(index, _)| index % 3 == 0) {
+            let boxes = (1 + (index / 9) % 3) as f64 * if index % 2 == 0 { 1.0 } else { -1.0 };
+            for &atom in molecule {
+                match (index / 3) % 3 {
+                    0 => displaced[atom].x += boxes * cell[0],
+                    1 => displaced[atom].y += boxes * cell[1],
+                    _ => displaced[atom].z += boxes * cell[2],
+                }
+            }
+        }
+        pair.gpu.set_coordinates(&displaced, cell.map(|v| v as f32), true);
+        pair.gpu.set_velocities(&pair.cpu.state.velocities).unwrap();
+        pair.gpu.energy_and_forces(true).await.unwrap();
+        pair.gpu
+            .set_leapfrog_variables(&LeapfrogVariables {
+                box_angstrom: cell,
+                ..LeapfrogVariables::default()
+            })
+            .unwrap();
+        let mut done = 0;
+        let (variables, distance) = advance_to(&mut pair, &mut done, 1).await;
+        assert!(distance < 2e-4, "{distance:e} A from the CPU step, modulo the box");
+        let state = pair
+            .gpu
+            .read_dynamics_checkpoint(variables.box_angstrom.map(|v| v as f32))
+            .await
+            .unwrap();
+        for molecule in &pair.molecules {
+            let first = state.coordinates[molecule[0]];
+            for (value, length) in [first.x, first.y, first.z].into_iter().zip(cell) {
+                assert!(value > -0.5 && value < length + 0.5, "first atom at {value} in a box of {length}");
+            }
+            // whole: every atom is where the CPU has it relative to the first
+            let reference = pair.cpu.state.coordinates[molecule[0]];
+            for &atom in molecule {
+                let (p, q) = (state.coordinates[atom], pair.cpu.state.coordinates[atom]);
+                let apart = ((p.x - first.x) - (q.x - reference.x)).abs()
+                    + ((p.y - first.y) - (q.y - reference.y)).abs()
+                    + ((p.z - first.z) - (q.z - reference.z)).abs();
+                assert!(apart < 1e-3, "atom {atom} is {apart} A from its place in the molecule");
+            }
+        }
+    });
 }

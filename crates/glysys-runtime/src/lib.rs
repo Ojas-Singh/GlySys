@@ -656,6 +656,8 @@ fn leapfrog_coupling(
     let (_, _, ensemble, _, _) = protocol.stage_info(step);
     Ok(glysys_gpu::pbc_leapfrog::LeapfrogCoupling {
         group_bits,
+        // filled by the evaluator from its molecules
+        molecule_anchor: Vec::new(),
         inverse_q: per_group(&|group| group.inverse_mass()),
         reference_temperature_k: per_group(&|group| group.reference_temperature_k),
         degrees_of_freedom: per_group(&|group| group.degrees_of_freedom),
