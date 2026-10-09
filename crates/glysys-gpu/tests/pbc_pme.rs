@@ -602,8 +602,9 @@ fn reciprocal_pme_follows_a_box_change() {
     evaluate("box rewritten in the uniform (anisotropic)", barostat);
 }
 
-/// Wall time and device time of the force-only chain. Printed, not asserted:
-/// the adapter is shared.
+/// Wall time and device time of the two chains. Printed, not asserted: the
+/// adapter is shared, and another job on it shows up here as scattered,
+/// inflated kernel times.
 #[test]
 fn reciprocal_pme_timing() {
     let _guard = gpu_test_guard();
@@ -611,8 +612,13 @@ fn reciprocal_pme_timing() {
         return;
     };
     eprintln!("adapter: {}", context.adapter_info().name);
+    if context.adapter_info().device_type == wgpu::DeviceType::Cpu {
+        eprintln!("skipping: the time of a software adapter says nothing about a device");
+        return;
+    }
     for (atoms, box_xyz, grid) in [
-        // Next to nothing to compute: what seven dispatches cost by themselves.
+        // Next to nothing to compute: what seven dispatches and the chains of
+        // memory reads inside them cost by themselves.
         (64usize, [14.0f32, 14.0, 14.0], [16u32, 16, 16]),
         (9_000, [45.0, 45.0, 45.0], [64, 64, 64]),
         (100_000, [100.0, 100.0, 100.0], [128, 128, 128]),
