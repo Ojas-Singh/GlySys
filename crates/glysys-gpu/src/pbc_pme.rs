@@ -295,6 +295,18 @@ pub struct PmeShared<'a> {
 }
 
 /// The mesh, tables and pipelines of one system.
+///
+/// One evaluation is the kernels of [`Self::chain`] dispatched in order with
+/// the shapes of [`Self::groups`]. Between the first and the last of them the
+/// positions in `sys` and the box in the uniform must not change (spread and
+/// gather both derive the spline weights from them), and no second
+/// evaluation may start: there is one mesh. The gather has to come after the
+/// pair kernel has stored `pair_grad` for the evaluation, since it adds to it.
+///
+/// Limits: mesh sizes are powers of two from 16 to 256; the charge on one
+/// mesh point has to stay below 32 e in magnitude (32-bit fixed point with
+/// scale 2^26); atoms without charge or with a non-finite position are left
+/// out, silently.
 pub struct PmeMesh {
     sizing: PmeSizing,
     alpha: f32,

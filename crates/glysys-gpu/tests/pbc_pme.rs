@@ -56,6 +56,19 @@ impl Uniform {
     }
 }
 
+/// Box fractions of the first atoms. In the frame of `sys` (fraction minus
+/// one half, times the box) they are: the origin; a whole number of box
+/// lengths away from it (atom 1 is also moved by images); a hair below the
+/// origin, whose wrapped fraction rounds to one in f32; mesh points of every
+/// power-of-two mesh; and the faces of the box.
+const EDGE_FRACTIONS: [[f64; 3]; 5] = [
+    [0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [0.5 - 1e-12, 0.5 - 1e-12, 0.5 - 1e-12],
+    [3.0 / 16.0, 9.0 / 16.0, 15.0 / 16.0],
+    [1.0 - 1e-7, 0.0, 1e-7],
+];
+
 /// Point charges with a net charge of exactly zero, at positions given as box
 /// fractions plus whole box images, so the same system exists for any box.
 struct Charges {
@@ -67,13 +80,19 @@ struct Charges {
 impl Charges {
     /// Charges are multiples of 1/1024 up to 1 e in magnitude, so their sum is
     /// exact in f32 and f64. Every 19th atom is uncharged, and about a quarter
-    /// of the atoms sit one or two box lengths outside the box.
+    /// of the atoms sit one or two box lengths outside the box. The first
+    /// atoms are where the wrapping and the choice of mesh cell are decided
+    /// by the last bit: see [`EDGE_FRACTIONS`].
     fn random(n: usize, seed: u64) -> Self {
         let mut random = Uniform(seed);
         let mut units: Vec<i32> = (0..n)
             .map(|atom| {
                 let unit = (random.next() * 2049.0).floor() as i32 - 1024;
-                if atom % 19 == 7 { 0 } else { unit }
+                match atom {
+                    _ if atom % 19 == 7 => 0,
+                    _ if atom < EDGE_FRACTIONS.len() && unit == 0 => 512,
+                    _ => unit,
+                }
             })
             .collect();
         // Take the excess off the charged atoms, a little from each.
@@ -89,7 +108,10 @@ impl Charges {
         }
         assert_eq!(units.iter().sum::<i32>(), 0, "net charge");
         let fraction = (0..n)
-            .map(|_| [random.next(), random.next(), random.next()])
+            .map(|atom| {
+                let drawn = [random.next(), random.next(), random.next()];
+                EDGE_FRACTIONS.get(atom).copied().unwrap_or(drawn)
+            })
             .collect();
         let image = (0..n)
             .map(|atom| {
@@ -500,8 +522,8 @@ fn reciprocal_pme_matches_the_cpu_engine() {
     );
 }
 
-/// Lines longer than a workgroup (128 and 256 points, two and four elements
-/// per lane) and the shortest ones, on every axis.
+/// Every line length from 16 to 256 points on every axis: sixteen lines to a
+/// workgroup down to one, with and without the leading radix-2 stage.
 #[test]
 fn reciprocal_pme_handles_every_line_length_on_every_axis() {
     let _guard = gpu_test_guard();
@@ -513,6 +535,7 @@ fn reciprocal_pme_handles_every_line_length_on_every_axis() {
         ([250.0, 14.0, 120.0], [256, 16, 128]),
         ([120.0, 250.0, 14.0], [128, 256, 16]),
         ([60.0, 28.0, 14.0], [64, 32, 16]),
+        ([28.0, 60.0, 28.0], [32, 64, 32]),
         ([14.0, 14.0, 14.0], [16, 16, 16]),
     ] {
         assert_eq!(
@@ -579,8 +602,9 @@ fn reciprocal_pme_follows_a_box_change() {
     evaluate("box rewritten in the uniform (anisotropic)", barostat);
 }
 
-/// Wall time and device time of the force-only chain. Printed, not asserted:
-/// the adapter is shared.
+/// Wall time and device time of the two chains. Printed, not asserted: the
+/// adapter is shared, and another job on it shows up here as scattered,
+/// inflated kernel times.
 #[test]
 fn reciprocal_pme_timing() {
     let _guard = gpu_test_guard();
@@ -588,8 +612,13 @@ fn reciprocal_pme_timing() {
         return;
     };
     eprintln!("adapter: {}", context.adapter_info().name);
+    if context.adapter_info().device_type == wgpu::DeviceType::Cpu {
+        eprintln!("skipping: the time of a software adapter says nothing about a device");
+        return;
+    }
     for (atoms, box_xyz, grid) in [
-        // Next to nothing to compute: what seven dispatches cost by themselves.
+        // Next to nothing to compute: what seven dispatches and the chains of
+        // memory reads inside them cost by themselves.
         (64usize, [14.0f32, 14.0, 14.0], [16u32, 16, 16]),
         (9_000, [45.0, 45.0, 45.0], [64, 64, 64]),
         (100_000, [100.0, 100.0, 100.0], [128, 128, 128]),
