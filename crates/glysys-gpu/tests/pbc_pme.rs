@@ -513,6 +513,7 @@ fn reciprocal_pme_handles_every_line_length_on_every_axis() {
         ([250.0, 14.0, 120.0], [256, 16, 128]),
         ([120.0, 250.0, 14.0], [128, 256, 16]),
         ([60.0, 28.0, 14.0], [64, 32, 16]),
+        ([14.0, 14.0, 14.0], [16, 16, 16]),
     ] {
         assert_eq!(
             PmeSizing::new(3_000, box_xyz.map(f64::from), 1.0)
@@ -588,7 +589,9 @@ fn reciprocal_pme_timing() {
     };
     eprintln!("adapter: {}", context.adapter_info().name);
     for (atoms, box_xyz, grid) in [
-        (9_000usize, [45.0f32, 45.0, 45.0], [64u32, 64, 64]),
+        // Next to nothing to compute: what seven dispatches cost by themselves.
+        (64usize, [14.0f32, 14.0, 14.0], [16u32, 16, 16]),
+        (9_000, [45.0, 45.0, 45.0], [64, 64, 64]),
         (100_000, [100.0, 100.0, 100.0], [128, 128, 128]),
     ] {
         time_chain(&context, atoms, box_xyz, grid);

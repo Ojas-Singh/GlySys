@@ -7,9 +7,12 @@ use crate::device::Error;
 use crate::pbc_tiles::wide_groups;
 
 /// Smallest and largest mesh size per axis. A mesh line is transformed inside
-/// one workgroup, whose memory holds two buffers of [`MAX_POINTS`] elements.
+/// one workgroup, so it has to fit one of the two buffers of its memory.
 const MIN_POINTS: u32 = 16;
 const MAX_POINTS: u32 = 256;
+/// Elements of one workgroup buffer, `LINE` in the shader: a workgroup
+/// transforms `GROUP_ELEMENTS / K` neighbouring lines of `K` points.
+const GROUP_ELEMENTS: u32 = 256;
 /// Bytes of the uniform: grid and atom count, box and alpha, log2 of the grid.
 const UNIFORM_BYTES: u64 = 48;
 /// Entries of the twiddle table, `exp(-2 pi i j / 256)`.
@@ -208,15 +211,18 @@ impl PmeSizing {
     }
 
     /// Workgroup counts `(x, y)` of a kernel's direct dispatch `(x, y, 1)`:
-    /// 64 atoms per workgroup, or one mesh line (two for the x transforms,
-    /// which pair lines z and z + 1) of the half spectrum.
+    /// 64 atoms per workgroup, or the neighbouring mesh lines that fit the
+    /// workgroup's memory.
     pub fn groups(&self, kernel: PmeKernel) -> (u32, u32) {
         let [kx, ky, kz] = self.grid;
+        // `lines_per_group` of the shader.
+        let lines = |points: u32, available: u32| (GROUP_ELEMENTS / points).min(available);
         match kernel {
             PmeKernel::Spread | PmeKernel::Gather => wide_groups(self.n.div_ceil(64).max(1)),
-            PmeKernel::FftXForward | PmeKernel::FftXInverse => (kz / 2, ky),
-            PmeKernel::FftYForward | PmeKernel::FftYInverse => (kz, kx / 2 + 1),
-            PmeKernel::Convolve | PmeKernel::ConvolveEnergy => (ky, kx / 2 + 1),
+            // One complex line is the two real lines z and z + 1.
+            PmeKernel::FftXForward | PmeKernel::FftXInverse => (kz / 2 / lines(kx, kz / 2), ky),
+            PmeKernel::FftYForward | PmeKernel::FftYInverse => (kz / lines(ky, kz), kx / 2 + 1),
+            PmeKernel::Convolve | PmeKernel::ConvolveEnergy => (ky / lines(kz, ky), kx / 2 + 1),
         }
     }
 }
@@ -528,6 +534,14 @@ mod tests {
         }
     }
 
+    /// The host's dispatch shapes assume the shader's buffer size.
+    #[test]
+    fn group_size_matches_the_shader() {
+        let source = include_str!("pbc_pme.wgsl");
+        assert!(source.contains(&format!("const LINE: u32 = {GROUP_ELEMENTS}u;")));
+        assert!(GROUP_ELEMENTS >= MAX_POINTS && GROUP_ELEMENTS.is_power_of_two());
+    }
+
     /// Workgroup memory stays far below the 16 KiB every device grants.
     #[test]
     fn workgroup_memory_is_small() {
@@ -578,9 +592,22 @@ mod tests {
         let sizing = PmeSizing::with_grid(9_001, [32, 64, 128]).unwrap();
         assert_eq!(sizing.groups(PmeKernel::Spread), (141, 1));
         assert_eq!(sizing.groups(PmeKernel::Gather), (141, 1));
-        assert_eq!(sizing.groups(PmeKernel::FftXForward), (64, 64));
-        assert_eq!(sizing.groups(PmeKernel::FftYInverse), (128, 17));
-        assert_eq!(sizing.groups(PmeKernel::ConvolveEnergy), (64, 17));
+        // Every transform covers each line of its mesh exactly once.
+        for grid in [[32, 64, 128], [16, 16, 16], [256, 16, 256], [64, 64, 64]] {
+            let sizing = PmeSizing::with_grid(100, grid).unwrap();
+            let [kx, ky, kz] = grid;
+            let per_group = |points: u32, available: u32| (GROUP_ELEMENTS / points).min(available);
+            let (x, y) = sizing.groups(PmeKernel::FftXForward);
+            assert_eq!(sizing.groups(PmeKernel::FftXInverse), (x, y));
+            assert_eq!(x * per_group(kx, kz / 2) * 2, kz, "{grid:?}");
+            assert_eq!(y, ky);
+            let (x, y) = sizing.groups(PmeKernel::FftYForward);
+            assert_eq!(sizing.groups(PmeKernel::FftYInverse), (x, y));
+            assert_eq!((x * per_group(ky, kz), y), (kz, kx / 2 + 1), "{grid:?}");
+            let (x, y) = sizing.groups(PmeKernel::Convolve);
+            assert_eq!(sizing.groups(PmeKernel::ConvolveEnergy), (x, y));
+            assert_eq!((x * per_group(kz, ky), y), (ky, kx / 2 + 1), "{grid:?}");
+        }
         let wide = PmeSizing::with_grid(3_000_000, [64, 64, 64]).unwrap();
         assert_eq!(wide.groups(PmeKernel::Spread), (32_768, 2));
         assert_eq!(PmeMesh::chain(false).len(), 7);

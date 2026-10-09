@@ -20,10 +20,17 @@
 //!
 //! The mesh is real, so only the half spectrum kx <= Kx/2 is kept, and the x
 //! transforms carry two real lines (z and z + 1) as the real and imaginary
-//! part of one complex line. A workgroup owns one line: it copies the line to
-//! workgroup memory, runs the Stockham autosort stages there (radix 2, grid
-//! sizes are powers of two up to 256) and writes the line back, so no two
-//! workgroups touch the same element and the transforms run in place.
+//! part of one complex line. A workgroup owns a few neighbouring lines: it
+//! copies them to workgroup memory, runs the Stockham autosort stages there
+//! (radix 2, grid sizes are powers of two up to 256) and writes them back, so
+//! no two workgroups touch the same element and the transforms run in place.
+//!
+//! What a transform costs on a device is mostly how its loads and stores of
+//! the meshes are laid out, not its arithmetic: the lanes of a workgroup
+//! execute one load together, and it is served fastest when their addresses
+//! are neighbours. Hence the layouts (x contiguous in the real meshes, z in
+//! the half spectrum) and, in every copy loop below, lanes that walk along
+//! the contiguous index.
 //!
 //! Everything that depends on the box is computed from the three box lengths
 //! in the uniform at every dispatch, so a barostat kernel can rewrite them on
@@ -43,7 +50,7 @@ struct PmeConfig {
 // sys[2i] = (charge, sigma, epsilon, mass); sys[2i+1] = position, centred on
 // the box and not wrapped.
 @group(0) @binding(1) var<storage, read> sys: array<vec4<f32>>;
-// Charge mesh, index (x * Ky + y) * Kz + z, fixed point with scale 2^26.
+// Charge mesh, index (y * Kz + z) * Kx + x, fixed point with scale 2^26.
 @group(0) @binding(2) var<storage, read_write> charge_mesh: array<atomic<u32>>;
 // The same buffer without atomics, for the transform that reads and clears
 // words that it alone owns.
@@ -68,9 +75,10 @@ override INVERSE: bool = false;
 const COULOMB: f32 = 332.063713299;
 const PI: f32 = 3.14159265358979;
 const WIDE: u32 = 32768u;
-const MESH_SCALE: f32 = 67108864.0;      // 2^26
+const MESH_SCALE: f32 = 67108864.0;           // 2^26
 const MESH_UNIT: f32 = 1.4901161193847656e-8; // 2^-26
-// Half of `line`: the longest mesh line.
+// Elements of one of the two buffers of `line`: the mesh lines a workgroup
+// holds have this many points together. At least the longest line (256).
 const LINE: u32 = 256u;
 
 fn n_atoms() -> u32 { return pc.grid.w; }
@@ -152,17 +160,17 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
   let s = spline(p);
   let grid = pc.grid.xyz;
   let mask = grid - vec3<u32>(1u);
-  for (var jx = 0u; jx < 4u; jx++) {
-    let x = (s.cell.x + jx) & mask.x;
-    let wx = q * MESH_SCALE * s.theta[jx].x;
-    for (var jy = 0u; jy < 4u; jy++) {
-      let y = (s.cell.y + jy) & mask.y;
-      let wxy = wx * s.theta[jy].y;
-      let row = (x * grid.y + y) * grid.z;
-      for (var jz = 0u; jz < 4u; jz++) {
-        let z = (s.cell.z + jz) & mask.z;
-        let value = i32(round(wxy * s.theta[jz].z));
-        atomicAdd(&charge_mesh[row + z], bitcast<u32>(value));
+  for (var jy = 0u; jy < 4u; jy++) {
+    let y = (s.cell.y + jy) & mask.y;
+    let wy = q * MESH_SCALE * s.theta[jy].y;
+    for (var jz = 0u; jz < 4u; jz++) {
+      let z = (s.cell.z + jz) & mask.z;
+      let wyz = wy * s.theta[jz].z;
+      let row = (y * grid.z + z) * grid.x;
+      for (var jx = 0u; jx < 4u; jx++) {
+        let x = (s.cell.x + jx) & mask.x;
+        let value = i32(round(wyz * s.theta[jx].x));
+        atomicAdd(&charge_mesh[row + x], bitcast<u32>(value));
       }
     }
   }
@@ -170,25 +178,33 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
 
 // ---------------------------------------------------------------------------
 // One-dimensional transforms in workgroup memory. `line` is two buffers of
-// 256 elements; a stage reads one and writes the other. Lane `lid` computes
-// the output elements lid, lid + 64, ..., each from two inputs, so a stage
-// has no ordering among the lanes and the barrier after it is the only
-// synchronisation.
+// LINE elements; a stage reads one and writes the other. A workgroup holds
+// as many mesh lines as fit, LINE / K of them side by side (line l at
+// elements l K ... l K + K - 1). Lane `lid` computes the output elements
+// lid, lid + 64, ..., each from two inputs, so a stage has no ordering among
+// the lanes and the barrier after it is the only synchronisation.
 
-var<workgroup> line: array<vec2<f32>, 512>;
+var<workgroup> line: array<vec2<f32>, 2u * LINE>;
+
+// Lines of `points` elements held by one workgroup, of `available` in the
+// direction the workgroups are counted along. A power of two.
+fn lines_per_group(points: u32, available: u32) -> u32 {
+  return min(LINE / points, available);
+}
 
 // Stage `ls` of the decimation-in-frequency Stockham transform of
-// `1 << bits` points: the sequences have length n = N >> ls and stride
-// s = 1 << ls, and output q + s (2 p + r) is
+// `1 << bits` points, on `count` elements (whole lines): the sequences have
+// length n = N >> ls and stride s = 1 << ls, and output q + s (2 p + r) is
 // (x[q + s p] + (-1)^r x[q + s (p + n/2)]) exp(-+2 pi i r p / n).
-fn fft_stage(lid: u32, bits: u32, ls: u32, src: u32, dst: u32, direction: f32) {
+fn fft_stage(lid: u32, bits: u32, count: u32, ls: u32, src: u32, dst: u32, direction: f32) {
   let n = 1u << bits;
   let half = n >> 1u;
   let low = (1u << ls) - 1u;
-  for (var j = lid; j < n; j += 64u) {
+  for (var e = lid; e < count; e += 64u) {
+    let j = e & (n - 1u);
     let t = j >> ls;
     let turn = (t >> 1u) << ls;
-    let ia = src + (j & low) + turn;
+    let ia = src + (e - j) + (j & low) + turn;
     let a = line[ia];
     let b = line[ia + half];
     var value = a + b;
@@ -197,7 +213,7 @@ fn fft_stage(lid: u32, bits: u32, ls: u32, src: u32, dst: u32, direction: f32) {
       let d = a - b;
       value = vec2<f32>(d.x * w.x - direction * d.y * w.y, direction * d.x * w.y + d.y * w.x);
     }
-    line[dst + j] = value;
+    line[dst + e] = value;
   }
 }
 
@@ -205,56 +221,81 @@ fn fft_stage(lid: u32, bits: u32, ls: u32, src: u32, dst: u32, direction: f32) {
 // `direction` is 1 for the forward transform and -1 for the (unnormalised)
 // inverse. Must be called by every lane: the barriers need uniform control
 // flow, which the loop bounds (uniform values) keep.
-fn fft_stages(lid: u32, bits: u32, first: u32, last: u32, start: u32, direction: f32) -> u32 {
+fn fft_stages(lid: u32, bits: u32, count: u32, first: u32, last: u32, start: u32,
+              direction: f32) -> u32 {
   var src = start;
   for (var ls = first; ls < last; ls++) {
-    fft_stage(lid, bits, ls, src, LINE - src, direction);
+    fft_stage(lid, bits, count, ls, src, LINE - src, direction);
     workgroupBarrier();
     src = LINE - src;
   }
   return src;
 }
 
-// x forward. The workgroup (z / 2, y) transforms mesh lines z and z + 1 as
-// one complex line c = a + i b; with C its transform, the transforms of the
-// two real lines are A[k] = (C[k] + conj(C[-k])) / 2 and
-// B[k] = (C[k] - conj(C[-k])) / 2i. Only k <= Kx/2 is stored.
+// x forward. Mesh lines z and z + 1 are transformed as one complex line
+// c = a + i b; with C its transform, the transforms of the two real lines
+// are A[k] = (C[k] + conj(C[-k])) / 2 and B[k] = (C[k] - conj(C[-k])) / 2i.
+// Only k <= Kx/2 is stored. The workgroup (z group, y) holds the complex
+// lines of consecutive z pairs: a contiguous block of the charge mesh.
 @compute @workgroup_size(64)
 fn fft_x_forward(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let points = pc.grid.x;
-  let plane = pc.grid.y * pc.grid.z;
-  let column = group.y * pc.grid.z + 2u * group.x;
-  for (var x = lid; x < points; x += 64u) {
-    let at = x * plane + column;
+  let bits = pc.bits.x;
+  let lines = lines_per_group(points, pc.grid.z / 2u);
+  let count = lines * points;
+  let z0 = 2u * lines * group.x;
+  let row0 = group.y * pc.grid.z + z0;
+  for (var e = lid; e < count; e += 64u) {
+    let at = (row0 + 2u * (e >> bits)) * points + (e & (points - 1u));
     let re = bitcast<i32>(charge_words[at]);
-    let im = bitcast<i32>(charge_words[at + 1u]);
+    let im = bitcast<i32>(charge_words[at + points]);
     charge_words[at] = 0u;
-    charge_words[at + 1u] = 0u;
-    line[x] = MESH_UNIT * vec2<f32>(f32(re), f32(im));
+    charge_words[at + points] = 0u;
+    line[e] = MESH_UNIT * vec2<f32>(f32(re), f32(im));
   }
   workgroupBarrier();
-  let at = fft_stages(lid, pc.bits.x, 0u, pc.bits.x, 0u, 1.0);
-  for (var k = lid; k <= points / 2u; k += 64u) {
-    let direct = line[at + k];
-    let other = line[at + ((points - k) & (points - 1u))];
+  let done = fft_stages(lid, bits, count, 0u, bits, 0u, 1.0);
+  // One real line per lane and step: lanes take neighbouring z, which are
+  // neighbours in the half spectrum.
+  let reals = 2u * lines;
+  let real_bits = countTrailingZeros(reals);
+  let outputs = (points / 2u + 1u) * reals;
+  for (var i = lid; i < outputs; i += 64u) {
+    let zr = i & (reals - 1u);
+    let k = i >> real_bits;
+    let first = done + (zr >> 1u) * points;
+    let direct = line[first + k];
+    let other = line[first + ((points - k) & (points - 1u))];
     let mirror = vec2<f32>(other.x, -other.y);
     let odd = direct - mirror;
-    let out = k * plane + column;
-    spectrum[out] = 0.5 * (direct + mirror);
-    spectrum[out + 1u] = 0.5 * vec2<f32>(odd.y, -odd.x);
+    let value = select(direct + mirror, vec2<f32>(odd.y, -odd.x), (zr & 1u) != 0u);
+    spectrum[(k * pc.grid.y + group.y) * pc.grid.z + z0 + zr] = 0.5 * value;
   }
 }
 
-// y, forward or inverse: the workgroup (z, kx) owns one line.
+// y, forward or inverse: the workgroup (z group, kx) holds the lines of
+// consecutive z, and its lanes take neighbouring z.
 @compute @workgroup_size(64)
 fn fft_y(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let points = pc.grid.y;
+  let bits = pc.bits.y;
   let stride = pc.grid.z;
-  let base = group.y * points * stride + group.x;
-  for (var y = lid; y < points; y += 64u) { line[y] = spectrum[base + y * stride]; }
+  let lines = lines_per_group(points, stride);
+  let line_bits = countTrailingZeros(lines);
+  let count = lines * points;
+  let base = group.y * points * stride + lines * group.x;
+  for (var i = lid; i < count; i += 64u) {
+    let l = i & (lines - 1u);
+    let y = i >> line_bits;
+    line[l * points + y] = spectrum[base + y * stride + l];
+  }
   workgroupBarrier();
-  let at = fft_stages(lid, pc.bits.y, 0u, pc.bits.y, 0u, select(1.0, -1.0, INVERSE));
-  for (var y = lid; y < points; y += 64u) { spectrum[base + y * stride] = line[at + y]; }
+  let done = fft_stages(lid, bits, count, 0u, bits, 0u, select(1.0, -1.0, INVERSE));
+  for (var i = lid; i < count; i += 64u) {
+    let l = i & (lines - 1u);
+    let y = i >> line_bits;
+    spectrum[base + y * stride + l] = line[done + l * points + y];
+  }
 }
 
 // Frequency of mesh index `k`: indices in the upper half are negative.
@@ -264,54 +305,59 @@ fn frequency(k: u32, points: u32) -> f32 {
 
 var<workgroup> sums: array<vec2<f32>, 64>;
 
-// z forward, influence function, z inverse: the workgroup (ky, kx) owns one
-// line of the half spectrum. The influence function
+// z forward, influence function, z inverse: the workgroup (ky group, kx)
+// holds the lines of consecutive ky, a contiguous block of the half
+// spectrum. The influence function
 //   G(m) = C exp(-pi^2 m^2 / alpha^2) / (pi V m^2 |b(m)|^2),  m = k / L,
 // multiplies the outputs of the last forward stage, which needs no twiddle
 // (out[j] = x[j] + x[j + N/2], out[j + N/2] = x[j] - x[j + N/2]). With
-// COMPUTE_ENERGY the line's energy 1/2 sum G |S|^2 and virial
-// sum e(m) (1 - 2 pi^2 m^2 / alpha^2) are returned by lane 0; a line with
-// 0 < kx < Kx/2 stands for its mirror image too.
+// COMPUTE_ENERGY the energy 1/2 sum G |S|^2 and the virial
+// sum e(m) (1 - 2 pi^2 m^2 / alpha^2) of these lines are returned by lane 0;
+// a line with 0 < kx < Kx/2 stands for its mirror image too.
 fn convolve_z(group: vec3<u32>, lid: u32) -> vec2<f32> {
   let points = pc.grid.z;
   let bits = pc.bits.z;
   let half = points >> 1u;
-  let base = (group.y * pc.grid.y + group.x) * points;
-  for (var z = lid; z < points; z += 64u) { line[z] = spectrum[base + z]; }
+  let lines = lines_per_group(points, pc.grid.y);
+  let count = lines * points;
+  let first_ky = lines * group.x;
+  let base = (group.y * pc.grid.y + first_ky) * points;
+  for (var e = lid; e < count; e += 64u) { line[e] = spectrum[base + e]; }
   workgroupBarrier();
-  let at = fft_stages(lid, bits, 0u, bits - 1u, 0u, 1.0);
-  let scaled = LINE - at;
+  let done = fft_stages(lid, bits, count, 0u, bits - 1u, 0u, 1.0);
+  let scaled = LINE - done;
 
   let lengths = pc.box_.xyz;
   let factor = PI * PI / (pc.box_.w * pc.box_.w);
   let mx = f32(group.y) / lengths.x;
-  let my = frequency(group.x, pc.grid.y) / lengths.y;
-  let m2_xy = mx * mx + my * my;
-  let prefactor = COULOMB / (PI * lengths.x * lengths.y * lengths.z)
-    * moduli[group.y] * moduli[pc.grid.x + group.x];
+  let prefactor = COULOMB / (PI * lengths.x * lengths.y * lengths.z) * moduli[group.y];
   let weight = select(1.0, 0.5, group.y == 0u || 2u * group.y == pc.grid.x);
   var total = vec2<f32>(0.0);
-  for (var k = lid; k < points; k += 64u) {
-    let low = k & (half - 1u);
-    let a = line[at + low];
-    let b = line[at + low + half];
+  for (var e = lid; e < count; e += 64u) {
+    let k = e & (points - 1u);
+    let ky = first_ky + (e >> bits);
+    let low = done + (e - k) + (k & (half - 1u));
+    let a = line[low];
+    let b = line[low + half];
     let value = select(a + b, a - b, k >= half);
+    let my = frequency(ky, pc.grid.y) / lengths.y;
     let mz = frequency(k, points) / lengths.z;
-    let m2 = m2_xy + mz * mz;
+    let m2 = mx * mx + my * my + mz * mz;
     var g = 0.0;
     // The m = 0 term is the uniform background, not part of this sum.
     if (m2 > 0.0) {
-      g = prefactor * moduli[pc.grid.x + pc.grid.y + k] * exp(-factor * m2) / m2;
+      g = prefactor * moduli[pc.grid.x + ky] * moduli[pc.grid.x + pc.grid.y + k]
+        * exp(-factor * m2) / m2;
     }
     if (COMPUTE_ENERGY) {
-      let e = weight * g * dot(value, value);
-      total += vec2<f32>(e, e * (1.0 - 2.0 * factor * m2));
+      let energy = weight * g * dot(value, value);
+      total += vec2<f32>(energy, energy * (1.0 - 2.0 * factor * m2));
     }
-    line[scaled + k] = g * value;
+    line[scaled + e] = g * value;
   }
   workgroupBarrier();
-  let back = fft_stages(lid, bits, 0u, bits, scaled, -1.0);
-  for (var z = lid; z < points; z += 64u) { spectrum[base + z] = line[back + z]; }
+  let back = fft_stages(lid, bits, count, 0u, bits, scaled, -1.0);
+  for (var e = lid; e < count; e += 64u) { spectrum[base + e] = line[back + e]; }
 
   if (COMPUTE_ENERGY) {
     sums[lid] = total;
@@ -331,8 +377,8 @@ fn fft_z(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_inde
   convolve_z(group, lid);
 }
 
-// The same with COMPUTE_ENERGY set: one fixed-point add per line into the
-// electrostatic energy and the virial of the tile engine. The words are
+// The same with COMPUTE_ENERGY set: one fixed-point add per workgroup into
+// the electrostatic energy and the virial of the tile engine. The words are
 // cleared by the kernel that publishes them, not here.
 @compute @workgroup_size(64)
 fn fft_z_energy(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
@@ -343,28 +389,40 @@ fn fft_z_energy(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocati
   }
 }
 
-// x inverse. The workgroup (z / 2, y) rebuilds the complex line
-// A + i B of the two real lines z and z + 1 from their half spectra (the
-// mirror half is conj(A) + i conj(B)), transforms it and stores the real
-// part as line z and the imaginary part as line z + 1 of the potential.
+// x inverse. The workgroup (z group, y) rebuilds the complex lines A + i B
+// of the real lines z and z + 1 from their half spectra (the mirror half is
+// conj(A) + i conj(B)), transforms them and stores the real part as line z
+// and the imaginary part as line z + 1 of the potential.
 @compute @workgroup_size(64)
 fn fft_x_inverse(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let points = pc.grid.x;
+  let bits = pc.bits.x;
   let half = points >> 1u;
-  let plane = pc.grid.y * pc.grid.z;
-  let column = group.y * pc.grid.z + 2u * group.x;
-  for (var k = lid; k <= half; k += 64u) {
-    let a = spectrum[k * plane + column];
-    let b = spectrum[k * plane + column + 1u];
-    line[k] = vec2<f32>(a.x - b.y, a.y + b.x);
-    if (k != 0u && k != half) { line[points - k] = vec2<f32>(a.x + b.y, b.x - a.y); }
+  let lines = lines_per_group(points, pc.grid.z / 2u);
+  let line_bits = countTrailingZeros(lines);
+  let count = lines * points;
+  let z0 = 2u * lines * group.x;
+  let row0 = group.y * pc.grid.z + z0;
+  // One complex line per lane and step: lanes take neighbouring z pairs.
+  let inputs = (half + 1u) * lines;
+  for (var i = lid; i < inputs; i += 64u) {
+    let l = i & (lines - 1u);
+    let k = i >> line_bits;
+    let at = (k * pc.grid.y + group.y) * pc.grid.z + z0 + 2u * l;
+    let a = spectrum[at];
+    let b = spectrum[at + 1u];
+    line[l * points + k] = vec2<f32>(a.x - b.y, a.y + b.x);
+    if (k != 0u && k != half) {
+      line[l * points + points - k] = vec2<f32>(a.x + b.y, b.x - a.y);
+    }
   }
   workgroupBarrier();
-  let at = fft_stages(lid, pc.bits.x, 0u, pc.bits.x, 0u, -1.0);
-  for (var x = lid; x < points; x += 64u) {
-    let value = line[at + x];
-    potential[x * plane + column] = value.x;
-    potential[x * plane + column + 1u] = value.y;
+  let done = fft_stages(lid, bits, count, 0u, bits, 0u, -1.0);
+  for (var e = lid; e < count; e += 64u) {
+    let value = line[done + e];
+    let at = (row0 + 2u * (e >> bits)) * points + (e & (points - 1u));
+    potential[at] = value.x;
+    potential[at + points] = value.y;
   }
 }
 
@@ -385,22 +443,22 @@ fn gather(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
   let grid = pc.grid.xyz;
   let mask = grid - vec3<u32>(1u);
   var sum = vec3<f32>(0.0);
-  for (var jx = 0u; jx < 4u; jx++) {
-    let x = (s.cell.x + jx) & mask.x;
+  for (var jy = 0u; jy < 4u; jy++) {
+    let y = (s.cell.y + jy) & mask.y;
     var plane = vec3<f32>(0.0);
-    for (var jy = 0u; jy < 4u; jy++) {
-      let y = (s.cell.y + jy) & mask.y;
-      let row = (x * grid.y + y) * grid.z;
+    for (var jz = 0u; jz < 4u; jz++) {
+      let z = (s.cell.z + jz) & mask.z;
+      let row = (y * grid.z + z) * grid.x;
       var value = 0.0;
       var slope = 0.0;
-      for (var jz = 0u; jz < 4u; jz++) {
-        let phi = potential[row + ((s.cell.z + jz) & mask.z)];
-        value += s.theta[jz].z * phi;
-        slope += s.dtheta[jz].z * phi;
+      for (var jx = 0u; jx < 4u; jx++) {
+        let phi = potential[row + ((s.cell.x + jx) & mask.x)];
+        value += s.theta[jx].x * phi;
+        slope += s.dtheta[jx].x * phi;
       }
-      plane += vec3<f32>(s.theta[jy].y * value, s.dtheta[jy].y * value, s.theta[jy].y * slope);
+      plane += vec3<f32>(s.theta[jz].z * slope, s.theta[jz].z * value, s.dtheta[jz].z * value);
     }
-    sum += vec3<f32>(s.dtheta[jx].x * plane.x, s.theta[jx].x * plane.y, s.theta[jx].x * plane.z);
+    sum += vec3<f32>(s.theta[jy].y * plane.x, s.dtheta[jy].y * plane.y, s.theta[jy].y * plane.z);
   }
   let g = q * vec3<f32>(grid) / pc.box_.xyz * sum;
   pair_grad[i] = vec4<f32>(pair_grad[i].xyz + g, 0.0);
