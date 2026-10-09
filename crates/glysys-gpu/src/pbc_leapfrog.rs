@@ -248,10 +248,6 @@ pub(crate) struct LeapfrogEngine {
 }
 
 impl LeapfrogEngine {
-    pub fn allocation_bytes(atoms: u32) -> u64 {
-        COUPLING_BYTES + 4 * u64::from(atoms) + 48 * u64::from(atoms.div_ceil(PARTIAL_ATOMS)) + 64
-    }
-
     pub fn new(
         device: &wgpu::Device,
         shared: LeapfrogShared<'_>,
@@ -535,7 +531,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} is missing from KERNELS", entry.name));
             assert_eq!(used, listed, "bindings of {}", entry.name);
             let storage = used.len();
-            assert!(storage <= 8, "{} binds {storage} storage buffers", entry.name);
+            assert!(
+                storage <= 8,
+                "{} binds {storage} storage buffers",
+                entry.name
+            );
         }
         assert_eq!(module.entry_points.len(), KERNELS.len());
     }

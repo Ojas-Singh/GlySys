@@ -91,7 +91,12 @@ fn protocol(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Simulati
 }
 
 /// The CPU coupling plan as the numbers the resident integrator takes.
-fn coupling(plan: &CouplingPlan, masses: &[f64], ensemble: Ensemble, tail: f64) -> LeapfrogCoupling {
+fn coupling(
+    plan: &CouplingPlan,
+    masses: &[f64],
+    ensemble: Ensemble,
+    tail: f64,
+) -> LeapfrogCoupling {
     let mut group_bits = plan.group_of_atom.clone();
     let mut com_mass = [0.0; 2];
     for (index, group) in plan.com_groups.iter().enumerate() {
@@ -134,7 +139,9 @@ struct Pair {
 async fn start(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Pair {
     let system = solvated_dipeptide();
     let protocol = protocol(electrostatics, ensemble);
-    let cpu = ExplicitSimulation::new(&system, protocol.clone()).unwrap().into_owned();
+    let cpu = ExplicitSimulation::new(&system, protocol.clone())
+        .unwrap()
+        .into_owned();
     let plan = cpu.coupling_plan().unwrap().clone();
     let backend = match electrostatics {
         ElectrostaticsModel::Pme => {
@@ -155,9 +162,10 @@ async fn start(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Pair 
     };
     let packing = PbcPacking::new(&system, CUTOFF, SKIN).unwrap();
     let context = GpuContext::new(GpuContextOptions::default()).await.unwrap();
-    let mut gpu = ResidentPbc::with_context_kernel(&context, &packing, &backend, 1 << 20, PbcKernel::Tiles)
-        .await
-        .unwrap();
+    let mut gpu =
+        ResidentPbc::with_context_kernel(&context, &packing, &backend, 1 << 20, PbcKernel::Tiles)
+            .await
+            .unwrap();
     gpu.configure_leapfrog(coupling(
         &plan,
         cpu.masses(),
@@ -166,7 +174,11 @@ async fn start(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Pair 
     ))
     .await
     .unwrap();
-    gpu.set_coordinates(&cpu.state.coordinates, cpu.state.box_angstrom.map(|v| v as f32), true);
+    gpu.set_coordinates(
+        &cpu.state.coordinates,
+        cpu.state.box_angstrom.map(|v| v as f32),
+        true,
+    );
     gpu.set_velocities(&cpu.state.velocities).unwrap();
     gpu.energy_and_forces(true).await.unwrap();
     gpu.set_leapfrog_variables(&LeapfrogVariables {
@@ -175,7 +187,12 @@ async fn start(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Pair 
     })
     .unwrap();
     let molecules = glysys_energy::pbc::molecules(&system);
-    Pair { cpu, gpu, plan, molecules }
+    Pair {
+        cpu,
+        gpu,
+        plan,
+        molecules,
+    }
 }
 
 /// Largest distance between corresponding atoms, modulo the box: the device
@@ -226,7 +243,10 @@ fn follows_in_nvt(electrostatics: ElectrostaticsModel) {
         // center-of-mass motion
         for step in [1, 2, 7, 12] {
             let (variables, distance) = advance_to(&mut pair, &mut done, step).await;
-            assert!(distance < 2e-4 * step as f64, "{electrostatics:?} step {step}: {distance:e} A apart");
+            assert!(
+                distance < 2e-4 * step as f64,
+                "{electrostatics:?} step {step}: {distance:e} A apart"
+            );
             let coupling = pair.cpu.state.coupling.as_ref().unwrap();
             for group in 0..2 {
                 let (cpu, gpu) = (
@@ -238,7 +258,10 @@ fn follows_in_nvt(electrostatics: ElectrostaticsModel) {
                     "{electrostatics:?} step {step} group {group}: friction {cpu} on the CPU, {gpu} on the device"
                 );
             }
-            assert_eq!(variables.box_angstrom.map(|b| b as f32), pair.cpu.state.box_angstrom.map(|b| b as f32));
+            assert_eq!(
+                variables.box_angstrom.map(|b| b as f32),
+                pair.cpu.state.box_angstrom.map(|b| b as f32)
+            );
         }
     });
 }
@@ -252,11 +275,20 @@ fn follows_in_npt(electrostatics: ElectrostaticsModel) {
         // the pressures of steps 0, 4 and 8 drive the box on steps 1, 5 and 9
         for step in [1, 2, 6, 10, 13] {
             let (variables, distance) = advance_to(&mut pair, &mut done, step).await;
-            assert!(distance < 3e-4 * step as f64, "{electrostatics:?} step {step}: {distance:e} A apart");
+            assert!(
+                distance < 3e-4 * step as f64,
+                "{electrostatics:?} step {step}: {distance:e} A apart"
+            );
             let coupling = pair.cpu.state.coupling.as_ref().unwrap();
             for axis in 0..3 {
-                let (cpu, gpu) = (pair.cpu.state.box_angstrom[axis], variables.box_angstrom[axis]);
-                assert!((cpu - gpu).abs() < 2e-5 * cpu, "{electrostatics:?} step {step}: box {cpu} / {gpu}");
+                let (cpu, gpu) = (
+                    pair.cpu.state.box_angstrom[axis],
+                    variables.box_angstrom[axis],
+                );
+                assert!(
+                    (cpu - gpu).abs() < 2e-5 * cpu,
+                    "{electrostatics:?} step {step}: box {cpu} / {gpu}"
+                );
                 let (cpu, gpu) = (coupling.box_velocity[axis], variables.box_velocity[axis]);
                 assert!(
                     (cpu - gpu).abs() < 2e-3 * cpu.abs().max(1e-2),
@@ -289,7 +321,10 @@ fn follows_in_npt(electrostatics: ElectrostaticsModel) {
                 expected[group]
             );
             let temperature = 2.0 * got / (pair.plan.groups[group].degrees_of_freedom * KB);
-            assert!(temperature > 50.0 && temperature < 1000.0, "group {group} at {temperature} K");
+            assert!(
+                temperature > 50.0 && temperature < 1000.0,
+                "group {group} at {temperature} K"
+            );
         }
         // The box has moved, and the two engines agree on the pressure of
         // step 12, which both have just computed for the barostat.
@@ -298,7 +333,8 @@ fn follows_in_npt(electrostatics: ElectrostaticsModel) {
         let coupling = pair.cpu.state.coupling.as_ref().unwrap();
         assert_eq!(coupling.pressure_step, Some(12));
         assert!(
-            (coupling.pressure_bar - variables.pressure_bar).abs() < 5.0 + 2e-3 * coupling.pressure_bar.abs(),
+            (coupling.pressure_bar - variables.pressure_bar).abs()
+                < 5.0 + 2e-3 * coupling.pressure_bar.abs(),
             "{electrostatics:?}: pressure {} bar on the CPU, {} on the device",
             coupling.pressure_bar,
             variables.pressure_bar
@@ -336,7 +372,12 @@ fn molecules_come_back_into_the_box_whole() {
         let cell = pair.cpu.state.box_angstrom;
         // every third molecule starts one to three boxes away along an axis
         let mut displaced = pair.cpu.state.coordinates.clone();
-        for (index, molecule) in pair.molecules.iter().enumerate().filter(|(index, _)| index % 3 == 0) {
+        for (index, molecule) in pair
+            .molecules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 == 0)
+        {
             let boxes = (1 + (index / 9) % 3) as f64 * if index % 2 == 0 { 1.0 } else { -1.0 };
             for &atom in molecule {
                 match (index / 3) % 3 {
@@ -346,7 +387,8 @@ fn molecules_come_back_into_the_box_whole() {
                 }
             }
         }
-        pair.gpu.set_coordinates(&displaced, cell.map(|v| v as f32), true);
+        pair.gpu
+            .set_coordinates(&displaced, cell.map(|v| v as f32), true);
         pair.gpu.set_velocities(&pair.cpu.state.velocities).unwrap();
         pair.gpu.energy_and_forces(true).await.unwrap();
         pair.gpu
@@ -357,7 +399,10 @@ fn molecules_come_back_into_the_box_whole() {
             .unwrap();
         let mut done = 0;
         let (variables, distance) = advance_to(&mut pair, &mut done, 1).await;
-        assert!(distance < 2e-4, "{distance:e} A from the CPU step, modulo the box");
+        assert!(
+            distance < 2e-4,
+            "{distance:e} A from the CPU step, modulo the box"
+        );
         let state = pair
             .gpu
             .read_dynamics_checkpoint(variables.box_angstrom.map(|v| v as f32))
@@ -366,7 +411,10 @@ fn molecules_come_back_into_the_box_whole() {
         for molecule in &pair.molecules {
             let first = state.coordinates[molecule[0]];
             for (value, length) in [first.x, first.y, first.z].into_iter().zip(cell) {
-                assert!(value > -0.5 && value < length + 0.5, "first atom at {value} in a box of {length}");
+                assert!(
+                    value > -0.5 && value < length + 0.5,
+                    "first atom at {value} in a box of {length}"
+                );
             }
             // whole: every atom is where the CPU has it relative to the first
             let reference = pair.cpu.state.coordinates[molecule[0]];
@@ -375,7 +423,10 @@ fn molecules_come_back_into_the_box_whole() {
                 let apart = ((p.x - first.x) - (q.x - reference.x)).abs()
                     + ((p.y - first.y) - (q.y - reference.y)).abs()
                     + ((p.z - first.z) - (q.z - reference.z)).abs();
-                assert!(apart < 1e-3, "atom {atom} is {apart} A from its place in the molecule");
+                assert!(
+                    apart < 1e-3,
+                    "atom {atom} is {apart} A from its place in the molecule"
+                );
             }
         }
     });
