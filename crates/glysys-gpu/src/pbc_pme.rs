@@ -211,14 +211,15 @@ impl PmeSizing {
     }
 
     /// Workgroup counts `(x, y)` of a kernel's direct dispatch `(x, y, 1)`:
-    /// 64 atoms per workgroup, or the neighbouring mesh lines that fit the
+    /// 16 atoms per workgroup, or the neighbouring mesh lines that fit the
     /// workgroup's memory.
     pub fn groups(&self, kernel: PmeKernel) -> (u32, u32) {
         let [kx, ky, kz] = self.grid;
         // `lines_per_group` of the shader.
         let lines = |points: u32, available: u32| (GROUP_ELEMENTS / points).min(available);
         match kernel {
-            PmeKernel::Spread | PmeKernel::Gather => wide_groups(self.n.div_ceil(64).max(1)),
+            // Four lanes per atom.
+            PmeKernel::Spread | PmeKernel::Gather => wide_groups(self.n.div_ceil(16).max(1)),
             // One complex line is the two real lines z and z + 1.
             PmeKernel::FftXForward | PmeKernel::FftXInverse => (kz / 2 / lines(kx, kz / 2), ky),
             PmeKernel::FftYForward | PmeKernel::FftYInverse => (kz / lines(ky, kz), kx / 2 + 1),
@@ -590,8 +591,8 @@ mod tests {
     #[test]
     fn dispatch_shapes_cover_the_mesh() {
         let sizing = PmeSizing::with_grid(9_001, [32, 64, 128]).unwrap();
-        assert_eq!(sizing.groups(PmeKernel::Spread), (141, 1));
-        assert_eq!(sizing.groups(PmeKernel::Gather), (141, 1));
+        assert_eq!(sizing.groups(PmeKernel::Spread), (563, 1));
+        assert_eq!(sizing.groups(PmeKernel::Gather), (563, 1));
         // Every transform covers each line of its mesh exactly once.
         for grid in [[32, 64, 128], [16, 16, 16], [256, 16, 256], [64, 64, 64]] {
             let sizing = PmeSizing::with_grid(100, grid).unwrap();
@@ -609,7 +610,7 @@ mod tests {
             assert_eq!((x * per_group(kz, ky), y), (ky, kx / 2 + 1), "{grid:?}");
         }
         let wide = PmeSizing::with_grid(3_000_000, [64, 64, 64]).unwrap();
-        assert_eq!(wide.groups(PmeKernel::Spread), (32_768, 2));
+        assert_eq!(wide.groups(PmeKernel::Spread), (32_768, 6));
         assert_eq!(PmeMesh::chain(false).len(), 7);
         assert_eq!(PmeMesh::chain(true)[3], PmeKernel::ConvolveEnergy);
     }

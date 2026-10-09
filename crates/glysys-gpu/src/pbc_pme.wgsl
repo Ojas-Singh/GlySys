@@ -110,14 +110,20 @@ fn acc_add(word: u32, v: f32) {
 fn energy_word(slot: u32) -> u32 { return 6u * n_atoms() + 2u * slot; }
 
 // ---------------------------------------------------------------------------
-// Cardinal B-splines of order 4. `theta[k]` holds, for the three axes, the
-// weight of mesh point `cell + k`; `dtheta[k]` its derivative with respect to
-// the scaled coordinate. The recursion is the one of the CPU engine.
+// Cardinal B-splines of order 4. For each axis a vector holds the weights of
+// the mesh points `cell`, `cell + 1`, ... and a second one their derivatives
+// with respect to the scaled coordinate. The recursion is the one of the CPU
+// engine. Vectors, not arrays: an array indexed in a loop lives in memory on
+// a device, and each read of it then costs as much as a read of the mesh.
 
 struct Spline {
   cell: vec3<u32>,
-  theta: array<vec3<f32>, 4>,
-  dtheta: array<vec3<f32>, 4>,
+  tx: vec4<f32>,
+  ty: vec4<f32>,
+  tz: vec4<f32>,
+  dx: vec4<f32>,
+  dy: vec4<f32>,
+  dz: vec4<f32>,
 }
 
 fn spline(p: vec3<f32>) -> Spline {
@@ -133,26 +139,33 @@ fn spline(p: vec3<f32>) -> Spline {
   let a1 = 0.5 * ((w + 1.0) * (1.0 - w) + (2.0 - w) * w);
   let a2 = 0.5 * w * w;
   let third = 1.0 / 3.0;
-  var s: Spline;
-  s.cell = min(vec3<u32>(cell), pc.grid.xyz - vec3<u32>(1u));
-  s.dtheta[0] = -a0;
-  s.dtheta[1] = a0 - a1;
-  s.dtheta[2] = a1 - a2;
-  s.dtheta[3] = a2;
-  s.theta[0] = third * (1.0 - w) * a0;
-  s.theta[1] = third * ((w + 2.0) * a0 + (2.0 - w) * a1);
-  s.theta[2] = third * ((w + 1.0) * a1 + (3.0 - w) * a2);
-  s.theta[3] = third * w * a2;
-  return s;
+  let t0 = third * (1.0 - w) * a0;
+  let t1 = third * ((w + 2.0) * a0 + (2.0 - w) * a1);
+  let t2 = third * ((w + 1.0) * a1 + (3.0 - w) * a2);
+  let t3 = third * w * a2;
+  let d1 = a0 - a1;
+  let d2 = a1 - a2;
+  return Spline(
+    min(vec3<u32>(cell), pc.grid.xyz - vec3<u32>(1u)),
+    vec4<f32>(t0.x, t1.x, t2.x, t3.x),
+    vec4<f32>(t0.y, t1.y, t2.y, t3.y),
+    vec4<f32>(t0.z, t1.z, t2.z, t3.z),
+    vec4<f32>(-a0.x, d1.x, d2.x, a2.x),
+    vec4<f32>(-a0.y, d1.y, d2.y, a2.y),
+    vec4<f32>(-a0.z, d1.z, d2.z, a2.z));
 }
 
 fn usable(q: f32, p: vec3<f32>) -> bool {
   return q != 0.0 && all(abs(p) < vec3<f32>(1e20));
 }
 
+// Spread and gather give an atom four lanes, one per mesh point along x. A
+// lane then has 16 mesh words to touch instead of 64, one after the other,
+// and the four lanes of an atom touch four neighbouring words together.
+
 @compute @workgroup_size(64)
 fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  let i = wide_index(group) * 64u + lid;
+  let i = wide_index(group) * 16u + (lid >> 2u);
   if (i >= n_atoms()) { return; }
   let q = sys[2u * i].x;
   let p = sys[2u * i + 1u].xyz;
@@ -160,18 +173,16 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
   let s = spline(p);
   let grid = pc.grid.xyz;
   let mask = grid - vec3<u32>(1u);
+  let jx = lid & 3u;
+  let x = (s.cell.x + jx) & mask.x;
+  let wx = q * MESH_SCALE * s.tx[jx];
   for (var jy = 0u; jy < 4u; jy++) {
     let y = (s.cell.y + jy) & mask.y;
-    let wy = q * MESH_SCALE * s.theta[jy].y;
+    let wxy = wx * s.ty[jy];
     for (var jz = 0u; jz < 4u; jz++) {
       let z = (s.cell.z + jz) & mask.z;
-      let wyz = wy * s.theta[jz].z;
-      let row = (y * grid.z + z) * grid.x;
-      for (var jx = 0u; jx < 4u; jx++) {
-        let x = (s.cell.x + jx) & mask.x;
-        let value = i32(round(wyz * s.theta[jx].x));
-        atomicAdd(&charge_mesh[row + x], bitcast<u32>(value));
-      }
+      let value = i32(round(wxy * s.tz[jz]));
+      atomicAdd(&charge_mesh[(y * grid.z + z) * grid.x + x], bitcast<u32>(value));
     }
   }
 }
@@ -444,37 +455,51 @@ fn fft_x_inverse(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocat
 // ---------------------------------------------------------------------------
 // Gradient dE/dr of every atom from the mesh potential and the analytic
 // spline derivatives, added to the pair gradient the pair kernel stored
-// earlier in the pass. One invocation owns the atom and stores the element
-// whole.
+// earlier in the pass. Each of the atom's four lanes sums its plane of the
+// stencil; the atom's first lane adds the four parts in lane order and
+// stores the element whole.
+
+var<workgroup> parts: array<vec4<f32>, 64>;
 
 @compute @workgroup_size(64)
 fn gather(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  let i = wide_index(group) * 64u + lid;
-  if (i >= n_atoms()) { return; }
-  let q = sys[2u * i].x;
-  let p = sys[2u * i + 1u].xyz;
-  if (!usable(q, p)) { return; }
-  let s = spline(p);
-  let grid = pc.grid.xyz;
-  let mask = grid - vec3<u32>(1u);
-  var sum = vec3<f32>(0.0);
-  for (var jy = 0u; jy < 4u; jy++) {
-    let y = (s.cell.y + jy) & mask.y;
-    var plane = vec3<f32>(0.0);
-    for (var jz = 0u; jz < 4u; jz++) {
-      let z = (s.cell.z + jz) & mask.z;
-      let row = (y * grid.z + z) * grid.x;
-      var value = 0.0;
-      var slope = 0.0;
-      for (var jx = 0u; jx < 4u; jx++) {
-        let phi = potential[row + ((s.cell.x + jx) & mask.x)];
-        value += s.theta[jx].x * phi;
-        slope += s.dtheta[jx].x * phi;
+  let i = wide_index(group) * 16u + (lid >> 2u);
+  var part = vec3<f32>(0.0);
+  var valid = false;
+  if (i < n_atoms()) {
+    let q = sys[2u * i].x;
+    let p = sys[2u * i + 1u].xyz;
+    if (usable(q, p)) {
+      valid = true;
+      let s = spline(p);
+      let grid = pc.grid.xyz;
+      let mask = grid - vec3<u32>(1u);
+      let jx = lid & 3u;
+      let x = (s.cell.x + jx) & mask.x;
+      // Sums over the lane's 16 points with the weights of y and z: plain,
+      // differentiated along y, differentiated along z.
+      var sum = vec3<f32>(0.0);
+      for (var jy = 0u; jy < 4u; jy++) {
+        let y = (s.cell.y + jy) & mask.y;
+        var value = 0.0;
+        var slope = 0.0;
+        for (var jz = 0u; jz < 4u; jz++) {
+          let z = (s.cell.z + jz) & mask.z;
+          let phi = potential[(y * grid.z + z) * grid.x + x];
+          value += s.tz[jz] * phi;
+          slope += s.dz[jz] * phi;
+        }
+        sum += vec3<f32>(s.ty[jy] * value, s.dy[jy] * value, s.ty[jy] * slope);
       }
-      plane += vec3<f32>(s.theta[jz].z * slope, s.theta[jz].z * value, s.dtheta[jz].z * value);
+      part = q * vec3<f32>(grid) / pc.box_.xyz * vec3<f32>(s.dx[jx], s.tx[jx], s.tx[jx]) * sum;
     }
-    sum += vec3<f32>(s.theta[jy].y * plane.x, s.dtheta[jy].y * plane.y, s.theta[jy].y * plane.z);
   }
-  let g = q * vec3<f32>(grid) / pc.box_.xyz * sum;
-  pair_grad[i] = vec4<f32>(pair_grad[i].xyz + g, 0.0);
+  parts[lid] = vec4<f32>(part, 0.0);
+  workgroupBarrier();
+  if (valid && jx_first(lid)) {
+    let g = ((parts[lid].xyz + parts[lid + 1u].xyz) + parts[lid + 2u].xyz) + parts[lid + 3u].xyz;
+    pair_grad[i] = vec4<f32>(pair_grad[i].xyz + g, 0.0);
+  }
 }
+
+fn jx_first(lid: u32) -> bool { return (lid & 3u) == 0u; }
