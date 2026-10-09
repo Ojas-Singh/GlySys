@@ -594,16 +594,50 @@ fn reciprocal_pme_timing() {
         (9_000, [45.0, 45.0, 45.0], [64, 64, 64]),
         (100_000, [100.0, 100.0, 100.0], [128, 128, 128]),
     ] {
-        time_chain(&context, atoms, box_xyz, grid);
+        time_chain(&context, atoms, box_xyz, grid, false);
+        time_chain(&context, atoms, box_xyz, grid, true);
     }
 }
 
-fn time_chain(context: &GpuContext, atoms: usize, box_xyz: [f32; 3], grid: [u32; 3]) {
+/// The atoms reordered along a Morton curve of cells about 3 A wide: what
+/// `sys` looks like while neighbours in space are neighbours in index, as
+/// the waters of a freshly built box are.
+fn spatially_sorted(
+    charges: &[f32],
+    positions: &[[f32; 3]],
+    box_xyz: [f32; 3],
+) -> (Vec<f32>, Vec<[f32; 3]>) {
+    let key = |p: &[f32; 3]| {
+        let mut code = 0u64;
+        for axis in 0..3 {
+            let fraction = (p[axis] / box_xyz[axis] + 0.5).rem_euclid(1.0);
+            let cell = (fraction * (box_xyz[axis] / 3.0).ceil()) as u64;
+            for bit in 0..10 {
+                code |= ((cell >> bit) & 1) << (3 * bit + axis);
+            }
+        }
+        code
+    };
+    let mut order: Vec<usize> = (0..charges.len()).collect();
+    order.sort_by_key(|atom| key(&positions[*atom]));
+    (
+        order.iter().map(|atom| charges[*atom]).collect(),
+        order.iter().map(|atom| positions[*atom]).collect(),
+    )
+}
+
+fn time_chain(context: &GpuContext, atoms: usize, box_xyz: [f32; 3], grid: [u32; 3], sorted: bool) {
     const CHAINS: usize = 200;
     const SUBMISSIONS: usize = 4;
     let charges = Charges::random(atoms, 0x5851_F42D_4C95_7F2D);
     let harness = Harness::new(context, atoms, grid);
-    harness.set_system(&charges.q, &charges.positions(box_xyz));
+    let positions = charges.positions(box_xyz);
+    if sorted {
+        let (q, positions) = spatially_sorted(&charges.q, &positions, box_xyz);
+        harness.set_system(&q, &positions);
+    } else {
+        harness.set_system(&charges.q, &positions);
+    }
     harness.mesh.upload(context.queue(), box_xyz);
     harness.clear_acc();
     let device = context.device();
@@ -636,9 +670,14 @@ fn time_chain(context: &GpuContext, atoms: usize, box_xyz: [f32; 3], grid: [u32;
         wall[slot] = started.elapsed().as_secs_f64() * 1e6 / (CHAINS * SUBMISSIONS) as f64;
     }
     eprintln!(
-        "{atoms} atoms, mesh {}x{}x{}: {:.1} us per force-only chain, {:.1} us per energy chain \
-         (wall, {SUBMISSIONS} submissions of {CHAINS} chains)",
-        grid[0], grid[1], grid[2], wall[0], wall[1],
+        "{atoms} atoms in {} order, mesh {}x{}x{}: {:.1} us per force-only chain, {:.1} us per \
+         energy chain (wall, {SUBMISSIONS} submissions of {CHAINS} chains)",
+        if sorted { "spatial" } else { "random" },
+        grid[0],
+        grid[1],
+        grid[2],
+        wall[0],
+        wall[1],
     );
 
     // Device time per kernel from timestamps written between the dispatches.
