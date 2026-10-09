@@ -54,7 +54,9 @@ with N0 the ion pairs the water of the box holds at that concentration
 (55.34 mol/L of water) and Q the charge of the solute, the box gets
 sqrt(N0² + Q²/4) − Q/2 sodium and sqrt(N0² + Q²/4) + Q/2 chloride ions. A
 neutral solute gets N0 pairs, and `--salt 0` leaves only the neutralizing
-counter-ions.
+counter-ions. The ions replace waters chosen in a pseudo-random order set by
+`--seed`, at least 5 Å from the solute and from each other, so they start
+spread through the solvent.
 
 `glysys-md` is the native session adapter; it does not require WASM or a
 browser. `--threads` is per process, so a Slurm replica should receive only

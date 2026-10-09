@@ -2083,9 +2083,13 @@ mod tests {
             totals.virial
         );
         let coulomb_virial = full.virial_pair_split[1];
+        // The kernel sums both parts of the pair virial in single precision.
+        // A jittered box has close contacts, and next to their Lennard-Jones
+        // part (1e7 here) the electrostatic part carries the rounding of that
+        // sum as well as its own.
         assert!(
             (totals.virial_pair_split[1] - coulomb_virial).abs()
-                <= 1e-3 * coulomb_virial.abs().max(10.),
+                <= 1e-3 * coulomb_virial.abs().max(10.) + 1e-6 * virial.abs(),
             "electrostatic virial {} vs {coulomb_virial}",
             totals.virial_pair_split[1]
         );
