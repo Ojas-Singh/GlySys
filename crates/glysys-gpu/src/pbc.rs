@@ -22,6 +22,7 @@ use crate::device::{Error, Special};
 use crate::pbc_leapfrog::{
     LeapfrogCoupling, LeapfrogEngine, LeapfrogKernel, LeapfrogShared, LeapfrogVariables,
 };
+use crate::pbc_pme::{PmeKernel, PmeMesh, PmeShared, PmeSizing};
 use crate::pbc_tiles::{SharedBuffers, TileEngine, TileKernel, TilePacking, TileSizing};
 use glysys::{ParameterizedSystem, Vec3};
 use glysys_energy::pbc::{
@@ -43,6 +44,8 @@ const INDIRECT_NEIGHBOR_DISPATCH: u32 = u32::MAX;
 const TILE_JOB: usize = 1000;
 /// Job codes of the leap-frog coupling kernels.
 const LEAPFROG_JOB: usize = 2000;
+/// Job codes of the PME mesh kernels.
+const PME_JOB: usize = 3000;
 /// SETTLE/SHAKE that also records the constraint virial.
 const SETTLE_VIRIAL: usize = 30;
 
@@ -380,7 +383,7 @@ impl PbcPacking {
 fn electrostatics_uniform(
     backend: &NonbondedElectrostatics,
     cutoff: f64,
-) -> Result<([f32; 4], Option<EwaldPairPolynomials>), Error> {
+) -> Result<([f32; 4], Option<(EwaldPairPolynomials, [usize; 3])>), Error> {
     match backend {
         NonbondedElectrostatics::ReactionField {
             cutoff_angstrom,
@@ -397,7 +400,7 @@ fn electrostatics_uniform(
         NonbondedElectrostatics::Pme {
             alpha_per_angstrom,
             interpolation_order,
-            ..
+            grid,
         } => {
             if *interpolation_order != 4 {
                 return Err(Error::Input("GPU PME interpolates with order 4 only"));
@@ -406,7 +409,7 @@ fn electrostatics_uniform(
                 .map_err(|_| Error::Input("Ewald coefficient and cutoff"))?;
             Ok((
                 [1., cutoff as f32, *alpha_per_angstrom as f32, 0.],
-                Some(ewald),
+                Some((ewald, *grid)),
             ))
         }
     }
@@ -556,6 +559,8 @@ pub struct ResidentPbc {
     tiled_nonbonded: bool,
     kernel: PbcKernel,
     tiles: Option<TileEngine>,
+    /// Reciprocal-space PME; its kernels run after the pair kernel.
+    mesh: Option<PmeMesh>,
     leapfrog: Option<LeapfrogEngine>,
     /// PME: self energy (kcal/mol) and the coefficient of the uniform
     /// background energy of a charged box (kcal Å³/mol, over the volume).
@@ -796,7 +801,8 @@ impl ResidentPbc {
         kernel: PbcKernel,
     ) -> Result<Self, Error> {
         let tiled_nonbonded = kernel == PbcKernel::FixedRows;
-        let (electro, ewald) = electrostatics_uniform(backend, packing.cutoff)?;
+        let (electro, pme) = electrostatics_uniform(backend, packing.cutoff)?;
+        let ewald = pme.map(|(ewald, _)| ewald);
         // The packing cutoff and the backend cutoff must agree: cells are
         // sized for one limit, physics evaluated at one cutoff.
         if (electro[1] as f64 - packing.cutoff).abs() > 1e-6 {
@@ -844,6 +850,25 @@ impl ResidentPbc {
         let tile_bytes = tile_plan.as_ref().map_or(0, |(tile_packing, sizing)| {
             TileEngine::allocation_bytes(sizing, tile_packing)
         });
+        // The device transforms in radix 2: every axis takes the next power
+        // of two above the requested mesh, so the mesh is never coarser.
+        let mesh_sizing = pme
+            .map(|(_, grid)| {
+                let mut points = [0u32; 3];
+                for (device, requested) in points.iter_mut().zip(grid) {
+                    *device = u32::try_from(requested)
+                        .ok()
+                        .and_then(u32::checked_next_power_of_two)
+                        .ok_or(Error::Capacity)?
+                        .max(16);
+                }
+                PmeSizing::with_grid(n, points)
+            })
+            .transpose()?;
+        let mesh_bytes = mesh_sizing.map_or(0, |sizing| sizing.allocation_bytes());
+        if mesh_sizing.is_some_and(|sizing| sizing.largest_binding_bytes() > max_buffer) {
+            return Err(Error::Capacity);
+        }
         let sys_bytes = n64.checked_mul(32).ok_or(Error::Capacity)?;
         // Cell heads, links, two range words/atom, pair counter, and a
         // single atomic numerical-status flag.
@@ -880,6 +905,7 @@ impl ResidentPbc {
             .and_then(|v| v.checked_add(64 * 4))
             .and_then(|v| v.checked_add(out_bytes))
             .and_then(|v| v.checked_add(tile_bytes))
+            .and_then(|v| v.checked_add(mesh_bytes))
             .ok_or(Error::Capacity)?;
         // A dynamics snapshot packs 5 per-atom regions plus a 32-byte
         // scalar block and a 4-byte status word in one transfer.  Keep a
@@ -1144,6 +1170,20 @@ impl ResidentPbc {
                 status_word + 1,
             )
         });
+        let mesh = match (&tiles, mesh_sizing, ewald) {
+            (Some(tiles), Some(sizing), Some(ewald)) => Some(PmeMesh::new(
+                &device,
+                &queue,
+                sizing,
+                PmeShared {
+                    sys: &buffers[1],
+                    pair_grad: &tiles.pair_grad,
+                    acc: &tiles.acc,
+                },
+                ewald.alpha_per_angstrom as f32,
+            )),
+            _ => None,
+        };
         let validation = crate::pop_error_scope(&device).await;
         let allocation = crate::pop_error_scope(&device).await;
         if let Some(e) = validation {
@@ -1186,6 +1226,7 @@ impl ResidentPbc {
             tiled_nonbonded,
             kernel,
             tiles,
+            mesh,
             leapfrog: None,
             ewald_constants: ewald.map(|ewald| {
                 let alpha = ewald.alpha_per_angstrom;
@@ -1385,6 +1426,9 @@ impl ResidentPbc {
         if let Some(tiles) = &self.tiles {
             tiles.upload(&self.queue, box_xyz, reset_neighbor_search);
         }
+        if let Some(mesh) = &self.mesh {
+            mesh.upload(&self.queue, box_xyz);
+        }
         if reset_neighbor_search {
             self.queue
                 .write_buffer(&self.buffers[2], 0, &vec![0xFFu8; self.ncells as usize * 4]);
@@ -1562,6 +1606,19 @@ impl ResidentPbc {
     }
 
     fn encode_job(&self, pass: &mut wgpu::ComputePass<'_>, pipeline: usize, groups: u32) {
+        if pipeline >= PME_JOB {
+            let mesh = self
+                .mesh
+                .as_ref()
+                .expect("mesh jobs are only expanded for PME electrostatics");
+            let kernel = PmeKernel::from_job(pipeline - PME_JOB);
+            let (compute, bind_group) = mesh.kernel(kernel);
+            let (x, y) = mesh.groups(kernel);
+            pass.set_pipeline(compute);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(x, y, 1);
+            return;
+        }
         if pipeline >= LEAPFROG_JOB {
             let engine = self
                 .leapfrog
@@ -1605,7 +1662,9 @@ impl ResidentPbc {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn stage_name(&self, pipeline: usize) -> &'static str {
-        if pipeline >= LEAPFROG_JOB {
+        if pipeline >= PME_JOB {
+            PmeKernel::from_job(pipeline - PME_JOB).stage_name()
+        } else if pipeline >= LEAPFROG_JOB {
             LeapfrogKernel::from_job(pipeline - LEAPFROG_JOB).stage_name()
         } else if pipeline >= TILE_JOB {
             TileKernel::from_job(pipeline - TILE_JOB).stage_name()
@@ -1645,11 +1704,19 @@ impl ResidentPbc {
                             expanded.push(self.tile_job(kernel));
                         }
                     }
-                    2 => expanded.push(self.tile_job(if energy {
-                        TileKernel::PairEnergy
-                    } else {
-                        TileKernel::PairForces
-                    })),
+                    2 => {
+                        expanded.push(self.tile_job(if energy {
+                            TileKernel::PairEnergy
+                        } else {
+                            TileKernel::PairForces
+                        }));
+                        // The mesh adds its gradient to the pair gradient.
+                        if self.mesh.is_some() {
+                            for kernel in PmeMesh::chain(energy) {
+                                expanded.push((PME_JOB + kernel.job(), 0));
+                            }
+                        }
+                    }
                     4 => {
                         expanded.push(self.tile_job(match (all_terms, energy) {
                             (true, true) => TileKernel::BondedAllEnergy,
@@ -2582,7 +2649,12 @@ impl ResidentPbc {
                 aux: &self.buffers[2],
                 pbc_config: &self.buffers[0],
                 tile_config: &tiles.uniform,
-                mesh_config: None,
+                mesh_config: self.mesh.as_ref().map(|mesh| {
+                    (
+                        mesh.uniform(),
+                        (crate::pbc_pme::BOX_OFFSET_BYTES / 16) as u32,
+                    )
+                }),
                 status_word,
                 rebuild_word: status_word + 1,
                 cutoff: self.electro[1],

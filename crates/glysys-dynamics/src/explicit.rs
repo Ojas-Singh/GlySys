@@ -90,14 +90,21 @@ pub fn pme_parameters(
     protocol: &SimulationProtocol,
 ) -> Result<PmeParameters> {
     let prepared_box = BoxVectors::from_system(system).map_err(Error::Energy)?;
+    let tolerance = protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE);
+    let order = protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER);
+    if let Some(grid) = protocol.pme_grid {
+        let alpha = glysys_energy::pme::ewald_coefficient(cutoff_angstrom(protocol), tolerance)
+            .map_err(Error::Energy)?;
+        return PmeParameters::new(alpha, grid, order).map_err(Error::Energy);
+    }
     PmeParameters::for_box(
         &prepared_box,
         cutoff_angstrom(protocol),
-        protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE),
+        tolerance,
         protocol
             .fourier_spacing_angstrom
             .unwrap_or(DEFAULT_FOURIER_SPACING_ANGSTROM),
-        protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER),
+        order,
     )
     .map_err(Error::Energy)
 }

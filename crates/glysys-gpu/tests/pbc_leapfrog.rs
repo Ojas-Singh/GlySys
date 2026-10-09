@@ -81,6 +81,8 @@ fn protocol(electrostatics: ElectrostaticsModel, ensemble: Ensemble) -> Simulati
         temperature_coupling_interval: Some(5),
         pressure_coupling_interval: Some(4),
         com_removal_interval: Some(10),
+        // a power-of-two mesh: the one both engines evaluate identically
+        pme_grid: Some([32, 32, 32]),
         minimization_iterations: 200,
         save_every: 1_000_000,
         seed: 11,
@@ -273,11 +275,12 @@ fn follows_in_npt(electrostatics: ElectrostaticsModel) {
             let temperature = 2.0 * got / (pair.plan.groups[group].degrees_of_freedom * KB);
             assert!(temperature > 50.0 && temperature < 1000.0, "group {group} at {temperature} K");
         }
-        // The box has moved, and the two engines agree on the last pressure
-        // the barostat used (that of step 12).
+        // The box has moved, and the two engines agree on the pressure of
+        // step 12, which both have just computed for the barostat.
         assert!((pair.cpu.state.box_angstrom[0] - start_box[0]).abs() > 1e-5);
-        let (variables, _) = advance_to(&mut pair, &mut done, 14).await;
+        assert!(variables.pressure_pending);
         let coupling = pair.cpu.state.coupling.as_ref().unwrap();
+        assert_eq!(coupling.pressure_step, Some(12));
         assert!(
             (coupling.pressure_bar - variables.pressure_bar).abs() < 5.0 + 2e-3 * coupling.pressure_bar.abs(),
             "{electrostatics:?}: pressure {} bar on the CPU, {} on the device",
@@ -295,4 +298,14 @@ fn reaction_field_nvt_follows_the_cpu_integrator() {
 #[test]
 fn reaction_field_npt_follows_the_cpu_integrator() {
     follows_in_npt(ElectrostaticsModel::ReactionField);
+}
+
+#[test]
+fn pme_nvt_follows_the_cpu_integrator() {
+    follows_in_nvt(ElectrostaticsModel::Pme);
+}
+
+#[test]
+fn pme_npt_follows_the_cpu_integrator() {
+    follows_in_npt(ElectrostaticsModel::Pme);
 }

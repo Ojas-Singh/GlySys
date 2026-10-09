@@ -291,6 +291,12 @@ pub struct SimulationProtocol {
     /// PME B-spline order (GROMACS `pme-order`, default 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pme_order: Option<usize>,
+    /// PME mesh points per axis (GROMACS `fourier-nx`, `-ny`, `-nz`); takes
+    /// the place of the grid spacing. The GPU engine transforms in radix 2
+    /// and rounds each axis up to a power of two, so a power-of-two mesh is
+    /// the one both engines evaluate identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pme_grid: Option<[usize; 3]>,
 }
 impl Default for SimulationProtocol {
     fn default() -> Self {
@@ -329,6 +335,7 @@ impl Default for SimulationProtocol {
             ewald_tolerance: None,
             fourier_spacing_angstrom: None,
             pme_order: None,
+            pme_grid: None,
         }
     }
 }

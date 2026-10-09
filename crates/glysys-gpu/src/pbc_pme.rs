@@ -115,6 +115,15 @@ impl PmeKernel {
         Self::ALL.iter().position(|kernel| *kernel == self).unwrap()
     }
 
+    /// Stable job code used by the resident dispatcher.
+    pub(crate) fn job(self) -> usize {
+        self.index()
+    }
+
+    pub(crate) fn from_job(job: usize) -> Self {
+        Self::ALL[job]
+    }
+
     /// Short name for timing reports.
     pub fn stage_name(self) -> &'static str {
         match self {
