@@ -138,6 +138,47 @@ impl EwaldKernel {
     }
 }
 
+/// The single-precision Ewald direct-space pair term in the form the cluster
+/// kernel evaluates it, for engines that evaluate pairs elsewhere (the GPU
+/// tile kernel). With `u = min(scale r^2 - 1, 1)` and `P(c, u)` the
+/// degree-15 polynomial with monomial coefficients `c`:
+/// `(dE/dr)/r = qq (P(force, u) - 1/r^3)` and `E = qq (1/r - P(energy, u))`
+/// for a regular pair, and `(dE/dr)/r = qq P(force, u)`,
+/// `E = -qq P(energy, u)` for the correction of an excluded pair
+/// (`-qq erf(alpha r)/r`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EwaldPairPolynomials {
+    pub alpha_per_angstrom: f64,
+    /// `2/rc^2`.
+    pub scale: f32,
+    pub force: [f32; EWALD_TERMS],
+    pub energy: [f32; EWALD_TERMS],
+    /// Largest errors of the pair force and energy over (0, rc], relative to
+    /// the bare Coulomb force and energy of the pair.
+    pub error: [f64; 2],
+}
+
+/// Fit [`EwaldPairPolynomials`] for one Ewald coefficient and cutoff; the
+/// same fit, with the same acceptance test, as [`ClusterPairEngine::new_pme`].
+pub fn ewald_pair_polynomials(
+    alpha_per_angstrom: f64,
+    cutoff_angstrom: f64,
+) -> Result<EwaldPairPolynomials> {
+    if !cutoff_angstrom.is_finite() || cutoff_angstrom <= 0. {
+        return Err(EnergyError::InvalidConfiguration(
+            "cutoff must be positive".into(),
+        ));
+    }
+    let kernel = EwaldKernel::new(alpha_per_angstrom, cutoff_angstrom)?;
+    Ok(EwaldPairPolynomials {
+        alpha_per_angstrom: kernel.alpha,
+        scale: kernel.scale,
+        force: kernel.force,
+        energy: kernel.energy,
+        error: kernel.error,
+    })
+}
+
 /// Monomial coefficients of the polynomial that interpolates `f` at the
 /// `EWALD_TERMS` Chebyshev nodes of [-1, 1].
 fn chebyshev_monomials(f: impl Fn(f64) -> f64) -> [f64; EWALD_TERMS] {

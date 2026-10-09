@@ -25,6 +25,7 @@ const SHADERS: &[(&str, &str)] = &[
         include_str!("../src/implicit_tiles.wgsl"),
     ),
     ("pbc.wgsl", include_str!("../src/pbc.wgsl")),
+    ("pbc_pme.wgsl", include_str!("../src/pbc_pme.wgsl")),
     ("pbc_tiles.wgsl", include_str!("../src/pbc_tiles.wgsl")),
     (
         "resident_rng.wgsl",

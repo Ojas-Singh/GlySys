@@ -6,6 +6,7 @@
 //! kernels run unchanged on top of it. See the shader for the algorithm.
 use crate::device::Error;
 use crate::pbc::PbcPacking;
+use glysys_energy::pbc_cluster::EwaldPairPolynomials;
 use std::collections::HashSet;
 
 /// Coulomb constant in kcal Å / (mol e²), identical to the shader constant.
@@ -23,6 +24,8 @@ pub(crate) const RESORT_STEPS: u32 = 64;
 pub(crate) const STAGES: u64 = 4;
 const BLOCK: u32 = 32;
 const WIDE: u32 = 32_768;
+/// Bytes of `TileConfig`: twelve vec4 and the two Ewald polynomials.
+const UNIFORM_BYTES: u64 = 320;
 
 /// Entry points with the global bindings each one statically uses. Automatic
 /// pipeline layouts are derived from the shader, so a bind group must supply
@@ -130,6 +133,19 @@ impl TileKernel {
         }
     }
 
+    /// Kernels whose physics depends on the electrostatics method.
+    fn has_electrostatics(self) -> bool {
+        matches!(
+            self,
+            Self::PairForces
+                | Self::PairEnergy
+                | Self::BondedDynamicsForces
+                | Self::BondedDynamicsEnergy
+                | Self::BondedAllForces
+                | Self::BondedAllEnergy
+        )
+    }
+
     /// Indirect argument slot for list-rebuild stages, written on the device
     /// from the rebuild flag so an unchanged list costs no host round trip.
     pub(crate) fn rebuild_stage(self) -> Option<u64> {
@@ -218,12 +234,24 @@ pub(crate) struct TilePacking {
     /// Directed exclusion pairs more than 32 indices apart.
     pub far_exclusions: u32,
     pub far_offset: u32,
+    /// Excluded pairs (1-4 pairs included) with their full charge product,
+    /// one vec4 each at this offset in `terms`: the Ewald corrections. Pairs
+    /// inside a rigid water come last, so dynamics can skip them.
+    pub corrections: u32,
+    pub free_corrections: u32,
+    pub correction_offset: u32,
+    /// Energy of the corrections inside rigid waters at their constrained
+    /// geometry, kcal/mol: what a dynamics evaluation leaves out.
+    pub rigid_correction_energy: f64,
 }
 
 impl TilePacking {
     /// Derive the engine topology from the shared PBC packing, so the tiled
     /// and historical kernels see bit-identical parameters and constraints.
-    pub fn new(packing: &PbcPacking) -> Result<Self, Error> {
+    ///
+    /// With an Ewald coefficient the packing also lists every excluded pair
+    /// for the PME correction `-qq erf(alpha r)/r`.
+    pub fn new(packing: &PbcPacking, ewald_alpha: Option<f64>) -> Result<Self, Error> {
         let n = packing.params.len();
         if n >= 1 << 24 {
             return Err(Error::Capacity);
@@ -351,6 +379,47 @@ impl TilePacking {
         let torsion_offset = terms.len() as u32;
         terms.extend_from_slice(&packing.bonded[torsion_start..water_start]);
         let torsions = ((water_start - torsion_start) / 2) as u32;
+        let correction_offset = u32::try_from(terms.len()).map_err(|_| Error::Capacity)?;
+        let mut free_corrections = 0u32;
+        let mut rigid = Vec::new();
+        let mut rigid_correction_energy = 0.0;
+        if let Some(alpha) = ewald_alpha {
+            for (a, range) in packing.ranges.iter().enumerate() {
+                for special in &packing.specials[range[0] as usize..range[1] as usize] {
+                    let b = special.other as usize;
+                    if b <= a {
+                        continue;
+                    }
+                    let qq = COULOMB
+                        * f64::from(packing.params[a][0])
+                        * f64::from(packing.params[b][0]);
+                    if qq == 0.0 {
+                        continue;
+                    }
+                    let term = [a as f32, b as f32, qq as f32, 0.0];
+                    if water_of[a] != usize::MAX && water_of[a] == water_of[b] {
+                        // O-H1, O-H2 or H1-H2 at the SETTLE geometry
+                        let head = packing.bonded[water_start + 2 * water_of[a]];
+                        let geometry = packing.bonded[water_start + 2 * water_of[a] + 1];
+                        let (o, h1) = (head[0] as usize, head[1] as usize);
+                        let r = f64::from(if a != o && b != o {
+                            geometry[1]
+                        } else if a == h1 || b == h1 {
+                            head[3]
+                        } else {
+                            geometry[0]
+                        });
+                        rigid_correction_energy -= qq * glysys_energy::pme::erf(alpha * r) / r;
+                        rigid.push(term);
+                    } else {
+                        terms.push(term);
+                        free_corrections += 1;
+                    }
+                }
+            }
+        }
+        let corrections = free_corrections + rigid.len() as u32;
+        terms.append(&mut rigid);
         Ok(Self {
             atoms,
             terms,
@@ -365,6 +434,10 @@ impl TilePacking {
             exception_offset,
             far_exclusions,
             far_offset,
+            corrections,
+            free_corrections,
+            correction_offset,
+            rigid_correction_energy,
         })
     }
 }
@@ -502,20 +575,27 @@ pub(crate) fn wide_groups(groups: u32) -> (u32, u32) {
 pub(crate) struct TileEngine {
     pub sizing: TileSizing,
     pub packing_counts: [u32; 6],
-    uniform: wgpu::Buffer,
+    pub uniform: wgpu::Buffer,
     pub work: wgpu::Buffer,
     pub args: wgpu::Buffer,
     _atoms: wgpu::Buffer,
     _blocks: wgpu::Buffer,
-    _acc: wgpu::Buffer,
+    pub acc: wgpu::Buffer,
     _terms: wgpu::Buffer,
-    _pair_grad: wgpu::Buffer,
+    pub pair_grad: wgpu::Buffer,
     pipelines: Vec<wgpu::ComputePipeline>,
     bind_groups: Vec<wgpu::BindGroup>,
     cutoff: f32,
     krf: f32,
     crf: f32,
     list_radius: f32,
+    /// Shortens the displacement that triggers a rebuild; a barostat that
+    /// changes the box between rebuilds takes its allowance from the skin.
+    pub skin_margin: f32,
+    ewald: Option<EwaldPairPolynomials>,
+    /// Excluded-pair corrections: all, those outside rigid waters, offset.
+    corrections: [u32; 3],
+    pub rigid_correction_energy: f64,
     status_word: u32,
     rebuild_word: u32,
     offsets: [u32; 4],
@@ -545,7 +625,7 @@ impl TileEngine {
             + 16 * packing.atoms.len() as u64
             + 16 * packing.terms.len().max(1) as u64
             + 12 * STAGES
-            + 256
+            + UNIFORM_BYTES
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -556,16 +636,18 @@ impl TileEngine {
         packing: &TilePacking,
         shared: SharedBuffers<'_>,
         electro: [f32; 4],
+        ewald: Option<EwaldPairPolynomials>,
         list_radius: f32,
         status_word: u32,
         rebuild_word: u32,
     ) -> Self {
         use wgpu::util::DeviceExt;
         let storage = wgpu::BufferUsages::STORAGE;
+        // A barostat kernel rewrites the box through a storage binding.
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pbc tiles config"),
-            size: 160,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: UNIFORM_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | storage,
             mapped_at_creation: false,
         });
         let work = device.create_buffer(&wgpu::BufferDescriptor {
@@ -651,13 +733,17 @@ impl TileEngine {
         let mut pipelines = Vec::with_capacity(TileKernel::ALL.len());
         let mut bind_groups = Vec::with_capacity(TileKernel::ALL.len());
         for kernel in TileKernel::ALL {
+            let mut constants = kernel.constants().to_vec();
+            if ewald.is_some() && kernel.has_electrostatics() {
+                constants.push(("PME", 1.0));
+            }
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(kernel.entry()),
                 layout: None,
                 module: &shader,
                 entry_point: Some(kernel.entry()),
                 compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: kernel.constants(),
+                    constants: &constants,
                     zero_initialize_workgroup_memory: false,
                 },
                 cache: None,
@@ -697,15 +783,23 @@ impl TileEngine {
             args,
             _atoms: atoms,
             _blocks: blocks,
-            _acc: acc,
+            acc,
             _terms: terms,
-            _pair_grad: pair_grad,
+            pair_grad,
             pipelines,
             bind_groups,
             cutoff: electro[1],
             krf: electro[2],
             crf: electro[3],
             list_radius,
+            skin_margin: 0.0,
+            ewald,
+            corrections: [
+                packing.corrections,
+                packing.free_corrections,
+                packing.correction_offset,
+            ],
+            rigid_correction_energy: packing.rigid_correction_energy,
             status_word,
             rebuild_word,
             offsets: [
@@ -752,9 +846,9 @@ impl TileEngine {
     fn terms(&self, include_constrained: bool) -> u32 {
         let [exceptions, bonds, angles, torsions, free_bonds, free_angles] = self.packing_counts;
         if include_constrained {
-            exceptions + bonds + angles + torsions
+            exceptions + bonds + angles + torsions + self.corrections[0]
         } else {
-            exceptions + free_bonds + free_angles + torsions
+            exceptions + free_bonds + free_angles + torsions + self.corrections[1]
         }
     }
 
@@ -778,9 +872,10 @@ impl TileEngine {
         let s = &self.sizing;
         let l = &s.layout;
         let grid = s.grid();
-        let half_skin = 0.5 * (self.list_radius - self.cutoff);
+        let half_skin = 0.5 * (self.list_radius - self.cutoff - self.skin_margin).max(0.0);
         let [exceptions, bonds, angles, torsions, free_bonds, free_angles] = self.packing_counts;
-        let words: [u32; 40] = [
+        let mut words = [0u32; (UNIFORM_BYTES / 4) as usize];
+        let head: [u32; 40] = [
             s.n,
             s.blocks,
             s.stride,
@@ -822,6 +917,17 @@ impl TileEngine {
             self.offsets[2],
             self.offsets[3],
         ];
+        words[..40].copy_from_slice(&head);
+        if let Some(ewald) = &self.ewald {
+            words[40] = ewald.scale.to_bits();
+            words[41] = (ewald.alpha_per_angstrom as f32).to_bits();
+            words[44] = self.corrections[0];
+            words[45] = self.corrections[1];
+            words[46] = self.corrections[2];
+            for (slot, value) in ewald.force.iter().chain(&ewald.energy).enumerate() {
+                words[48 + slot] = value.to_bits();
+            }
+        }
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
         if resort {
             self.resort_pending

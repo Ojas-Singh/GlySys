@@ -3,6 +3,8 @@ pub(crate) mod adapter;
 pub mod context;
 pub mod device;
 pub mod pbc;
+pub mod pbc_leapfrog;
+pub(crate) mod pbc_pme;
 pub(crate) mod pbc_tiles;
 pub mod topology;
 
@@ -154,6 +156,12 @@ pub(crate) async fn pop_error_scope(device: &wgpu::Device) -> Option<wgpu::Error
 
 pub use context::{AllocationReservation, AllocationStats, GpuContext, GpuContextOptions};
 pub use device::{ADAPTIVE_MEMORY_BUDGET, LOW_MEMORY_BUDGET, MemoryProfile};
+/// The reciprocal-space PME mesh, exported for its native validation test
+/// (`tests/pbc_pme.rs`); `ResidentPbc` is its user.
+#[doc(hidden)]
+pub use pbc_pme::{
+    BOX_OFFSET_BYTES as PME_BOX_OFFSET_BYTES, PmeKernel, PmeMesh, PmeShared, PmeSizing,
+};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct GpuAdapterInfo {

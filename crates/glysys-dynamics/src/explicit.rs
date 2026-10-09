@@ -90,14 +90,21 @@ pub fn pme_parameters(
     protocol: &SimulationProtocol,
 ) -> Result<PmeParameters> {
     let prepared_box = BoxVectors::from_system(system).map_err(Error::Energy)?;
+    let tolerance = protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE);
+    let order = protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER);
+    if let Some(grid) = protocol.pme_grid {
+        let alpha = glysys_energy::pme::ewald_coefficient(cutoff_angstrom(protocol), tolerance)
+            .map_err(Error::Energy)?;
+        return PmeParameters::new(alpha, grid, order).map_err(Error::Energy);
+    }
     PmeParameters::for_box(
         &prepared_box,
         cutoff_angstrom(protocol),
-        protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE),
+        tolerance,
         protocol
             .fourier_spacing_angstrom
             .unwrap_or(DEFAULT_FOURIER_SPACING_ANGSTROM),
-        protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER),
+        order,
     )
     .map_err(Error::Energy)
 }
@@ -2235,6 +2242,84 @@ impl<'a> ExplicitSimulation<'a> {
         self.state.pressure_estimator = "atomic-virial".into();
         self.state.integrator_phase = "ready".into();
         Ok(())
+    }
+
+    /// Install a leap-frog state advanced by an external evaluator (the GPU
+    /// engine): positions, the velocities half a step behind them, the box
+    /// and the coupling variables, with the energy, gradient and full virial
+    /// of the new positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_leapfrog_state(
+        &mut self,
+        coordinates: Vec<Vec3>,
+        velocities: Vec<Vec3>,
+        step: usize,
+        energy: f64,
+        gradient: Vec<Vec3>,
+        virial: f64,
+        box_angstrom: [f64; 3],
+        coupling: CouplingState,
+    ) -> Result<()> {
+        let Some(plan) = &self.coupling_plan else {
+            return Err(invalid("leap-frog state for another integrator"));
+        };
+        if coupling.thermostat_velocity.len() != plan.groups.len()
+            || coupling.thermostat_position.len() != plan.groups.len()
+            || !virial.is_finite()
+            || !coupling.pressure_bar.is_finite()
+            || !box_angstrom.iter().all(|b| b.is_finite() && *b > 0.)
+            || coupling
+                .thermostat_velocity
+                .iter()
+                .chain(&coupling.thermostat_position)
+                .chain(&coupling.box_velocity)
+                .any(|value| !value.is_finite())
+        {
+            return Err(invalid("invalid external leap-frog state"));
+        }
+        self.validate_external_state(&coordinates, &velocities, step)?;
+        self.commit(coordinates, velocities, energy, gradient, virial)?;
+        self.state.box_angstrom = box_angstrom;
+        self.state.step = step;
+        if coupling.pressure_step.is_some() {
+            self.state.pressure_bar = coupling.pressure_bar;
+            self.state.pressure_estimator = "atomic-virial-with-constraints".into();
+        }
+        self.state.coupling = Some(coupling);
+        self.state.integrator_phase = "ready".into();
+        self.virial_current = true;
+        Ok(())
+    }
+
+    /// Homogeneous long-range Lennard-Jones energy of the current box,
+    /// kcal/mol; zero when the protocol leaves the correction out.
+    pub fn dispersion_energy(&self) -> f64 {
+        if self.state.protocol.dispersion_correction {
+            self.dispersion_coefficient / self.state.box_angstrom.iter().product::<f64>()
+        } else {
+            0.
+        }
+    }
+
+    /// Temperature groups and coupling intervals of the leap-frog integrator;
+    /// `None` when the protocol uses another integrator.
+    pub fn coupling_plan(&self) -> Option<&CouplingPlan> {
+        self.coupling_plan.as_deref()
+    }
+
+    /// Coefficient of the long-range dispersion term in a pressure computed
+    /// from forces, kcal Å³/mol; zero when the protocol leaves the correction
+    /// out.
+    pub fn dispersion_pressure_coefficient(&self) -> f64 {
+        if self.state.protocol.dispersion_correction {
+            self.dispersion_pressure_coefficient
+        } else {
+            0.
+        }
+    }
+
+    pub fn masses(&self) -> &[f64] {
+        &self.masses
     }
 
     pub fn advance(&mut self, steps: usize) -> Result<TrajectoryChunk> {

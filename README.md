@@ -65,12 +65,14 @@ prints adapter type, features, and limits so a Vulkan device can be audited
 before a benchmark.
 
 Explicit periodic dynamics runs with reaction-field or smooth particle-mesh
-Ewald (PME) electrostatics on the CPU. Three integrators are available:
+Ewald (PME) electrostatics, on the CPU and on the GPU. Three integrators are
+available:
 velocity Verlet / BAOAB Langevin with the Monte Carlo barostat, OpenMM's
 LF-middle Langevin scheme (constant volume), and the leap-frog integrator of
 GROMACS' `md` with Nose–Hoover temperature coupling per group and isotropic
 Parrinello–Rahman pressure coupling. The last one runs the GOTW recipe as its
-GROMACS parameter files state it:
+GROMACS parameter files state it, on CPU threads or on one GPU
+(`--backend vulkan`):
 
 ```console
 glysys-md run --input prepared --output replica-01 --backend cpu --threads 8 \
@@ -92,11 +94,29 @@ energy to 4e-8 kcal/mol, forces to 1e-11 of their RMS;
 Started from GROMACS' own minimised coordinates, the temperature under
 Nose–Hoover coupling follows GROMACS' within the spread of random velocities,
 and the density under Parrinello–Rahman coupling agrees to 0.05%.
-The GPU engines evaluate reaction field with Langevin dynamics only; PME,
-Nose–Hoover and Parrinello–Rahman run on the CPU. On one 192-core node an
-8,900-atom box reaches about 60 ns/day per 8-thread process (24 processes per
-node); GROMACS runs the same recipe at 900 to 1,100 ns/day on 48 cores, so
-GlySys is not yet a replacement for it on CPU clusters. The Slurm adapter is in
+On the GPU the same recipe runs resident on the device (PME mesh, coupling,
+constraints and the box), and follows the CPU integrator step for step on the
+same mesh: pressure, box and thermostat variables agree to 4-6 digits over 200
+steps, and the density of the four test boxes over 2 ns is within 0.001 g/mL
+of GROMACS'. The device mesh takes the next power of two above the requested
+points per axis.
+
+Throughput of one simulation of a 7,700 to 8,900-atom glycan box with the GOTW
+recipe (2 fs, October 2026; GROMACS 2025.4 on the same nodes):
+
+| | NVIDIA A100 | NVIDIA L4 | 48 CPU cores |
+|---|---|---|---|
+| GlySys | 647 ns/day | 845 ns/day | about 60 ns/day per 8-thread process |
+| GROMACS, the recipe (Nose–Hoover keeps its update on the CPU) | 1,341 ns/day | 1,412 ns/day | 900 to 1,100 ns/day |
+| GROMACS, v-rescale and C-rescale, whole step on the GPU | 1,750 ns/day | 1,827 ns/day | |
+
+GlySys on a GPU is ten times its own CPU speed per simulation and about half
+of GROMACS on the same card. The tiled pair kernel evaluates every pair from
+both blocks and lists about five times the atoms that lie inside the cutoff,
+the pair list is rebuilt whenever an atom has moved half the skin (every six
+steps here, where GROMACS rebuilds every 80 with a buffer), and the radix-2
+mesh is 64 points per axis where GROMACS uses 36 x 44 x 36. On CPU clusters
+GlySys is not yet a replacement for GROMACS. The Slurm adapter is in
 `GlycoShape-Cookbook/API/GOTW_Scripts`.
 
 The output bundle contains:
