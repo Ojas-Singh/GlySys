@@ -626,13 +626,7 @@ fn spatially_sorted(
     )
 }
 
-fn time_chain(
-    context: &GpuContext,
-    atoms: usize,
-    box_xyz: [f32; 3],
-    grid: [u32; 3],
-    sorted: bool,
-) {
+fn time_chain(context: &GpuContext, atoms: usize, box_xyz: [f32; 3], grid: [u32; 3], sorted: bool) {
     const CHAINS: usize = 200;
     const SUBMISSIONS: usize = 4;
     let charges = Charges::random(atoms, 0x5851_F42D_4C95_7F2D);

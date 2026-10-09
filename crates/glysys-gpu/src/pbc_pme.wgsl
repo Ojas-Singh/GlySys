@@ -53,9 +53,9 @@ struct PmeConfig {
 @group(0) @binding(1) var<storage, read> sys: array<vec4<f32>>;
 // Charge mesh, index (y * Kz + z) * Kx + x, fixed point with scale 2^26.
 @group(0) @binding(2) var<storage, read_write> charge_mesh: array<atomic<u32>>;
-// The same buffer without atomics, for the transform that reads and clears
-// words that it alone owns.
-@group(0) @binding(3) var<storage, read_write> charge_words: array<u32>;
+// The same buffer without atomics and four words (consecutive x) to the
+// element, for the transform that reads and clears words that it alone owns.
+@group(0) @binding(3) var<storage, read_write> charge_quads: array<vec4<u32>>;
 // Half spectrum, index (kx * Ky + y) * Kz + z with kx <= Kx/2. The y and z
 // indices are positions or frequencies depending on the stage.
 @group(0) @binding(4) var<storage, read_write> spectrum: array<vec2<f32>>;
@@ -319,13 +319,19 @@ fn fft_x_forward(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocat
   let count = lines * points;
   let z0 = 2u * lines * group.x;
   let row0 = group.y * pc.grid.z + z0;
-  for (var e = lid; e < count; e += 64u) {
-    let at = (row0 + 2u * (e >> bits)) * points + (e & (points - 1u));
-    let re = bitcast<i32>(charge_words[at]);
-    let im = bitcast<i32>(charge_words[at + points]);
-    charge_words[at] = 0u;
-    charge_words[at + points] = 0u;
-    line[e] = MESH_UNIT * vec2<f32>(f32(re), f32(im));
+  // Four consecutive x per lane and step: one element of each of the two
+  // real lines, read and cleared whole.
+  let quads = points / 4u;
+  for (var u = lid; u < count / 4u; u += 64u) {
+    let at = (row0 + 2u * (u >> (bits - 2u))) * quads + (u & (quads - 1u));
+    let re = MESH_UNIT * vec4<f32>(bitcast<vec4<i32>>(charge_quads[at]));
+    let im = MESH_UNIT * vec4<f32>(bitcast<vec4<i32>>(charge_quads[at + quads]));
+    charge_quads[at] = vec4<u32>(0u);
+    charge_quads[at + quads] = vec4<u32>(0u);
+    line[4u * u] = vec2<f32>(re.x, im.x);
+    line[4u * u + 1u] = vec2<f32>(re.y, im.y);
+    line[4u * u + 2u] = vec2<f32>(re.z, im.z);
+    line[4u * u + 3u] = vec2<f32>(re.w, im.w);
   }
   load_turns(lid, bits);
   workgroupBarrier();

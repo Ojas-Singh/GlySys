@@ -115,6 +115,15 @@ impl PmeKernel {
         Self::ALL.iter().position(|kernel| *kernel == self).unwrap()
     }
 
+    /// Stable code of the kernel for a dispatcher's job table.
+    pub fn job(self) -> usize {
+        self.index()
+    }
+
+    pub fn from_job(job: usize) -> Self {
+        Self::ALL[job]
+    }
+
     /// Short name for timing reports.
     pub fn stage_name(self) -> &'static str {
         match self {
