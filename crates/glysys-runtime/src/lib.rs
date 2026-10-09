@@ -197,12 +197,23 @@ impl ExecutionDiagnostics {
             });
         }
         diagnostics.selected_kernel_variants = vec![
-            format!("integrator:{:?}", protocol.langevin_discretization),
+            if protocol.uses_leapfrog() {
+                if protocol.has_npt() {
+                    "integrator:leap-frog-nose-hoover-parrinello-rahman".into()
+                } else {
+                    "integrator:leap-frog-nose-hoover".into()
+                }
+            } else {
+                format!("integrator:{:?}", protocol.langevin_discretization)
+            },
             format!("solvent:{:?}", protocol.solvent),
             "force-precision:f32".into(),
-            match protocol.solvent {
-                SolventModel::Explicit => "force-kernel:pbc-cutoff-rf".into(),
-                SolventModel::Implicit => "force-kernel:obc2-all-pairs".into(),
+            match (protocol.solvent, protocol.electrostatics) {
+                (SolventModel::Explicit, glysys_dynamics::ElectrostaticsModel::Pme) => {
+                    "force-kernel:pbc-pme".into()
+                }
+                (SolventModel::Explicit, _) => "force-kernel:pbc-cutoff-rf".into(),
+                (SolventModel::Implicit, _) => "force-kernel:obc2-all-pairs".into(),
             },
         ];
         if protocol.solvent == SolventModel::Implicit {

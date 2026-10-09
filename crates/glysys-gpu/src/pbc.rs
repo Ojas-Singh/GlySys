@@ -2722,8 +2722,17 @@ impl ResidentPbc {
         Ok(variables)
     }
 
-    fn leapfrog_jobs(&self, engine: &LeapfrogEngine, step: u64) -> Vec<(usize, u32)> {
-        let plan = engine.coupling.plan(step);
+    /// Kernels of one step. `report_pressure` also measures the pressure on
+    /// a step the barostat does not need it for (the last of an advance, so
+    /// that observers get a current value).
+    fn leapfrog_jobs(
+        &self,
+        engine: &LeapfrogEngine,
+        step: u64,
+        report_pressure: bool,
+    ) -> Vec<(usize, u32)> {
+        let mut plan = engine.coupling.plan(step);
+        plan.pressure |= report_pressure;
         let atoms = workgroups(self.n);
         let groups = workgroups(self.n.max(self.ncells));
         let job = |kernel: LeapfrogKernel| (LEAPFROG_JOB + kernel.job(), engine.groups(kernel));
@@ -2771,8 +2780,9 @@ impl ResidentPbc {
     /// Advance `steps` leap-frog steps, the first of which is step
     /// `first_step` of the segment's schedule (thermostat, barostat and
     /// center-of-mass removal act on fixed step numbers). The forces of the
-    /// resident state must come from an evaluation with energies when
-    /// `first_step` is a pressure step. The final step publishes energies.
+    /// resident state must come from an evaluation with energies (any static
+    /// evaluation, or the end of an earlier advance). The final step
+    /// publishes energies and the pressure.
     pub async fn dynamics_steps_leapfrog(&self, first_step: u64, steps: usize) -> Result<(), Error> {
         let Some(engine) = &self.leapfrog else {
             return Err(Error::Input("leap-frog integrator is not configured"));
@@ -2802,13 +2812,22 @@ impl ResidentPbc {
                 .map(|offset| {
                     let step = first_step + (done + offset) as u64;
                     let last = done + offset + 1 == steps;
-                    let energy = last || engine.coupling.plan(step).virial_next;
+                    // the step before the last leaves the virial of its
+                    // forces for the pressure of the last one
+                    let energy = last
+                        || done + offset + 2 == steps
+                        || engine.coupling.plan(step).virial_next;
                     let resort = self.tiles.as_ref().is_some_and(TileEngine::take_resort);
                     // Terms between atoms that SETTLE/SHAKE hold at a fixed
                     // distance act along the constraint: leaving them out
                     // changes neither the constrained step nor, with the
                     // constraint virial, the pressure.
-                    self.expanded_jobs(&self.leapfrog_jobs(engine, step), energy, false, resort)
+                    self.expanded_jobs(
+                        &self.leapfrog_jobs(engine, step, last),
+                        energy,
+                        false,
+                        resort,
+                    )
                 })
                 .collect();
             #[cfg(not(target_arch = "wasm32"))]
