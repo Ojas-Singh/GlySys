@@ -577,10 +577,8 @@ fn gather(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
   }
   parts[lid] = vec4<f32>(part, 0.0);
   workgroupBarrier();
-  if (valid && jx_first(lid)) {
+  if (valid && (lid & 3u) == 0u) {
     let g = ((parts[lid].xyz + parts[lid + 1u].xyz) + parts[lid + 2u].xyz) + parts[lid + 3u].xyz;
     pair_grad[i] = vec4<f32>(pair_grad[i].xyz + g, 0.0);
   }
 }
-
-fn jx_first(lid: u32) -> bool { return (lid & 3u) == 0u; }
