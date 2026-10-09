@@ -26,8 +26,6 @@ const BLOCK: u32 = 32;
 const WIDE: u32 = 32_768;
 /// Bytes of `TileConfig`: twelve vec4 and the two Ewald polynomials.
 const UNIFORM_BYTES: u64 = 320;
-/// Byte offset of the box lengths (three f32) in the engine uniform.
-pub(crate) const BOX_OFFSET_BYTES: u64 = 16;
 
 /// Entry points with the global bindings each one statically uses. Automatic
 /// pipeline layouts are derived from the shader, so a bind group must supply
@@ -237,21 +235,23 @@ pub(crate) struct TilePacking {
     pub far_exclusions: u32,
     pub far_offset: u32,
     /// Excluded pairs (1-4 pairs included) with their full charge product,
-    /// one vec4 each at this offset in `terms`: the Ewald corrections.
+    /// one vec4 each at this offset in `terms`: the Ewald corrections. Pairs
+    /// inside a rigid water come last, so dynamics can skip them.
     pub corrections: u32,
+    pub free_corrections: u32,
     pub correction_offset: u32,
+    /// Energy of the corrections inside rigid waters at their constrained
+    /// geometry, kcal/mol: what a dynamics evaluation leaves out.
+    pub rigid_correction_energy: f64,
 }
 
 impl TilePacking {
     /// Derive the engine topology from the shared PBC packing, so the tiled
     /// and historical kernels see bit-identical parameters and constraints.
-    pub fn new(packing: &PbcPacking) -> Result<Self, Error> {
-        Self::new_for(packing, false)
-    }
-
-    /// `ewald_corrections` also lists every excluded pair for the PME
-    /// correction `-qq erf(alpha r)/r`.
-    pub fn new_for(packing: &PbcPacking, ewald_corrections: bool) -> Result<Self, Error> {
+    ///
+    /// With an Ewald coefficient the packing also lists every excluded pair
+    /// for the PME correction `-qq erf(alpha r)/r`.
+    pub fn new(packing: &PbcPacking, ewald_alpha: Option<f64>) -> Result<Self, Error> {
         let n = packing.params.len();
         if n >= 1 << 24 {
             return Err(Error::Capacity);
@@ -380,8 +380,10 @@ impl TilePacking {
         terms.extend_from_slice(&packing.bonded[torsion_start..water_start]);
         let torsions = ((water_start - torsion_start) / 2) as u32;
         let correction_offset = u32::try_from(terms.len()).map_err(|_| Error::Capacity)?;
-        let mut corrections = 0u32;
-        if ewald_corrections {
+        let mut free_corrections = 0u32;
+        let mut rigid = Vec::new();
+        let mut rigid_correction_energy = 0.0;
+        if let Some(alpha) = ewald_alpha {
             for (a, range) in packing.ranges.iter().enumerate() {
                 for special in &packing.specials[range[0] as usize..range[1] as usize] {
                     let b = special.other as usize;
@@ -394,11 +396,30 @@ impl TilePacking {
                     if qq == 0.0 {
                         continue;
                     }
-                    terms.push([a as f32, b as f32, qq as f32, 0.0]);
-                    corrections += 1;
+                    let term = [a as f32, b as f32, qq as f32, 0.0];
+                    if water_of[a] != usize::MAX && water_of[a] == water_of[b] {
+                        // O-H1, O-H2 or H1-H2 at the SETTLE geometry
+                        let head = packing.bonded[water_start + 2 * water_of[a]];
+                        let geometry = packing.bonded[water_start + 2 * water_of[a] + 1];
+                        let (o, h1) = (head[0] as usize, head[1] as usize);
+                        let r = f64::from(if a != o && b != o {
+                            geometry[1]
+                        } else if a == h1 || b == h1 {
+                            head[3]
+                        } else {
+                            geometry[0]
+                        });
+                        rigid_correction_energy -= qq * glysys_energy::pme::erf(alpha * r) / r;
+                        rigid.push(term);
+                    } else {
+                        terms.push(term);
+                        free_corrections += 1;
+                    }
                 }
             }
         }
+        let corrections = free_corrections + rigid.len() as u32;
+        terms.append(&mut rigid);
         Ok(Self {
             atoms,
             terms,
@@ -414,7 +435,9 @@ impl TilePacking {
             far_exclusions,
             far_offset,
             corrections,
+            free_corrections,
             correction_offset,
+            rigid_correction_energy,
         })
     }
 }
@@ -570,7 +593,9 @@ pub(crate) struct TileEngine {
     /// changes the box between rebuilds takes its allowance from the skin.
     pub skin_margin: f32,
     ewald: Option<EwaldPairPolynomials>,
-    corrections: [u32; 2],
+    /// Excluded-pair corrections: all, those outside rigid waters, offset.
+    corrections: [u32; 3],
+    pub rigid_correction_energy: f64,
     status_word: u32,
     rebuild_word: u32,
     offsets: [u32; 4],
@@ -769,7 +794,12 @@ impl TileEngine {
             list_radius,
             skin_margin: 0.0,
             ewald,
-            corrections: [packing.corrections, packing.correction_offset],
+            corrections: [
+                packing.corrections,
+                packing.free_corrections,
+                packing.correction_offset,
+            ],
+            rigid_correction_energy: packing.rigid_correction_energy,
             status_word,
             rebuild_word,
             offsets: [
@@ -815,17 +845,11 @@ impl TileEngine {
 
     fn terms(&self, include_constrained: bool) -> u32 {
         let [exceptions, bonds, angles, torsions, free_bonds, free_angles] = self.packing_counts;
-        let corrections = if self.ewald.is_some() {
-            self.corrections[0]
+        if include_constrained {
+            exceptions + bonds + angles + torsions + self.corrections[0]
         } else {
-            0
-        };
-        corrections
-            + if include_constrained {
-                exceptions + bonds + angles + torsions
-            } else {
-                exceptions + free_bonds + free_angles + torsions
-            }
+            exceptions + free_bonds + free_angles + torsions + self.corrections[1]
+        }
     }
 
     /// Whether the next encoded step must resort atoms: after a full
@@ -898,8 +922,8 @@ impl TileEngine {
             words[40] = ewald.scale.to_bits();
             words[41] = (ewald.alpha_per_angstrom as f32).to_bits();
             words[44] = self.corrections[0];
-            words[45] = self.corrections[0];
-            words[46] = self.corrections[1];
+            words[45] = self.corrections[1];
+            words[46] = self.corrections[2];
             for (slot, value) in ewald.force.iter().chain(&ewald.energy).enumerate() {
                 words[48 + slot] = value.to_bits();
             }

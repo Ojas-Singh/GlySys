@@ -560,6 +560,9 @@ pub struct ResidentPbc {
     /// PME: self energy (kcal/mol) and the coefficient of the uniform
     /// background energy of a charged box (kcal Å³/mol, over the volume).
     ewald_constants: Option<[f64; 2]>,
+    /// Whether the last force evaluation left out the terms that rigid
+    /// constraints hold fixed (dynamics does; their energy is a constant).
+    rigid_terms_skipped: std::sync::atomic::AtomicBool,
     box_xyz: std::sync::Mutex<[f32; 3]>,
     gpu_stage_timings_ms: std::sync::Mutex<BTreeMap<String, f64>>,
     dt_ps: f32,
@@ -826,7 +829,8 @@ impl ResidentPbc {
             PbcKernel::Tiles => 64,
         };
         let tile_plan = if kernel == PbcKernel::Tiles {
-            let tile_packing = TilePacking::new_for(packing, ewald.is_some())?;
+            let tile_packing =
+                TilePacking::new(packing, ewald.map(|ewald| ewald.alpha_per_angstrom))?;
             let shrink = packing.tile_density_headroom.max(1.0).cbrt();
             let sizing =
                 TileSizing::new(n, packing.box_angstrom.map(|b| b / shrink), packing.limit)?;
@@ -1194,6 +1198,7 @@ impl ResidentPbc {
                     -COULOMB * std::f64::consts::PI * net * net / (2.0 * alpha * alpha),
                 ]
             }),
+            rigid_terms_skipped: std::sync::atomic::AtomicBool::new(false),
             box_xyz: std::sync::Mutex::new(packing.box_angstrom.map(|v| v as f32)),
             gpu_stage_timings_ms: std::sync::Mutex::new(BTreeMap::new()),
             dt_ps: f64::NAN as f32,
@@ -1516,6 +1521,8 @@ impl ResidentPbc {
     /// transfer have been observed to stall. A chain is a static evaluation:
     /// tiled force passes include every bonded term and publish energies.
     fn dispatch_chain(&self, jobs: &[(usize, u32)]) {
+        self.rigid_terms_skipped
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.dispatch_repeated(jobs, 1, true, true);
     }
 
@@ -2319,6 +2326,15 @@ impl ResidentPbc {
                 .unwrap_or(f64::NAN);
             let background = background / volume;
             result.rf += self_energy + background;
+            if self
+                .rigid_terms_skipped
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                result.rf += self
+                    .tiles
+                    .as_ref()
+                    .map_or(0.0, |tiles| tiles.rigid_correction_energy);
+            }
             if let Some(virial) = &mut result.virial {
                 *virial += 3.0 * background;
             }
@@ -2700,6 +2716,8 @@ impl ResidentPbc {
         // SETTLE/SHAKE along the bond directions of the start of the step,
         // with the whole displacement added to the velocities.
         self.write_nvt_uniforms(300.0, 0.0, 1.0);
+        self.rigid_terms_skipped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.queue
             .write_buffer(&self.buffers[2], self.meta_status_off(), &[0; 4]);
         crate::push_error_scope(&self.device, wgpu::ErrorFilter::Validation);
@@ -2714,7 +2732,11 @@ impl ResidentPbc {
                     let last = done + offset + 1 == steps;
                     let energy = last || engine.coupling.plan(step).virial_next;
                     let resort = self.tiles.as_ref().is_some_and(TileEngine::take_resort);
-                    self.expanded_jobs(&self.leapfrog_jobs(engine, step), energy, true, resort)
+                    // Terms between atoms that SETTLE/SHAKE hold at a fixed
+                    // distance act along the constraint: leaving them out
+                    // changes neither the constrained step nor, with the
+                    // constraint virial, the pressure.
+                    self.expanded_jobs(&self.leapfrog_jobs(engine, step), energy, false, resort)
                 })
                 .collect();
             #[cfg(not(target_arch = "wasm32"))]
