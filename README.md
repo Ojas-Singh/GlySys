@@ -57,12 +57,14 @@ prints adapter type, features, and limits so a Vulkan device can be audited
 before a benchmark.
 
 Explicit periodic dynamics runs with reaction-field or smooth particle-mesh
-Ewald (PME) electrostatics on the CPU. Three integrators are available:
+Ewald (PME) electrostatics, on the CPU and on the GPU. Three integrators are
+available:
 velocity Verlet / BAOAB Langevin with the Monte Carlo barostat, OpenMM's
 LF-middle Langevin scheme (constant volume), and the leap-frog integrator of
 GROMACS' `md` with Nose–Hoover temperature coupling per group and isotropic
 Parrinello–Rahman pressure coupling. The last one runs the GOTW recipe as its
-GROMACS parameter files state it:
+GROMACS parameter files state it, on CPU threads or on one GPU
+(`--backend vulkan`):
 
 ```console
 glysys-md run --input prepared --output replica-01 --backend cpu --threads 8 \

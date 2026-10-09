@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The GOTW recipe runs on the GPU: particle-mesh Ewald (direct-space term in
+  the tile kernel, reciprocal space on a mesh transformed on the device,
+  corrections for excluded pairs), and the leap-frog integrator with
+  Nose–Hoover and Parrinello–Rahman coupling, the pressure from the atomic
+  virial with constraint forces, and center-of-mass removal per group, all
+  resident on the device (`glysys-md run --backend vulkan --gromacs-mdp ...`).
+  The device follows the CPU integrator step for step (box, pressure and
+  thermostat variables to 4-6 digits over 200 steps on the same mesh).
+  Molecules are wrapped into the box on the device, so a long run keeps
+  single-precision bond lengths. `pmeGrid` in a protocol sets the PME mesh
+  (GROMACS `fourier-nx/ny/nz`); the device rounds each axis up to a power of
+  two.
 - Explicit-solvent dynamics on the CPU gains what the GOTW (GROMACS) recipe
   uses: smooth particle-mesh Ewald electrostatics (`glysys_energy::pme`, a PME
   mode of the cluster-pair kernel), Nose–Hoover temperature coupling per group
