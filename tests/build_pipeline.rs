@@ -282,6 +282,80 @@ fn ignores_free_form_pdb_metadata_during_glycan_analysis() {
     assert_eq!(system.report().glycans.len(), 1);
 }
 
+/// Ions are spread through the water of a box around a charged glycan: none on
+/// the glycan's surface, none crowded against another, as salt is in solution.
+#[test]
+fn spreads_ions_through_the_solvent_of_a_charged_glycan() {
+    let system = SystemBuilder::new(BuildOptions {
+        padding_angstrom: 12.0,
+        salt_molar: 0.3,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(SULFATED_GAG_WITH_CAP)
+    .unwrap();
+    let report = system.report();
+    assert_eq!(report.sodium_ions, report.chloride_ions + 8);
+    assert!(
+        report.chloride_ions >= 4,
+        "{} chloride",
+        report.chloride_ions
+    );
+    let box_lengths = report.box_angstrom;
+    let bundle = system.bundle_strings().unwrap();
+    let (mut solute, mut ions) = (Vec::new(), Vec::new());
+    for line in bundle["system.pdb"].lines() {
+        if !(line.starts_with("ATOM") || line.starts_with("HETATM")) {
+            continue;
+        }
+        let at: [f64; 3] =
+            [30..38, 38..46, 46..54].map(|range| line[range].trim().parse().unwrap());
+        match line[17..21].trim() {
+            "WAT" => {}
+            "NA" | "CL" => ions.push(at),
+            _ => solute.push(at),
+        }
+    }
+    assert_eq!(ions.len(), report.sodium_ions + report.chloride_ions);
+    let image = |a: [f64; 3], b: [f64; 3]| {
+        (0..3)
+            .map(|axis| {
+                let delta = a[axis] - b[axis];
+                (delta - box_lengths[axis] * (delta / box_lengths[axis]).round()).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt()
+    };
+    let mut nearest_ion_sum = 0.0;
+    for (index, ion) in ions.iter().enumerate() {
+        let to_solute = solute
+            .iter()
+            .map(|atom| image(*ion, *atom))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            to_solute >= 4.9,
+            "ion {index} is {to_solute:.2} A from the glycan"
+        );
+        let to_ion = ions
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, other)| image(*ion, *other))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            to_ion >= 4.9,
+            "ion {index} is {to_ion:.2} A from another ion"
+        );
+        nearest_ion_sum += to_ion;
+    }
+    // a cluster of ions 5 A apart would give about 5 A here
+    let mean_nearest = nearest_ion_sum / ions.len() as f64;
+    assert!(
+        mean_nearest > 6.5,
+        "mean nearest ion at {mean_nearest:.1} A"
+    );
+}
+
 #[test]
 fn adds_neutral_salt_pairs() {
     let system = SystemBuilder::new(BuildOptions::default())

@@ -122,7 +122,7 @@ struct PrepareArgs {
     /// Solvate with water but do not add neutralizing ions or salt.
     #[arg(long)]
     no_ions: bool,
-    /// Deterministic ion-placement tie-breaking seed.
+    /// Seed of the ion placement (the same seed gives the same system).
     #[arg(long)]
     seed: Option<u64>,
     /// Replace an existing generated bundle.

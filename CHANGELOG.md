@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Ions are spread through the solvent. Each ion replaces a water taken in a
+  seeded pseudo-random order, at least 5 Å from the solute and from every
+  other ion (by the minimum image). Ions used to go where the solute's own
+  electrostatic potential was lowest (sodium) or highest (chloride), without
+  the potential of the ions already placed: around a charged solute every
+  counter-ion started on its surface and every co-ion in one cluster in the
+  far corner of the box (17 chloride ions 4.6 Å apart for a glycan of charge
+  −4). The numbers of ions are unchanged; `--seed` now selects the placement.
 - The GOTW recipe runs on the GPU: particle-mesh Ewald (direct-space term in
   the tile kernel, reciprocal space on a mesh transformed on the device,
   corrections for excluded pairs), and the leap-frog integrator with
