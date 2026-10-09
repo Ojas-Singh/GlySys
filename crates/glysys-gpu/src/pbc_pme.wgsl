@@ -26,12 +26,12 @@
 //! back, so no two workgroups touch the same element and the transforms run
 //! in place.
 //!
-//! What a transform costs on a device is mostly how its loads and stores of
-//! the meshes are laid out, not its arithmetic: the lanes of a workgroup
-//! execute one load together, and it is served fastest when their addresses
-//! are neighbours. Hence the layouts (x contiguous in the real meshes, z in
-//! the half spectrum) and, in every copy loop below, lanes that walk along
-//! the contiguous index.
+//! What a transform costs is mostly how its loads and stores of the meshes
+//! are laid out, not its arithmetic (measured on an NVIDIA GB10): the lanes
+//! of a workgroup execute one load together, and it is served fastest when
+//! their addresses are neighbours. Hence the layouts (x contiguous in the
+//! real meshes, z in the half spectrum) and, in every copy loop below, lanes
+//! that walk along the contiguous index.
 //!
 //! Everything that depends on the box is computed from the three box lengths
 //! in the uniform at every dispatch, so a barostat kernel can rewrite them on
@@ -114,8 +114,9 @@ fn energy_word(slot: u32) -> u32 { return 6u * n_atoms() + 2u * slot; }
 // Cardinal B-splines of order 4. For each axis a vector holds the weights of
 // the mesh points `cell`, `cell + 1`, ... and a second one their derivatives
 // with respect to the scaled coordinate. The recursion is the one of the CPU
-// engine. Vectors, not arrays: an array indexed in a loop lives in memory on
-// a device, and each read of it then costs as much as a read of the mesh.
+// engine. Vectors, not arrays: a device compiler may keep an array that is
+// indexed in a loop in memory, where reading it costs as much as reading the
+// mesh.
 
 struct Spline {
   cell: vec3<u32>,
@@ -209,9 +210,8 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
 // after one radix-2 stage when log2 N is odd.
 
 var<workgroup> line: array<vec2<f32>, 2u * LINE>;
-// The twiddles of the workgroup's transform, exp(-2 pi i j / N) for j < N/2.
-// Taken from the storage table every read of one would wait on the device's
-// memory; here it is as fast as the line itself.
+// The twiddles of the workgroup's transform, exp(-2 pi i j / N) for j < N/2,
+// next to the line they multiply rather than in the storage table.
 var<workgroup> turns: array<vec2<f32>, 128>;
 
 // Copy the twiddles of a `1 << bits`-point transform. Every lane calls it
