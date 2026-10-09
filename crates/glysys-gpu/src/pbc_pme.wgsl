@@ -185,6 +185,17 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
 // the lanes and the barrier after it is the only synchronisation.
 
 var<workgroup> line: array<vec2<f32>, 2u * LINE>;
+// The twiddles of the workgroup's transform, exp(-2 pi i j / N) for j < N/2.
+// A stage reads a twiddle for every other output; taken from the storage
+// table each of those reads would wait on the device's memory, here it is as
+// fast as the line itself.
+var<workgroup> turns: array<vec2<f32>, 128>;
+
+// Copy the twiddles of a `1 << bits`-point transform. Every lane calls it
+// before the barrier that follows the copy of the lines.
+fn load_turns(lid: u32, bits: u32) {
+  for (var j = lid; j < (1u << bits) / 2u; j += 64u) { turns[j] = twiddle[j << (8u - bits)]; }
+}
 
 // Lines of `points` elements held by one workgroup, of `available` in the
 // direction the workgroups are counted along. A power of two.
@@ -209,7 +220,7 @@ fn fft_stage(lid: u32, bits: u32, count: u32, ls: u32, src: u32, dst: u32, direc
     let b = line[ia + half];
     var value = a + b;
     if ((t & 1u) != 0u) {
-      let w = twiddle[turn << (8u - bits)];
+      let w = turns[turn];
       let d = a - b;
       value = vec2<f32>(d.x * w.x - direction * d.y * w.y, direction * d.x * w.y + d.y * w.x);
     }
@@ -253,6 +264,7 @@ fn fft_x_forward(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocat
     charge_words[at + points] = 0u;
     line[e] = MESH_UNIT * vec2<f32>(f32(re), f32(im));
   }
+  load_turns(lid, bits);
   workgroupBarrier();
   let done = fft_stages(lid, bits, count, 0u, bits, 0u, 1.0);
   // One real line per lane and step: lanes take neighbouring z, which are
@@ -289,6 +301,7 @@ fn fft_y(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_inde
     let y = i >> line_bits;
     line[l * points + y] = spectrum[base + y * stride + l];
   }
+  load_turns(lid, bits);
   workgroupBarrier();
   let done = fft_stages(lid, bits, count, 0u, bits, 0u, select(1.0, -1.0, INVERSE));
   for (var i = lid; i < count; i += 64u) {
@@ -323,6 +336,7 @@ fn convolve_z(group: vec3<u32>, lid: u32) -> vec2<f32> {
   let first_ky = lines * group.x;
   let base = (group.y * pc.grid.y + first_ky) * points;
   for (var e = lid; e < count; e += 64u) { line[e] = spectrum[base + e]; }
+  load_turns(lid, bits);
   workgroupBarrier();
   let done = fft_stages(lid, bits, count, 0u, bits - 1u, 0u, 1.0);
   let scaled = LINE - done;
@@ -416,6 +430,7 @@ fn fft_x_inverse(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocat
       line[l * points + points - k] = vec2<f32>(a.x + b.y, b.x - a.y);
     }
   }
+  load_turns(lid, bits);
   workgroupBarrier();
   let done = fft_stages(lid, bits, count, 0u, bits, 0u, -1.0);
   for (var e = lid; e < count; e += 64u) {
