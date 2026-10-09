@@ -5,6 +5,7 @@
 //! barostat use independent deterministic streams so barostat schedule
 //! changes never perturb thermostat reproducibility.
 use super::accumulators::{Accumulator, WaterOccupancy};
+use super::coupling::{CouplingPlan, CouplingState};
 use super::settle::SettleWaters;
 use super::{
     ACCEL, BAR_PER_KCAL_MOL_A3, ConstraintModel, ElectrostaticsModel, Ensemble, KB,
@@ -19,10 +20,18 @@ use glysys_energy::pbc::{
     classify_waters, molecules,
 };
 use glysys_energy::pbc_cluster::ClusterPairEngine;
+use glysys_energy::pme::{PmeEngine, PmeParameters};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 pub const SKIN_ANGSTROM: f64 = 1.5;
+/// Fewest atoms a parallel task of a per-atom loop takes; such loops cost a
+/// few nanoseconds per atom, less than handing out a task does.
+const PER_ATOM_TASK: usize = 512;
+/// Below this many atoms the per-atom loops of a step run on the calling
+/// thread: waking the pool for one of them takes longer than the loop.
+const PARALLEL_ATOMS: usize = 32_768;
 /// 1 fs for flexible waters, 2 fs with SETTLE. Larger requests are rejected
 /// rather than silently integrated.
 pub fn max_timestep_fs(constraints: ConstraintModel) -> f64 {
@@ -68,10 +77,105 @@ pub fn cutoff_angstrom(protocol: &SimulationProtocol) -> f64 {
     protocol.cutoff_angstrom.unwrap_or(9.0)
 }
 
+/// GROMACS defaults of `ewald-rtol`, `fourierspacing` and `pme-order`.
+pub const DEFAULT_EWALD_TOLERANCE: f64 = 1e-5;
+pub const DEFAULT_FOURIER_SPACING_ANGSTROM: f64 = 1.2;
+pub const DEFAULT_PME_ORDER: usize = 4;
+
+/// Mesh Ewald settings of a protocol for a prepared system. The grid comes
+/// from the box the system was prepared with, so a run and its restarts use
+/// the same one whatever a barostat has done to the box since.
+pub fn pme_parameters(
+    system: &ParameterizedSystem,
+    protocol: &SimulationProtocol,
+) -> Result<PmeParameters> {
+    let prepared_box = BoxVectors::from_system(system).map_err(Error::Energy)?;
+    PmeParameters::for_box(
+        &prepared_box,
+        cutoff_angstrom(protocol),
+        protocol.ewald_tolerance.unwrap_or(DEFAULT_EWALD_TOLERANCE),
+        protocol
+            .fourier_spacing_angstrom
+            .unwrap_or(DEFAULT_FOURIER_SPACING_ANGSTROM),
+        protocol.pme_order.unwrap_or(DEFAULT_PME_ORDER),
+    )
+    .map_err(Error::Energy)
+}
+
+/// Electrostatics of one run: the reaction-field pair function, or the mesh
+/// Ewald engine with its grids and work buffers.
+enum Electrostatics {
+    ReactionField(ReactionField),
+    Pme(Box<PmeEngine>),
+}
+
+impl Electrostatics {
+    fn new(system: &ParameterizedSystem, protocol: &SimulationProtocol) -> Result<Self> {
+        match protocol.electrostatics {
+            ElectrostaticsModel::ReactionField => Ok(Self::ReactionField(rf_backend(protocol)?)),
+            ElectrostaticsModel::Pme => {
+                if protocol.has_npt() && !protocol.uses_leapfrog() {
+                    return Err(invalid(
+                        "PME at constant pressure needs the Nose-Hoover leap-frog integrator with Parrinello-Rahman; the Monte Carlo barostat evaluates reaction field only",
+                    ));
+                }
+                let engine = PmeEngine::new(system, pme_parameters(system, protocol)?)
+                    .map_err(Error::Energy)?;
+                Ok(Self::Pme(Box::new(engine)))
+            }
+        }
+    }
+
+    /// The reaction-field function, for the Monte Carlo barostat and the
+    /// pressure probe, which are written for it.
+    fn reaction_field(&self) -> Result<ReactionField> {
+        match self {
+            Self::ReactionField(backend) => Ok(*backend),
+            Self::Pme(_) => Err(invalid("this path evaluates reaction field only")),
+        }
+    }
+
+    /// Energy, gradient and virial on the f64 reference path.
+    fn reference(
+        &mut self,
+        field: &PbcForceField,
+        coordinates: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        protocol: &SimulationProtocol,
+        dispersion_coefficient: f64,
+    ) -> Result<glysys_energy::pbc::PbcEnergy> {
+        let cutoff = cutoff_angstrom(protocol);
+        match self {
+            Self::ReactionField(backend) => field
+                .evaluate_with_dispersion_coefficient(
+                    coordinates,
+                    box_vec,
+                    pairs,
+                    backend,
+                    cutoff,
+                    dispersion_coefficient,
+                    protocol.dispersion_correction,
+                )
+                .map_err(Error::Energy),
+            Self::Pme(engine) => {
+                let mut energy = field
+                    .evaluate_pme(engine, coordinates, box_vec, pairs, cutoff)
+                    .map_err(Error::Energy)?;
+                if protocol.dispersion_correction {
+                    energy.components.dispersion_correction =
+                        dispersion_coefficient / box_vec.volume();
+                }
+                Ok(energy)
+            }
+        }
+    }
+}
+
 pub fn rf_backend(protocol: &SimulationProtocol) -> Result<ReactionField> {
     if protocol.electrostatics != ElectrostaticsModel::ReactionField {
         return Err(invalid(
-            "PME was requested, but the CPU reciprocal-space evaluator is not installed yet; use reaction-field until the PME gate passes",
+            "this path evaluates reaction-field electrostatics only",
         ));
     }
     ReactionField::new(
@@ -88,8 +192,9 @@ fn electrostatics_kind(protocol: &SimulationProtocol) -> NonbondedElectrostatics
             solvent_dielectric: protocol.rf_dielectric.unwrap_or(78.5),
         },
         ElectrostaticsModel::Pme => NonbondedElectrostatics::Pme {
-            // This value is used only to keep fingerprints descriptive while
-            // rf_backend emits the capability error above.
+            // Fingerprint label only: the settings that fix alpha and the
+            // grid (cutoff, tolerance, spacing, order, prepared box) are
+            // hashed with the protocol and the system.
             alpha_per_angstrom: 0.35,
             grid: [0, 0, 0],
             interpolation_order: 4,
@@ -97,23 +202,30 @@ fn electrostatics_kind(protocol: &SimulationProtocol) -> NonbondedElectrostatics
     }
 }
 
-/// Cluster-pair engine for reaction-field dynamics. Setting the environment
-/// variable `GLYSYS_CPU_REFERENCE_PAIRS` keeps the f64 reference pair loop
-/// (for validation runs); PME has no cluster kernel yet.
+/// Cluster-pair engine for the dynamics force loop, in reaction-field or
+/// PME mode. Setting the environment variable `GLYSYS_CPU_REFERENCE_PAIRS`
+/// keeps the f64 reference pair loop (for validation runs).
 fn cluster_engine(
     system: &ParameterizedSystem,
     protocol: &SimulationProtocol,
 ) -> Result<Option<ClusterPairEngine>> {
-    if protocol.electrostatics != ElectrostaticsModel::ReactionField || reference_pairs_requested()
-    {
+    if reference_pairs_requested() {
         return Ok(None);
     }
-    ClusterPairEngine::new(
-        system,
-        cutoff_angstrom(protocol),
-        SKIN_ANGSTROM,
-        protocol.rf_dielectric.unwrap_or(78.5),
-    )
+    match protocol.electrostatics {
+        ElectrostaticsModel::ReactionField => ClusterPairEngine::new(
+            system,
+            cutoff_angstrom(protocol),
+            SKIN_ANGSTROM,
+            protocol.rf_dielectric.unwrap_or(78.5),
+        ),
+        ElectrostaticsModel::Pme => ClusterPairEngine::new_pme(
+            system,
+            cutoff_angstrom(protocol),
+            SKIN_ANGSTROM,
+            pme_parameters(system, protocol)?.alpha_per_angstrom,
+        ),
+    }
     .map(Some)
     .map_err(Error::Energy)
 }
@@ -228,11 +340,31 @@ fn fingerprint(
             )
         );
     }
+    // The leap-frog model adds its coupling intervals and time step: they
+    // set the equations of motion as much as the coupling times do.
+    let leapfrog = if protocol.uses_leapfrog() {
+        format!(
+            "dt={}:T={}:P={}:cutoff={:?}:rf={:?}:tc-interval={:?}:pc-interval={:?}:com-interval={:?}:ewald={:?}:grid={:?}:pme-order={:?}:",
+            protocol.timestep_fs,
+            protocol.temperature_k,
+            protocol.pressure_bar,
+            protocol.cutoff_angstrom,
+            protocol.rf_dielectric,
+            protocol.temperature_coupling_interval,
+            protocol.pressure_coupling_interval,
+            protocol.com_removal_interval,
+            protocol.ewald_tolerance,
+            protocol.fourier_spacing_angstrom,
+            protocol.pme_order,
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{:x}",
         Sha256::digest(
                 format!(
-                "{}:{:?}:{:?}:pressure-coupling={:?}:thermostat={:?}:dispersion={}:stages={:?}:thermostat-groups={:?}:pressure-tau={:?}:compressibility={:?}:com-mode={:?}:com-groups={:?}:{restraints}:{system:?}",
+                "{}:{:?}:{:?}:pressure-coupling={:?}:thermostat={:?}:dispersion={}:stages={:?}:thermostat-groups={:?}:pressure-tau={:?}:compressibility={:?}:com-mode={:?}:com-groups={:?}:{leapfrog}{restraints}:{system:?}",
                 model_version(protocol),
                 electrostatics_kind(protocol),
                 protocol.constraints,
@@ -252,7 +384,9 @@ fn fingerprint(
 }
 
 pub fn model_version(protocol: &SimulationProtocol) -> &'static str {
-    if protocol.langevin_discretization == LangevinDiscretization::LfMiddle {
+    if protocol.uses_leapfrog() {
+        super::EXPLICIT_LEAPFROG_MODEL_VERSION
+    } else if protocol.langevin_discretization == LangevinDiscretization::LfMiddle {
         super::EXPLICIT_LF_MIDDLE_MODEL_VERSION
     } else if protocol.has_npt() || protocol.dispersion_correction || protocol.stages.is_some() {
         super::EXPLICIT_NPT_MODEL_VERSION
@@ -526,6 +660,78 @@ pub fn molecular_pressure_bar(
     Ok((2. * k_com / (3. * volume) - d_u_d_v) * BAR_PER_KCAL_MOL_A3)
 }
 
+/// Coupling set-up for a leap-frog protocol; `None` for the other
+/// integrators.
+fn coupling_plan(
+    atom_count: usize,
+    waters: &[[usize; 3]],
+    h_bonds: &[(usize, usize, f64)],
+    protocol: &SimulationProtocol,
+) -> Result<Option<Arc<CouplingPlan>>> {
+    if !protocol.uses_leapfrog() {
+        return Ok(None);
+    }
+    let mut is_water = vec![false; atom_count];
+    let mut constraints = vec![0u32; atom_count];
+    for water in waters {
+        for &atom in water {
+            is_water[atom] = true;
+            constraints[atom] += 2;
+        }
+    }
+    for &(a, b, _) in h_bonds {
+        constraints[a] += 1;
+        constraints[b] += 1;
+    }
+    CouplingPlan::new(protocol, &is_water, &constraints).map(|plan| Some(Arc::new(plan)))
+}
+
+/// First atom of each atom's molecule: the origin its constraint forces are
+/// measured from in the virial, so the sum does not depend on where the
+/// unwrapped molecule has drifted.
+fn molecule_anchors(atom_count: usize, molecules: &[Vec<usize>]) -> Vec<u32> {
+    let mut anchors: Vec<u32> = (0..atom_count as u32).collect();
+    for molecule in molecules {
+        if let Some(&first) = molecule.iter().min() {
+            for &atom in molecule {
+                anchors[atom] = first as u32;
+            }
+        }
+    }
+    anchors
+}
+
+/// Subtract the center-of-mass velocity of each group from its atoms.
+fn remove_com_motion(groups: &[Vec<usize>], masses: &[f64], velocities: &mut [Vec3]) {
+    for group in groups {
+        let mut momentum = Vec3 {
+            x: 0.,
+            y: 0.,
+            z: 0.,
+        };
+        let mut mass = 0.;
+        for &atom in group {
+            momentum = add(momentum, scale(velocities[atom], masses[atom]));
+            mass += masses[atom];
+        }
+        if mass <= 0. {
+            continue;
+        }
+        let drift = scale(momentum, -1. / mass);
+        for &atom in group {
+            velocities[atom] = add(velocities[atom], drift);
+        }
+    }
+}
+
+fn schema_version(protocol: &SimulationProtocol) -> u32 {
+    match model_version(protocol) {
+        version if version == super::EXPLICIT_LEAPFROG_MODEL_VERSION => 3,
+        version if version == super::EXPLICIT_NPT_MODEL_VERSION => 2,
+        _ => 1,
+    }
+}
+
 fn dof_count(atom_count: usize, settle: &Option<SettleWaters>) -> usize {
     let constrained = settle.as_ref().map(|s| s.constraint_count()).unwrap_or(0);
     (3 * atom_count).saturating_sub(constrained).max(1)
@@ -542,6 +748,9 @@ pub fn degrees_of_freedom(
     let waters = classify_waters(system);
     let h_bonds = solute_h_bonds(system, &waters);
     let targets = water_targets(system, &waters)?;
+    if let Some(plan) = coupling_plan(system.atom_count(), &waters, &h_bonds, protocol)? {
+        return Ok(plan.degrees_of_freedom().round() as usize);
+    }
     let settle = match protocol.constraints {
         ConstraintModel::None => None,
         ConstraintModel::Settle => Some(SettleWaters::from_equilibrium(
@@ -571,7 +780,7 @@ pub struct ExplicitSimulation<'a> {
     settle: Option<SettleWaters>,
     waters: Vec<[usize; 3]>,
     molecules: Vec<Vec<usize>>,
-    backend: ReactionField,
+    electrostatics: Electrostatics,
     pairs: PbcNeighborList,
     /// Single-precision cluster-pair engine for the dynamics force loop.
     /// `None` keeps the f64 reference pair list for every evaluation.
@@ -583,9 +792,32 @@ pub struct ExplicitSimulation<'a> {
     /// cutoff. It is a volume-only term and therefore adds no Cartesian
     /// force in the fixed-box integrator.
     dispersion_coefficient: f64,
+    /// Its counterpart for a pressure computed from forces
+    /// ([`PbcForceField::dispersion_pressure_coefficient`]).
+    dispersion_pressure_coefficient: f64,
     /// Unconstrained velocity DOF: 3N minus one per distance constraint.
     degrees_of_freedom: usize,
+    /// Temperature groups and coupling intervals of the leap-frog
+    /// integrator; `None` for the other integrators.
+    coupling_plan: Option<Arc<CouplingPlan>>,
+    /// See [`molecule_anchors`].
+    constraint_anchor: Vec<u32>,
+    /// Whether `state.virial_kcal_mol` holds the full virial of the stored
+    /// gradient (force-only evaluations leave the pair part out).
+    virial_current: bool,
+    scratch: LeapfrogScratch,
+    /// `-ACCEL / mass` of every atom: gradient to acceleration.
+    kick_per_ps: Vec<f64>,
     pub state: SimulationState,
+}
+
+/// Buffers of the leap-frog step, kept between steps: the new velocities,
+/// the positions before and after the constraints.
+#[derive(Default)]
+struct LeapfrogScratch {
+    velocities: Vec<Vec3>,
+    trial: Vec<Vec3>,
+    coordinates: Vec<Vec3>,
 }
 
 impl<'a> ExplicitSimulation<'a> {
@@ -596,12 +828,18 @@ impl<'a> ExplicitSimulation<'a> {
             settle: self.settle,
             waters: self.waters,
             molecules: self.molecules,
-            backend: self.backend,
+            electrostatics: self.electrostatics,
             pairs: self.pairs,
             cluster: self.cluster,
             force_only: self.force_only,
             dispersion_coefficient: self.dispersion_coefficient,
+            dispersion_pressure_coefficient: self.dispersion_pressure_coefficient,
             degrees_of_freedom: self.degrees_of_freedom,
+            coupling_plan: self.coupling_plan,
+            constraint_anchor: self.constraint_anchor,
+            virial_current: self.virial_current,
+            scratch: self.scratch,
+            kick_per_ps: self.kick_per_ps,
             state: self.state,
         }
     }
@@ -649,14 +887,12 @@ impl<'a> ExplicitSimulation<'a> {
         if protocol.solvent != SolventModel::Explicit {
             return Err(invalid("explicit driver needs solvent=explicit"));
         }
-        if protocol.thermostat == Thermostat::NoseHoover {
+        if protocol.has_npt()
+            && protocol.pressure_coupling == PressureCoupling::ParrinelloRahman
+            && !protocol.uses_leapfrog()
+        {
             return Err(invalid(
-                "Nose-Hoover is a declared protocol option but its constrained integrator is not installed yet; use Langevin or v-rescale",
-            ));
-        }
-        if protocol.has_npt() && protocol.pressure_coupling != PressureCoupling::MonteCarlo {
-            return Err(invalid(
-                "Parrinello-Rahman is a declared protocol option but its constrained stress integrator is not installed yet; use the validated Monte Carlo barostat",
+                "Parrinello-Rahman requires the Nose-Hoover leap-frog integrator",
             ));
         }
         if protocol.timestep_fs > max_timestep_fs(protocol.constraints) {
@@ -689,7 +925,14 @@ impl<'a> ExplicitSimulation<'a> {
         } else {
             0.0
         };
-        let backend = rf_backend(&protocol)?;
+        let dispersion_pressure_coefficient = if protocol.dispersion_correction {
+            field
+                .dispersion_pressure_coefficient(cutoff)
+                .map_err(Error::Energy)?
+        } else {
+            0.0
+        };
+        let mut electrostatics = Electrostatics::new(system, &protocol)?;
         let waters = classify_waters(system);
         if waters.is_empty() {
             return Err(invalid(
@@ -721,7 +964,7 @@ impl<'a> ExplicitSimulation<'a> {
             coordinates = minimize(
                 &field,
                 &box_vec,
-                &backend,
+                &mut electrostatics,
                 coordinates,
                 &protocol,
                 dispersion_coefficient,
@@ -730,6 +973,7 @@ impl<'a> ExplicitSimulation<'a> {
         }
         let h_bonds = solute_h_bonds(system, &waters);
         let targets = water_targets(system, &waters)?;
+        let coupling_plan = coupling_plan(system.atom_count(), &waters, &h_bonds, &protocol)?;
         let settle = match protocol.constraints {
             ConstraintModel::None => None,
             ConstraintModel::Settle => Some(
@@ -752,17 +996,14 @@ impl<'a> ExplicitSimulation<'a> {
         let wrapped: Vec<Vec3> = coordinates.iter().map(|p| box_vec.wrap(*p)).collect();
         let pairs = PbcNeighborList::build(&wrapped, &box_vec, cutoff, SKIN_ANGSTROM)
             .map_err(Error::Energy)?;
-        let energy = field
-            .evaluate_with_dispersion_coefficient(
-                &coordinates,
-                &box_vec,
-                &pairs.pairs,
-                &backend,
-                cutoff_angstrom(&protocol),
-                dispersion_coefficient,
-                protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = electrostatics.reference(
+            &field,
+            &coordinates,
+            &box_vec,
+            &pairs.pairs,
+            &protocol,
+            dispersion_coefficient,
+        )?;
         let mut rng = protocol.seed;
         let mut velocities = masses
             .iter()
@@ -771,9 +1012,19 @@ impl<'a> ExplicitSimulation<'a> {
         if let Some(settle) = &settle {
             settle.constrain_velocities(&coordinates, &mut velocities)?;
         }
+        if let Some(plan) = coupling_plan.as_ref().filter(|plan| plan.com_interval > 0) {
+            remove_com_motion(&plan.com_groups, &masses, &mut velocities);
+        }
         let barostat_rng = protocol_seed_barostat(protocol_seed(&protocol));
         let has_npt = protocol.has_npt();
-        let degrees_of_freedom = dof_count(system.atom_count(), &settle);
+        let degrees_of_freedom = coupling_plan.as_ref().map_or_else(
+            || dof_count(system.atom_count(), &settle),
+            |plan| plan.degrees_of_freedom().round() as usize,
+        );
+        let coupling = coupling_plan
+            .as_ref()
+            .map(|plan| CouplingState::new(plan.groups.len()));
+        let constraint_anchor = molecule_anchors(system.atom_count(), &molecules);
         let resident_rng = (protocol.thermostat == Thermostat::Langevin).then(|| {
             super::resident_rng::ResidentThermostatRng::seeded(protocol.seed, system.atom_count())
         });
@@ -781,22 +1032,24 @@ impl<'a> ExplicitSimulation<'a> {
         let cluster = cluster_engine(system, &protocol)?;
         let mut sim = Self {
             field,
+            kick_per_ps: masses.iter().map(|m| -ACCEL / m).collect(),
             masses,
             settle,
             waters,
             molecules,
-            backend,
+            electrostatics,
             pairs,
             cluster,
             force_only: false,
             dispersion_coefficient,
+            dispersion_pressure_coefficient,
             degrees_of_freedom,
+            coupling_plan,
+            constraint_anchor,
+            virial_current: true,
+            scratch: LeapfrogScratch::default(),
             state: SimulationState {
-                schema_version: if model_version(&protocol) == super::EXPLICIT_NPT_MODEL_VERSION {
-                    2
-                } else {
-                    1
-                },
+                schema_version: schema_version(&protocol),
                 model_version: model_version(&protocol).into(),
                 velocity_convention,
                 degrees_of_freedom,
@@ -824,6 +1077,7 @@ impl<'a> ExplicitSimulation<'a> {
                 barostat_step_counter: 0,
                 barostat_frozen: false,
                 water_occupancy: None,
+                coupling,
             },
         };
         sim.state.system_fingerprint =
@@ -854,11 +1108,7 @@ impl<'a> ExplicitSimulation<'a> {
             }
         }
         let expected_model = model_version(&state.protocol);
-        let expected_schema = if expected_model == super::EXPLICIT_NPT_MODEL_VERSION {
-            2
-        } else {
-            1
-        };
+        let expected_schema = schema_version(&state.protocol);
         if state.schema_version != expected_schema
             || state.model_version != expected_model
             || state.velocity_convention != VelocityConvention::for_protocol(&state.protocol)
@@ -888,11 +1138,32 @@ impl<'a> ExplicitSimulation<'a> {
         } else {
             0.0
         };
-        let backend = rf_backend(&state.protocol)?;
+        let dispersion_pressure_coefficient = if state.protocol.dispersion_correction {
+            field
+                .dispersion_pressure_coefficient(cutoff_angstrom(&state.protocol))
+                .map_err(Error::Energy)?
+        } else {
+            0.0
+        };
+        let mut electrostatics = Electrostatics::new(system, &state.protocol)?;
         let waters = classify_waters(system);
         let masses: Vec<_> = system.atoms().iter().map(|a| a.mass()).collect();
         let h_bonds = solute_h_bonds(system, &waters);
         let targets = water_targets(system, &waters)?;
+        let coupling_plan =
+            coupling_plan(system.atom_count(), &waters, &h_bonds, &state.protocol)?;
+        if coupling_plan.as_ref().map(|plan| plan.groups.len())
+            != state.coupling.as_ref().map(|c| c.thermostat_velocity.len())
+            || state.coupling.as_ref().is_some_and(|c| {
+                c.thermostat_position.len() != c.thermostat_velocity.len()
+                    || c.thermostat_velocity.iter().any(|v| !v.is_finite())
+                    || c.box_velocity.iter().any(|v| !v.is_finite())
+            })
+        {
+            return Err(invalid(
+                "checkpoint coupling variables do not match the protocol",
+            ));
+        }
         let settle = match state.protocol.constraints {
             ConstraintModel::None => None,
             ConstraintModel::Settle => Some(SettleWaters::from_equilibrium(
@@ -915,17 +1186,14 @@ impl<'a> ExplicitSimulation<'a> {
             SKIN_ANGSTROM,
         )
         .map_err(Error::Energy)?;
-        let reference = field
-            .evaluate_with_dispersion_coefficient(
-                &state.coordinates,
-                &box_vec,
-                &pairs.pairs,
-                &backend,
-                cutoff_angstrom(&state.protocol),
-                dispersion_coefficient,
-                state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let reference = electrostatics.reference(
+            &field,
+            &state.coordinates,
+            &box_vec,
+            &pairs.pairs,
+            &state.protocol,
+            dispersion_coefficient,
+        )?;
         if (reference.components.total() - state.potential_energy).abs()
             > 1e-3 + 1e-4 * reference.components.total().abs()
         {
@@ -933,22 +1201,40 @@ impl<'a> ExplicitSimulation<'a> {
                 "checkpoint energy does not match prepared chemistry",
             ));
         }
-        let degrees_of_freedom = dof_count(system.atom_count(), &settle);
+        let degrees_of_freedom = coupling_plan.as_ref().map_or_else(
+            || dof_count(system.atom_count(), &settle),
+            |plan| plan.degrees_of_freedom().round() as usize,
+        );
         let cluster = cluster_engine(system, &state.protocol)?;
+        let molecules = molecules(system);
+        let constraint_anchor = molecule_anchors(system.atom_count(), &molecules);
+        let leapfrog = coupling_plan.is_some();
         let mut sim = Self {
             field,
+            kick_per_ps: masses.iter().map(|m| -ACCEL / m).collect(),
             masses,
             settle,
             waters,
-            molecules: molecules(system),
-            backend,
+            molecules,
+            electrostatics,
             pairs,
             cluster,
             force_only: false,
             dispersion_coefficient,
+            dispersion_pressure_coefficient,
             degrees_of_freedom,
+            coupling_plan,
+            constraint_anchor,
+            // A checkpoint may follow a force-only step. The barostat needs
+            // the virial of the stored forces, so take it from the
+            // evaluation above.
+            virial_current: leapfrog,
+            scratch: LeapfrogScratch::default(),
             state,
         };
+        if leapfrog {
+            sim.state.virial_kcal_mol = reference.virial;
+        }
         let expected = fingerprint(system, &sim.state.protocol, sim.field_restraint_count());
         if sim.state.system_fingerprint != expected {
             return Err(invalid("checkpoint chemistry fingerprint mismatch"));
@@ -998,6 +1284,11 @@ impl<'a> ExplicitSimulation<'a> {
 
     /// Transactional step: errors leave committed state and RNG untouched.
     pub fn step(&mut self) -> Result<()> {
+        if self.coupling_plan.is_some() {
+            self.leapfrog_step()?;
+            self.state.step += 1;
+            return Ok(());
+        }
         if self.cluster.is_none() || self.state.protocol.has_npt() {
             self.refresh_pairs()?;
         }
@@ -1051,16 +1342,18 @@ impl<'a> ExplicitSimulation<'a> {
                     .barostat_step_counter
                     .is_multiple_of(self.state.protocol.barostat_interval))
         {
-            match molecular_pressure_bar(
-                &self.field,
-                &self.backend,
-                &self.state.protocol,
-                &box_vec,
-                &self.state.coordinates,
-                &self.state.velocities,
-                &self.masses,
-                &self.molecules,
-            ) {
+            match self.electrostatics.reaction_field().and_then(|backend| {
+                molecular_pressure_bar(
+                    &self.field,
+                    &backend,
+                    &self.state.protocol,
+                    &box_vec,
+                    &self.state.coordinates,
+                    &self.state.velocities,
+                    &self.masses,
+                    &self.molecules,
+                )
+            }) {
                 Ok(value) => (value, "molecular-finite-difference"),
                 Err(_) => (
                     pressure_bar(
@@ -1362,6 +1655,298 @@ impl<'a> ExplicitSimulation<'a> {
         )
     }
 
+    /// Leap-frog with Nose–Hoover and Parrinello–Rahman coupling; the
+    /// equations are in [`super::coupling`]. The stored velocities belong to
+    /// the half step before the stored positions. One step:
+    ///
+    /// 1. on a coupling step, advance the thermostat frictions from the
+    ///    group temperatures and the box velocities from the last pressure;
+    /// 2. advance velocities and positions, constrain the positions and add
+    ///    the constraint displacement to the velocities;
+    /// 3. when the virial of the stored forces is known, compute the
+    ///    pressure of this step from it, the constraint forces and the mean
+    ///    of the two half-step kinetic energies;
+    /// 4. on a barostat step, scale the box and the coordinates;
+    /// 5. evaluate the forces at the new positions.
+    fn leapfrog_step(&mut self) -> Result<()> {
+        // The buffers leave `self` for the step, so the force evaluation can
+        // borrow the simulation while they hold the new coordinates.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = self.leapfrog_step_in(&mut scratch);
+        self.scratch = scratch;
+        result
+    }
+
+    fn leapfrog_step_in(&mut self, scratch: &mut LeapfrogScratch) -> Result<()> {
+        let Some(plan) = self.coupling_plan.clone() else {
+            return Err(invalid("leap-frog step without a coupling plan"));
+        };
+        let dt = self.state.protocol.timestep_fs * 0.001;
+        let step = self.state.step;
+        let ensemble = self.segment_ensemble();
+        let old_box = self.box_vectors()?;
+        let lengths = old_box.as_array();
+        let mut coupling = self
+            .state
+            .coupling
+            .clone()
+            .unwrap_or_else(|| CouplingState::new(plan.groups.len()));
+
+        let mut friction = vec![0.; plan.groups.len()];
+        if ensemble != Ensemble::Nve && CouplingPlan::acts_on(step, plan.temperature_interval) {
+            let dt_t = plan.temperature_interval as f64 * dt;
+            let mut kinetic = vec![0.; plan.groups.len()];
+            for ((mass, velocity), group) in self
+                .masses
+                .iter()
+                .zip(&self.state.velocities)
+                .zip(&plan.group_of_atom)
+            {
+                kinetic[*group as usize] += mass * norm2(*velocity) / (2. * ACCEL);
+            }
+            let temperatures: Vec<f64> = kinetic
+                .iter()
+                .zip(&plan.groups)
+                .map(|(k, group)| 2. * k / (group.degrees_of_freedom * KB))
+                .collect();
+            plan.advance_thermostats(&mut coupling, &temperatures, dt_t);
+            for (f, velocity) in friction.iter_mut().zip(&coupling.thermostat_velocity) {
+                *f = 0.5 * dt_t * velocity;
+            }
+        }
+
+        // `drag` is the box-velocity term of the velocity update over the
+        // barostat time step; the same number is the relative box change.
+        let mut drag = [0.; 3];
+        if ensemble == Ensemble::Npt {
+            if CouplingPlan::acts_on(step, plan.pressure_interval) {
+                let dt_p = plan.pressure_interval as f64 * dt;
+                // The first step of a run has no pressure yet.
+                if step > 0 && coupling.pressure_step == Some(step - 1) {
+                    plan.accelerate_box(
+                        &mut coupling.box_velocity,
+                        lengths,
+                        coupling.pressure_bar,
+                        dt_p,
+                    );
+                }
+                for d in 0..3 {
+                    drag[d] = dt_p * coupling.box_velocity[d] / lengths[d];
+                }
+            }
+        } else {
+            coupling.box_velocity = [0.; 3];
+        }
+        // GROMACS warns above 1% per coupling step (a system far from
+        // equilibrium under this barostat); ten times that is a runaway box.
+        if drag.iter().any(|d| !d.is_finite() || d.abs() > 0.1) {
+            return Err(invalid(
+                "the barostat changed the box by more than 10% in one coupling step; checkpoint retained",
+            ));
+        }
+
+        let atoms = self.masses.len();
+        let zero = Vec3 {
+            x: 0.,
+            y: 0.,
+            z: 0.,
+        };
+        for buffer in [&mut scratch.velocities, &mut scratch.trial, &mut scratch.coordinates] {
+            buffer.resize(atoms, zero);
+        }
+        let LeapfrogScratch {
+            velocities: next_vel,
+            trial,
+            coordinates: next_coords,
+        } = scratch;
+        let old_coords = &self.state.coordinates;
+        {
+            let velocities = &self.state.velocities;
+            let gradient = &self.state.gradient;
+            let kicks = &self.kick_per_ps;
+            let groups = &plan.group_of_atom;
+            // per group: the factors of the old velocity and of the kick
+            let factors: Vec<([f64; 3], f64)> = friction
+                .iter()
+                .map(|f| {
+                    let inverse = 1. / (1. + f);
+                    (
+                        [
+                            (1. - f - drag[0]) * inverse,
+                            (1. - f - drag[1]) * inverse,
+                            (1. - f - drag[2]) * inverse,
+                        ],
+                        dt * inverse,
+                    )
+                })
+                .collect();
+            let factors = &factors;
+            let advance = |(i, (velocity, position)): (usize, (&mut Vec3, &mut Vec3))| {
+                let (keep, kick) = factors[groups[i] as usize];
+                let kick = kick * kicks[i];
+                let (v, g) = (velocities[i], gradient[i]);
+                *velocity = Vec3 {
+                    x: v.x * keep[0] + kick * g.x,
+                    y: v.y * keep[1] + kick * g.y,
+                    z: v.z * keep[2] + kick * g.z,
+                };
+                *position = add(old_coords[i], scale(*velocity, dt));
+            };
+            if atoms >= PARALLEL_ATOMS {
+                next_vel
+                    .par_iter_mut()
+                    .zip(trial.par_iter_mut())
+                    .enumerate()
+                    .with_min_len(PER_ATOM_TASK)
+                    .for_each(advance);
+            } else {
+                next_vel.iter_mut().zip(trial.iter_mut()).enumerate().for_each(advance);
+            }
+        }
+
+        next_coords.copy_from_slice(trial);
+        let constrained = self.settle.is_some();
+        if let Some(constraints) = &self.settle {
+            constraints.settle_positions(old_coords, trial, next_coords, &self.masses)?;
+            constraints.shake_solute_positions_from_old(old_coords, next_coords)?;
+        }
+        // One pass adds the constraint displacement to the velocities and
+        // finds the largest move of the step.
+        let inverse_dt = 1. / dt;
+        let correct = |(((velocity, next), unconstrained), old): (
+            ((&mut Vec3, &Vec3), &Vec3),
+            &Vec3,
+        )| {
+            if constrained {
+                *velocity = add(
+                    *velocity,
+                    scale(add(*next, scale(*unconstrained, -1.)), inverse_dt),
+                );
+            }
+            if finite(next) && finite(velocity) {
+                norm2(add(*next, scale(*old, -1.)))
+            } else {
+                f64::INFINITY
+            }
+        };
+        let largest_move = if atoms >= PARALLEL_ATOMS {
+            next_vel
+                .par_iter_mut()
+                .zip(next_coords.par_iter())
+                .zip(trial.par_iter())
+                .zip(old_coords.par_iter())
+                .with_min_len(PER_ATOM_TASK)
+                .map(correct)
+                .reduce(|| 0., f64::max)
+        } else {
+            next_vel
+                .iter_mut()
+                .zip(next_coords.iter())
+                .zip(trial.iter())
+                .zip(old_coords.iter())
+                .map(correct)
+                .fold(0., f64::max)
+        };
+        if !(largest_move <= 1.) {
+            return Err(invalid(
+                "unstable leap-frog step (>1 A); checkpoint retained",
+            ));
+        }
+        let mut constraint_virial = 0.;
+        if constrained && self.virial_current {
+            // sum of r . G with G = m (x_constrained - x_free) / dt^2, summed
+            // in atom order so the result does not depend on the thread
+            // schedule
+            for (i, mass) in self.masses.iter().enumerate() {
+                let moved = add(next_coords[i], scale(trial[i], -1.));
+                let arm = add(
+                    old_coords[i],
+                    scale(old_coords[self.constraint_anchor[i] as usize], -1.),
+                );
+                constraint_virial += mass * (arm.x * moved.x + arm.y * moved.y + arm.z * moved.z);
+            }
+            constraint_virial /= dt * dt * ACCEL;
+        }
+
+        let mut pressure = None;
+        if self.virial_current {
+            let kinetic = 0.5
+                * (kinetic_energy(&self.masses, &self.state.velocities)
+                    + kinetic_energy(&self.masses, next_vel));
+            let volume = old_box.volume();
+            let mut value =
+                (2. * kinetic + self.state.virial_kcal_mol + constraint_virial) / (3. * volume);
+            if self.state.protocol.dispersion_correction {
+                value += self.dispersion_pressure_coefficient / (volume * volume);
+            }
+            let bar = value * BAR_PER_KCAL_MOL_A3;
+            coupling.pressure_bar = bar;
+            coupling.pressure_step = Some(step);
+            pressure = Some(bar);
+        }
+
+        let new_box = if drag == [0.; 3] {
+            old_box
+        } else {
+            let scale_by = [1. + drag[0], 1. + drag[1], 1. + drag[2]];
+            for p in next_coords.iter_mut() {
+                p.x *= scale_by[0];
+                p.y *= scale_by[1];
+                p.z *= scale_by[2];
+            }
+            BoxVectors::new(
+                lengths[0] * scale_by[0],
+                lengths[1] * scale_by[1],
+                lengths[2] * scale_by[2],
+            )
+            .map_err(Error::Energy)?
+        };
+        if cutoff_angstrom(&self.state.protocol)
+            >= 0.5 * new_box.x.min(new_box.y).min(new_box.z)
+        {
+            return Err(invalid(
+                "the box shrank below twice the cutoff; checkpoint retained",
+            ));
+        }
+
+        if plan.com_interval > 0 && step.is_multiple_of(plan.com_interval) {
+            remove_com_motion(&plan.com_groups, &self.masses, next_vel);
+        }
+
+        let virial_was_current = self.virial_current;
+        let energy = match self.dynamics_energy_in(next_coords, &new_box) {
+            Ok(energy)
+                if energy.components.total().is_finite()
+                    && energy.gradients.len() == atoms
+                    && energy.gradients.iter().all(finite) =>
+            {
+                energy
+            }
+            Ok(_) => {
+                self.virial_current = virial_was_current;
+                return Err(invalid("nonfinite explicit energy; checkpoint retained"));
+            }
+            Err(error) => {
+                self.virial_current = virial_was_current;
+                return Err(error);
+            }
+        };
+        // The new state takes the buffers and leaves the old ones for the
+        // next step.
+        std::mem::swap(&mut self.state.coordinates, next_coords);
+        std::mem::swap(&mut self.state.velocities, next_vel);
+        self.state.potential_energy = energy.components.total();
+        self.state.gradient = energy.gradients;
+        self.state.virial_kcal_mol = energy.virial;
+        self.state.box_angstrom = new_box.as_array();
+        self.state.coupling = Some(coupling);
+        if let Some(bar) = pressure {
+            self.state.pressure_bar = bar;
+            self.state.pressure_estimator = "atomic-virial-with-constraints".into();
+        }
+        Ok(())
+    }
+
     /// Isotropic Monte Carlo barostat. Volume moves use their own stream;
     /// restraint forces are external and excluded from the virial by design.
     fn try_barostat(&mut self, adaptation_enabled: bool) -> Result<()> {
@@ -1409,18 +1994,14 @@ impl<'a> ExplicitSimulation<'a> {
             SKIN_ANGSTROM,
         )
         .map_err(Error::Energy)?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &proposed_coords,
-                &proposed_box,
-                &pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            &proposed_coords,
+            &proposed_box,
+            &pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
         let delta_g = barostat_work(
             self.state.potential_energy,
             energy.components.total(),
@@ -1467,44 +2048,66 @@ impl<'a> ExplicitSimulation<'a> {
     /// barostat proposals share), otherwise the f64 reference evaluator.
     fn dynamics_energy(&mut self, coords: &[Vec3]) -> Result<glysys_energy::pbc::PbcEnergy> {
         let box_vec = self.box_vectors()?;
-        if !self.state.protocol.has_npt()
+        self.dynamics_energy_in(coords, &box_vec)
+    }
+
+    /// Energy and gradient of `coords` in `box_vec`, which a barostat step
+    /// may have changed from the committed box.
+    fn dynamics_energy_in(
+        &mut self,
+        coords: &[Vec3],
+        box_vec: &BoxVectors,
+    ) -> Result<glysys_energy::pbc::PbcEnergy> {
+        // The Monte Carlo barostat evaluates trial boxes with the reference
+        // pair list; the leap-frog barostat changes the box a little at a
+        // time, which the cluster lists follow.
+        if (!self.state.protocol.has_npt() || self.coupling_plan.is_some())
             && let Some(engine) = &mut self.cluster
         {
-            return self
-                .field
-                .evaluate_with_cluster(
+            let energy = match &mut self.electrostatics {
+                Electrostatics::ReactionField(_) => self.field.evaluate_with_cluster(
                     engine,
                     coords,
-                    &box_vec,
+                    box_vec,
                     self.dispersion_coefficient,
                     self.state.protocol.dispersion_correction,
                     !self.force_only,
-                )
-                .map_err(Error::Energy);
+                ),
+                Electrostatics::Pme(pme) => self.field.evaluate_with_cluster_pme(
+                    engine,
+                    pme,
+                    coords,
+                    box_vec,
+                    self.dispersion_coefficient,
+                    self.state.protocol.dispersion_correction,
+                    !self.force_only,
+                ),
+            }
+            .map_err(Error::Energy)?;
+            self.virial_current = !self.force_only;
+            return Ok(energy);
         }
-        self.refresh_pairs_for(coords)?;
-        self.field
-            .evaluate_with_dispersion_coefficient(
-                coords,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)
+        self.refresh_pairs_in(coords, box_vec)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            coords,
+            box_vec,
+            &self.pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
+        self.virial_current = true;
+        Ok(energy)
     }
 
-    fn refresh_pairs_for(&mut self, coords: &[Vec3]) -> Result<()> {
-        let box_vec = self.box_vectors()?;
+    fn refresh_pairs_in(&mut self, coords: &[Vec3], box_vec: &BoxVectors) -> Result<()> {
         let wrapped: Vec<Vec3> = coords.iter().map(|p| box_vec.wrap(*p)).collect();
         // Displacement-gated rebuild: forces never use stale pairs, and
         // quiescent systems skip the rebuild entirely.
-        if self.pairs.box_changed(&box_vec) || self.pairs.needs_rebuild(&wrapped) {
+        if self.pairs.box_changed(box_vec) || self.pairs.needs_rebuild(&wrapped) {
             self.pairs = PbcNeighborList::build(
                 &wrapped,
-                &box_vec,
+                box_vec,
                 cutoff_angstrom(&self.state.protocol),
                 SKIN_ANGSTROM,
             )
@@ -1607,20 +2210,16 @@ impl<'a> ExplicitSimulation<'a> {
         step: usize,
     ) -> Result<()> {
         self.validate_external_state(&coordinates, &velocities, step)?;
-        self.refresh_pairs_for(&coordinates)?;
         let box_vec = self.box_vectors()?;
-        let energy = self
-            .field
-            .evaluate_with_dispersion_coefficient(
-                &coordinates,
-                &box_vec,
-                &self.pairs.pairs,
-                &self.backend,
-                cutoff_angstrom(&self.state.protocol),
-                self.dispersion_coefficient,
-                self.state.protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        self.refresh_pairs_in(&coordinates, &box_vec)?;
+        let energy = self.electrostatics.reference(
+            &self.field,
+            &coordinates,
+            &box_vec,
+            &self.pairs.pairs,
+            &self.state.protocol,
+            self.dispersion_coefficient,
+        )?;
         self.state.coordinates = coordinates;
         self.state.velocities = velocities;
         self.state.step = step;
@@ -1649,7 +2248,11 @@ impl<'a> ExplicitSimulation<'a> {
             self.force_only = next != end
                 && !next.is_multiple_of(self.state.protocol.save_every)
                 && !self.state.protocol.is_stage_boundary(next)
-                && next != self.state.protocol.total_steps();
+                && next != self.state.protocol.total_steps()
+                && !self
+                    .coupling_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.needs_pressure(next));
             let result = self.step();
             self.force_only = false;
             result?;
@@ -1768,7 +2371,7 @@ pub fn next_barostat_uniform(state: &mut u64) -> f64 {
 fn minimize<F>(
     field: &PbcForceField,
     box_vec: &BoxVectors,
-    backend: &ReactionField,
+    electrostatics: &mut Electrostatics,
     initial: Vec<Vec3>,
     protocol: &SimulationProtocol,
     dispersion_coefficient: f64,
@@ -1808,17 +2411,14 @@ where
             pairs = PbcNeighborList::build(&wrapped, box_vec, cutoff, min_skin)
                 .map_err(Error::Energy)?;
         }
-        let energy = field
-            .evaluate_with_dispersion_coefficient(
-                &coords,
-                box_vec,
-                &pairs.pairs,
-                backend,
-                cutoff,
-                dispersion_coefficient,
-                protocol.dispersion_correction,
-            )
-            .map_err(Error::Energy)?;
+        let energy = electrostatics.reference(
+            field,
+            &coords,
+            box_vec,
+            &pairs.pairs,
+            protocol,
+            dispersion_coefficient,
+        )?;
         let submitted = optimizer.submit(
             energy.components.total(),
             energy
@@ -2192,5 +2792,314 @@ mod tests {
         assert_eq!(original, fingerprint(&system, &extended, 0));
         extended.temperature_k += 1.0;
         assert_ne!(original, fingerprint(&system, &extended, 0));
+    }
+
+    fn leapfrog_protocol(steps: usize) -> SimulationProtocol {
+        SimulationProtocol {
+            solvent: SolventModel::Explicit,
+            equilibration_ensemble: Ensemble::Nvt,
+            production_ensemble: Ensemble::Nvt,
+            equilibration_steps: 0,
+            production_steps: steps,
+            save_every: 50,
+            minimization_iterations: 50,
+            timestep_fs: 2.0,
+            constraints: ConstraintModel::Settle,
+            thermostat: Thermostat::NoseHoover,
+            thermostat_groups: ["WAT", "System_&_!WAT"]
+                .into_iter()
+                .map(|name| crate::ThermostatGroup {
+                    name: name.into(),
+                    tau_ps: 0.2,
+                    reference_temperature_k: 300.0,
+                })
+                .collect(),
+            com_mode: Some("linear".into()),
+            com_groups: vec!["WAT".into(), "System_&_!WAT".into()],
+            cutoff_angstrom: Some(4.0),
+            seed: 7,
+            ..Default::default()
+        }
+    }
+
+    fn leapfrog_npt_protocol(steps: usize) -> SimulationProtocol {
+        SimulationProtocol {
+            production_ensemble: Ensemble::Npt,
+            pressure_coupling: PressureCoupling::ParrinelloRahman,
+            pressure_bar: 1.0,
+            pressure_tau_ps: Some(2.0),
+            pressure_compressibility_bar_inverse: vec![4.5e-5],
+            dispersion_correction: true,
+            ..leapfrog_protocol(steps)
+        }
+    }
+
+    #[test]
+    fn coupling_choices_that_do_not_belong_together_are_rejected() {
+        let system = solvated_dipeptide();
+        let mut monte_carlo = leapfrog_npt_protocol(10);
+        monte_carlo.pressure_coupling = PressureCoupling::MonteCarlo;
+        assert!(ExplicitSimulation::new(&system, monte_carlo).is_err());
+        let mut langevin = leapfrog_npt_protocol(10);
+        langevin.thermostat = Thermostat::Langevin;
+        assert!(ExplicitSimulation::new(&system, langevin).is_err());
+        let mut unknown_group = leapfrog_protocol(10);
+        unknown_group.thermostat_groups[1].name = "Protein".into();
+        assert!(ExplicitSimulation::new(&system, unknown_group).is_err());
+    }
+
+    #[test]
+    fn leapfrog_nose_hoover_holds_the_target_temperature() {
+        let system = solvated_dipeptide();
+        // 601 steps: the last one removes center-of-mass motion.
+        let mut sim = ExplicitSimulation::new(&system, leapfrog_protocol(601)).unwrap();
+        assert_eq!(sim.state.velocity_convention, VelocityConvention::LeapfrogHalfStep);
+        let mut temperatures = Vec::new();
+        for _ in 0..601 {
+            sim.step().unwrap();
+            temperatures.push(sim.frame().temperature_k);
+        }
+        let tail = &temperatures[temperatures.len() / 2..];
+        let mean = tail.iter().sum::<f64>() / tail.len() as f64;
+        assert!((mean - 300.).abs() < 30., "mean temperature {mean} K");
+        let coupling = sim.state.coupling.as_ref().unwrap();
+        assert!(coupling.thermostat_velocity.iter().all(|v| v.is_finite() && v.abs() < 50.));
+        assert!(
+            sim.settle
+                .as_ref()
+                .unwrap()
+                .max_violation(&sim.state.coordinates)
+                < 1e-4
+        );
+        // Neither center-of-mass group is left with a net velocity.
+        let plan = sim.coupling_plan.clone().unwrap();
+        for group in &plan.com_groups {
+            let mut momentum = Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+            };
+            let mut mass = 0.;
+            for &atom in group {
+                momentum = add(momentum, scale(sim.state.velocities[atom], sim.masses[atom]));
+                mass += sim.masses[atom];
+            }
+            assert!(norm2(scale(momentum, 1. / mass)).sqrt() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn leapfrog_nose_hoover_conserves_its_extended_energy() {
+        // Production-like 9 A cutoff, as for the NVE drift test above.
+        let system = solvated_dipeptide_padded(9.0);
+        let mut protocol = leapfrog_protocol(200);
+        protocol.cutoff_angstrom = Some(9.0);
+        protocol.temperature_coupling_interval = Some(1);
+        protocol.com_mode = Some("none".into());
+        protocol.com_groups.clear();
+        let mut sim = ExplicitSimulation::new(&system, protocol).unwrap();
+        let plan = sim.coupling_plan.clone().unwrap();
+        // Kinetic energy at a full step: the mean of the two half steps.
+        let mut previous = kinetic_energy(&sim.masses, &sim.state.velocities);
+        let mut series = Vec::new();
+        for _ in 0..200 {
+            let potential = sim.state.potential_energy;
+            let thermostat = plan.thermostat_energy(sim.state.coupling.as_ref().unwrap());
+            sim.step().unwrap();
+            let next = kinetic_energy(&sim.masses, &sim.state.velocities);
+            series.push(potential + 0.5 * (previous + next) + thermostat);
+            previous = next;
+        }
+        let head = series[..20].iter().sum::<f64>() / 20.;
+        let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
+        let drift = ((tail - head) / sim.masses.len() as f64).abs();
+        assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+    }
+
+    #[test]
+    fn leapfrog_parrinello_rahman_moves_the_box_towards_the_target_pressure() {
+        let system = solvated_dipeptide();
+        let initial_volume = protocol_seed_volume(&system);
+        let mut sim = ExplicitSimulation::new(&system, leapfrog_npt_protocol(400)).unwrap();
+        let mut pressures = Vec::new();
+        for _ in 0..400 {
+            sim.step().unwrap();
+            if sim.state.step % 10 == 1 {
+                pressures.push(sim.state.pressure_bar);
+            }
+        }
+        let volume: f64 = sim.state.box_angstrom.iter().product();
+        let density = sim.frame().density_g_ml;
+        assert!(density > 0.85 && density < 1.15, "density {density}");
+        assert!((volume / initial_volume - 1.).abs() > 1e-4, "the box did not move");
+        assert!(pressures.iter().all(|p| p.is_finite()));
+        eprintln!(
+            "volume ratio {:.4}, density {density:.3}, first pressures {:?}, last {:?}",
+            volume / initial_volume,
+            &pressures[..4],
+            &pressures[pressures.len() - 4..]
+        );
+        assert_eq!(sim.state.pressure_estimator, "atomic-virial-with-constraints");
+        // The box keeps its shape under isotropic coupling.
+        let initial = system.box_angstrom();
+        let ratio = sim.state.box_angstrom[0] / initial[0];
+        for d in 1..3 {
+            assert!((sim.state.box_angstrom[d] / initial[d] / ratio - 1.).abs() < 1e-9);
+        }
+        assert!(
+            sim.settle
+                .as_ref()
+                .unwrap()
+                .max_violation(&sim.state.coordinates)
+                < 1e-3
+        );
+    }
+
+    #[test]
+    fn leapfrog_pressure_matches_the_volume_derivative_of_the_energy() {
+        // The virial the barostat uses, checked against a finite difference:
+        // with every atom scaled affinely, dU/dV = -(virial of all forces)/3V.
+        let system = solvated_dipeptide();
+        let mut protocol = leapfrog_npt_protocol(20);
+        protocol.dispersion_correction = false;
+        let sim = ExplicitSimulation::new(&system, protocol).unwrap();
+        let box_vec = sim.box_vectors().unwrap();
+        let energy_at = |factor: f64| {
+            let scaled_box =
+                BoxVectors::new(box_vec.x * factor, box_vec.y * factor, box_vec.z * factor).unwrap();
+            let coordinates: Vec<Vec3> =
+                sim.state.coordinates.iter().map(|p| scale(*p, factor)).collect();
+            let wrapped: Vec<Vec3> = coordinates.iter().map(|p| scaled_box.wrap(*p)).collect();
+            let pairs = PbcNeighborList::build(&wrapped, &scaled_box, 4.0, SKIN_ANGSTROM).unwrap();
+            sim.field
+                .evaluate(
+                    &coordinates,
+                    &scaled_box,
+                    &pairs.pairs,
+                    &sim.electrostatics.reaction_field().unwrap(),
+                    4.0,
+                )
+                .unwrap()
+                .components
+                .total()
+        };
+        let h: f64 = 1e-5;
+        let volume = box_vec.volume();
+        let d_volume = volume * ((1. + h).powi(3) - (1. - h).powi(3));
+        let finite_difference = -(energy_at(1. + h) - energy_at(1. - h)) / d_volume;
+        let from_virial = sim.state.virial_kcal_mol / (3. * volume);
+        assert!(
+            (finite_difference - from_virial).abs() < 2e-3 * from_virial.abs().max(1e-3),
+            "-dU/dV {finite_difference} against virial/3V {from_virial}"
+        );
+    }
+
+    #[test]
+    fn leapfrog_checkpoint_restores_the_coupling_variables() {
+        let system = solvated_dipeptide();
+        let mut sim = ExplicitSimulation::new(&system, leapfrog_npt_protocol(60)).unwrap();
+        // 23 steps: the last one is force-only, so the restored run has to
+        // recover the virial itself.
+        sim.advance(23).unwrap();
+        let json = serde_json::to_string(&sim.state).unwrap();
+        let restored: SimulationState = serde_json::from_str(&json).unwrap();
+        let mut again = ExplicitSimulation::restore(&system, restored).unwrap();
+        assert_eq!(again.state.coupling, sim.state.coupling);
+        assert_eq!(again.state.box_angstrom, sim.state.box_angstrom);
+        sim.advance(17).unwrap();
+        again.advance(17).unwrap();
+        assert_eq!(again.state.step, 40);
+        let worst = sim
+            .state
+            .coordinates
+            .iter()
+            .zip(&again.state.coordinates)
+            .map(|(a, b)| norm2(add(*a, scale(*b, -1.))).sqrt())
+            .fold(0., f64::max);
+        assert!(worst < 1e-3, "restored run departs by {worst} A");
+        let (a, b) = (
+            sim.state.coupling.as_ref().unwrap(),
+            again.state.coupling.as_ref().unwrap(),
+        );
+        assert!((a.box_velocity[0] - b.box_velocity[0]).abs() < 1e-6);
+        assert!((a.pressure_bar - b.pressure_bar).abs() < 1.0);
+    }
+
+    #[test]
+    fn pme_leapfrog_conserves_its_extended_energy_and_restarts() {
+        let system = solvated_dipeptide_padded(9.0);
+        let mut protocol = leapfrog_protocol(120);
+        protocol.cutoff_angstrom = Some(9.0);
+        protocol.electrostatics = ElectrostaticsModel::Pme;
+        protocol.temperature_coupling_interval = Some(1);
+        protocol.com_mode = Some("none".into());
+        protocol.com_groups.clear();
+        let parameters = pme_parameters(&system, &protocol).unwrap();
+        // GROMACS defaults: erfc(alpha rc) = 1e-5 and a grid no coarser than 1.2 A
+        assert!((parameters.alpha_per_angstrom - 0.3468).abs() < 2e-3);
+        assert_eq!(parameters.interpolation_order, 4);
+        for (points, length) in parameters.grid.iter().zip(system.box_angstrom()) {
+            assert!(length / *points as f64 <= 1.2 + 1e-9);
+        }
+        let mut sim = ExplicitSimulation::new(&system, protocol).unwrap();
+        let plan = sim.coupling_plan.clone().unwrap();
+        let mut previous = kinetic_energy(&sim.masses, &sim.state.velocities);
+        let mut series = Vec::new();
+        for step in 0..120 {
+            if step == 60 {
+                let json = serde_json::to_string(&sim.state).unwrap();
+                let restored: SimulationState = serde_json::from_str(&json).unwrap();
+                let again = ExplicitSimulation::restore(&system, restored).unwrap();
+                assert!((again.state.potential_energy - sim.state.potential_energy).abs() < 1e-6);
+            }
+            let potential = sim.state.potential_energy;
+            let thermostat = plan.thermostat_energy(sim.state.coupling.as_ref().unwrap());
+            sim.step().unwrap();
+            let next = kinetic_energy(&sim.masses, &sim.state.velocities);
+            series.push(potential + 0.5 * (previous + next) + thermostat);
+            previous = next;
+        }
+        let head = series[..20].iter().sum::<f64>() / 20.;
+        let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
+        let drift = ((tail - head) / sim.masses.len() as f64).abs();
+        assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+    }
+
+    #[test]
+    fn force_based_pressure_takes_the_virial_of_the_dispersion_tail() {
+        // One Lennard-Jones class with N atoms: the tail energy per volume is
+        // (8/3) pi N^2 eps sigma^3 [ (1/3)(sigma/rc)^9 - (sigma/rc)^3 ] / V and
+        // the tail pressure (16/3) pi N^2 eps sigma^3 [ (2/3)(sigma/rc)^9 -
+        // (sigma/rc)^3 ] / V^2 (Allen and Tildesley), with N^2 counted as the
+        // N (N + 1) / 2 pairs of the energy correction.
+        let system = solvated_dipeptide();
+        let field = PbcForceField::new(&system, Vec::new()).unwrap();
+        let cutoff = 9.0;
+        let energy = field.dispersion_coefficient(cutoff).unwrap();
+        let pressure = field.dispersion_pressure_coefficient(cutoff).unwrap();
+        // dominated by the attractive term, for which the factor is two
+        assert!(energy < 0. && pressure < 0.);
+        let ratio = pressure / energy;
+        assert!(ratio > 1.99 && ratio < 2.0, "tail pressure / tail energy = {ratio}");
+        // and exactly 4 E12 + 2 E6 with E12 + E6 the energy coefficient at
+        // two cutoffs, which separates the two powers of the cutoff
+        let (e1, e2) = (energy, field.dispersion_coefficient(2. * cutoff).unwrap());
+        // E12 scales as rc^-9 and E6 as rc^-3
+        let e12 = (e2 - e1 / 8.) / (1. / 512. - 1. / 8.);
+        let e6 = e1 - e12;
+        assert!((pressure - (4. * e12 + 2. * e6)).abs() < 1e-9 * pressure.abs());
+    }
+
+    #[test]
+    fn pme_with_the_monte_carlo_barostat_is_refused() {
+        let system = solvated_dipeptide();
+        let mut protocol = nve_protocol();
+        protocol.equilibration_ensemble = Ensemble::Npt;
+        protocol.production_ensemble = Ensemble::Npt;
+        protocol.timestep_fs = 2.0;
+        protocol.constraints = ConstraintModel::Settle;
+        protocol.friction_per_ps = 1.0;
+        protocol.electrostatics = ElectrostaticsModel::Pme;
+        assert!(ExplicitSimulation::new(&system, protocol).is_err());
     }
 }

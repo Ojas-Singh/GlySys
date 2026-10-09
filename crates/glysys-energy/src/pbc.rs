@@ -8,9 +8,9 @@
 //! pressure exact across box crossings and feeds reporting and the Monte
 //! Carlo barostat directly.
 //!
-//! Reaction field is the first electrostatics backend. PME arrives later
-//! behind the same [`ElectrostaticsBackend`] trait, reusing these pair lists,
-//! exclusions, and 1-4 scales without touching integration or analysis.
+//! Reaction field and particle-mesh Ewald share the [`ElectrostaticsBackend`]
+//! trait for the pair part, with the same pair lists, exclusions, and 1-4
+//! scales; the PME long-range part lives in [`crate::pme`].
 use crate::{EnergyComponents, EnergyError, HarmonicRestraint, Result};
 use glysys::{ParameterizedSystem, Vec3};
 use serde::{Deserialize, Serialize};
@@ -153,9 +153,12 @@ impl ElectrostaticsBackend for ReactionField {
     }
 }
 
-/// Reserved PME insertion point. Constructing an evaluation with this backend
-/// fails with a clear error until the mesh implementation lands; pair lists,
-/// exclusions, 1-4 scales, and virial plumbing are shared with reaction field.
+/// Direct-space part of particle-mesh Ewald: `E = qq erfc(alpha r)/r` inside
+/// the cutoff. Pair lists, exclusions, 1-4 scales, and virial plumbing are
+/// shared with reaction field; the long-range remainder (reciprocal sum, self
+/// energy, excluded-pair correction) comes from [`crate::pme::PmeEngine`]
+/// with the same `alpha`, and [`PbcForceField::evaluate_pme`] adds the two.
+/// The grid and interpolation order only matter to the mesh part.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PmeBackend {
     pub alpha_per_angstrom: f64,
@@ -168,8 +171,14 @@ impl ElectrostaticsBackend for PmeBackend {
         "pme"
     }
 
-    fn pair(&self, _r: f64, _qq: f64) -> (f64, f64) {
-        unimplemented!("PME direct/reciprocal kernels are a later milestone")
+    fn pair(&self, r: f64, qq: f64) -> (f64, f64) {
+        let alpha = self.alpha_per_angstrom;
+        let screened = crate::pme::erfc(alpha * r);
+        // d/dr erfc(alpha r) = -(2 alpha/sqrt(pi)) exp(-alpha^2 r^2).
+        let gauss = 2. * alpha / std::f64::consts::PI.sqrt() * (-(alpha * r).powi(2)).exp();
+        let energy = qq * screened / r;
+        let derivative = -qq * (screened / (r * r) + gauss / r);
+        (energy, derivative)
     }
 }
 
@@ -562,6 +571,28 @@ impl<'a> PbcForceField<'a> {
     /// correction: all particle pairs use Lorentz-Berthelot mixing and no
     /// atom-pair matrix is materialized.
     pub fn dispersion_coefficient(&self, cutoff: f64) -> Result<f64> {
+        let [repulsion, dispersion] = self.dispersion_terms(cutoff)?;
+        Ok(repulsion + dispersion)
+    }
+
+    /// Coefficient of the pressure the truncated Lennard-Jones tail adds to
+    /// a pressure computed from forces, in kcal mol^-1 Å^3: the correction
+    /// is `coefficient / volume^2`.
+    ///
+    /// This is the virial of the tail, `-(2 pi / 3) rho^2 * integral of
+    /// r^3 u'(r)`, which is twice the tail energy over the volume for the
+    /// r^-6 term and four times for the r^-12 term. It is not the volume
+    /// derivative of the tail energy: forces do not see the step of the
+    /// truncated potential at the cutoff, and the tail virial accounts for
+    /// it. A barostat that compares energies (Monte Carlo) sees that step
+    /// itself and needs only the energy correction.
+    pub fn dispersion_pressure_coefficient(&self, cutoff: f64) -> Result<f64> {
+        let [repulsion, dispersion] = self.dispersion_terms(cutoff)?;
+        Ok(4. * repulsion + 2. * dispersion)
+    }
+
+    /// The r^-12 and r^-6 parts of [`Self::dispersion_coefficient`].
+    fn dispersion_terms(&self, cutoff: f64) -> Result<[f64; 2]> {
         if !cutoff.is_finite() || cutoff <= 0. {
             return Err(EnergyError::InvalidConfiguration(
                 "dispersion correction needs a positive cutoff".into(),
@@ -607,17 +638,16 @@ impl<'a> PbcForceField<'a> {
         }
         let n = self.sigma.len() as f64;
         if n == 0. {
-            return Ok(0.);
+            return Ok([0.; 2]);
         }
         // OpenMM normalizes the class sums by the number of unordered
         // particle pairs, then multiplies by 8πN².
         let pair_norm = n * (n + 1.0) * 0.5;
-        Ok(8.0
-            * std::f64::consts::PI
-            * n
-            * n
-            * (sum12 / pair_norm / (9.0 * cutoff.powi(9))
-                - sum6 / pair_norm / (3.0 * cutoff.powi(3))))
+        let scale = 8.0 * std::f64::consts::PI * n * n;
+        Ok([
+            scale * sum12 / pair_norm / (9.0 * cutoff.powi(9)),
+            -scale * sum6 / pair_norm / (3.0 * cutoff.powi(3)),
+        ])
     }
 
     /// Evaluate the cutoff Hamiltonian and optionally add the homogeneous
@@ -826,6 +856,93 @@ impl<'a> PbcForceField<'a> {
             virial_terms,
             virial_pair_split: pairs.virial_pair_split,
         })
+    }
+
+    /// PME counterpart of [`Self::evaluate_with_cluster`] for dynamics: the
+    /// cluster engine in PME mode supplies Lennard-Jones, the `erfc`
+    /// direct-space sum and the 1-4 exceptions in single precision, `pme`
+    /// the long-range part in f64. Both must have been built for this
+    /// system with the same Ewald coefficient. The long-range energy is
+    /// added to `components.electrostatics` and its virial to the pair
+    /// entries; without `observables` only the gradients are exact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_cluster_pme(
+        &self,
+        engine: &mut crate::pbc_cluster::ClusterPairEngine,
+        pme: &mut crate::pme::PmeEngine,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        dispersion_coefficient: f64,
+        include_dispersion: bool,
+        observables: bool,
+    ) -> Result<PbcEnergy> {
+        if engine.ewald_alpha() != Some(pme.parameters().alpha_per_angstrom) {
+            return Err(EnergyError::InvalidConfiguration(
+                "cluster engine and PME engine need the same Ewald coefficient".into(),
+            ));
+        }
+        // The two parts only share the coordinates, so they run side by
+        // side: the long-range part is a handful of short parallel loops
+        // that would otherwise leave most workers idle. Each part reduces in
+        // its own fixed order and the sum below is ordered too.
+        let mut long_range_gradients = vec![
+            Vec3 {
+                x: 0.,
+                y: 0.,
+                z: 0.
+            };
+            unwrapped.len()
+        ];
+        let (short_range, long_range) = rayon::join(
+            || {
+                self.evaluate_with_cluster(
+                    engine,
+                    unwrapped,
+                    box_vec,
+                    dispersion_coefficient,
+                    include_dispersion,
+                    observables,
+                )
+            },
+            || pme.evaluate_into(unwrapped, box_vec, &mut long_range_gradients, observables),
+        );
+        let mut result = short_range?;
+        let long_range = long_range?;
+        for (total, extra) in result.gradients.iter_mut().zip(&long_range_gradients) {
+            total.x += extra.x;
+            total.y += extra.y;
+            total.z += extra.z;
+        }
+        result.components.electrostatics += long_range.energy;
+        result.virial_terms[3] += long_range.virial;
+        result.virial_pair_split[1] += long_range.virial;
+        result.virial = result.virial_terms.iter().sum();
+        Ok(result)
+    }
+
+    /// The complete PME Hamiltonian on the f64 reference path: bonded terms,
+    /// Lennard-Jones and the `erfc` direct-space sum inside `cutoff` from
+    /// [`Self::evaluate`], plus the long-range part from `pme`, which must
+    /// have been built for this system. The long-range energy is added to
+    /// `components.electrostatics` and its virial to the pair entries. As
+    /// with reaction field, a 1-4 pair is only evaluated inside the cutoff,
+    /// which must therefore exceed every 1-4 distance.
+    pub fn evaluate_pme(
+        &self,
+        pme: &mut crate::pme::PmeEngine,
+        unwrapped: &[Vec3],
+        box_vec: &BoxVectors,
+        pairs: &[(usize, usize)],
+        cutoff: f64,
+    ) -> Result<PbcEnergy> {
+        let backend = pme.parameters().backend();
+        let mut result = self.evaluate(unwrapped, box_vec, pairs, &backend, cutoff)?;
+        let long_range = pme.evaluate_into(unwrapped, box_vec, &mut result.gradients, true)?;
+        result.components.electrostatics += long_range.energy;
+        result.virial_terms[3] += long_range.virial;
+        result.virial_pair_split[1] += long_range.virial;
+        result.virial = result.virial_terms.iter().sum();
+        Ok(result)
     }
 
     pub fn evaluate(

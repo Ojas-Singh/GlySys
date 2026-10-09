@@ -1,0 +1,441 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-08",
+  "subject": "particle-mesh Ewald in glysys-energy (pme.rs, PME mode of the cluster-pair engine)",
+  "system": {
+    "name": "1ogg_4ogt_5ogt glycan in TIP3P water with 0.2 M NaCl",
+    "atoms": 7714,
+    "boxAngstrom": [
+      41.918,
+      50.479,
+      39.631
+    ],
+    "configurations": {
+      "prepared": "system.snapshot.json as built: not minimized, Lennard-Jones clashes (3.39e6 kcal/mol) dominate the total energy and force",
+      "relaxed": "the same after OpenMM LocalEnergyMinimizer (openmm_pme.py --minimize)"
+    }
+  },
+  "commands": [
+    "cargo run --release -p glysys-energy --example pme_snapshot -- system.snapshot.json --order 5 --out glysys.json",
+    "python benchmarks/openmm_pme.py glysys.json --prmtop system.prmtop",
+    "python benchmarks/openmm_pme.py glysys.json --prmtop system.prmtop --minimize relaxed.json",
+    "cargo run --release -p glysys-energy --example pme_snapshot -- system.snapshot.json --coordinates relaxed.json ...",
+    "python benchmarks/openmm_pme.py production.json --reference converged.json",
+    "RAYON_NUM_THREADS=N cargo run --release -p glysys-energy --example pme_snapshot -- system.snapshot.json --coordinates relaxed.json --timing 300"
+  ],
+  "openmmParity": {
+    "engine": "OpenMM 8.6.1, Reference platform (double precision), B-spline order 5",
+    "units": "kcal/mol and kcal/mol/angstrom; the Ewald part is regular-pair direct space + reciprocal + self + exclusion corrections",
+    "prepared": {
+      "pme": {
+        "alphaPerNm": 3.4704591937120832,
+        "grid": [
+          35,
+          45,
+          35
+        ],
+        "order": 5
+      },
+      "cutoffAngstrom": 9.0,
+      "totalEnergyKcalMol": {
+        "glysys": 3369337.0497309477,
+        "openmm": 3369337.0506858076,
+        "difference": -0.0009548598900437355
+      },
+      "ewaldEnergyKcalMol": {
+        "glysys": -24753.573157984243,
+        "openmm": -24753.57315801317,
+        "difference": 2.892556949518621e-08
+      },
+      "lennardJonesKcalMol": {
+        "glysys": 3392035.9816605207,
+        "openmm": 3392035.9826174844,
+        "difference": -0.0009569637477397919
+      },
+      "energyDifferencePerAtom": -1.237827184396857e-07,
+      "ewaldEnergyDifferencePerAtom": 3.749749740107105e-12,
+      "forcesTotal": {
+        "rmsDifference": 5.3674942136988096e-05,
+        "rmsReference": 192457.91610266065,
+        "rmsRatio": 2.788918389221095e-10,
+        "maxAbsDifference": 0.002576146274805069
+      },
+      "forcesEwald": {
+        "rmsDifference": 2.164416673013723e-10,
+        "rmsReference": 15.847113007101688,
+        "rmsRatio": 1.3658113449710155e-11,
+        "maxAbsDifference": 1.6763806343078613e-08
+      },
+      "failures": []
+    },
+    "relaxed": {
+      "pme": {
+        "alphaPerNm": 3.4704591937120832,
+        "grid": [
+          35,
+          45,
+          35
+        ],
+        "order": 5
+      },
+      "cutoffAngstrom": 9.0,
+      "totalEnergyKcalMol": {
+        "glysys": -31471.401215024685,
+        "openmm": -31471.401284597505,
+        "difference": 6.957281948416494e-05
+      },
+      "ewaldEnergyKcalMol": {
+        "glysys": -41088.92065108178,
+        "openmm": -41088.920651119835,
+        "difference": 3.805325832217932e-08
+      },
+      "lennardJonesKcalMol": {
+        "glysys": 6119.515351012594,
+        "openmm": 6119.515362019546,
+        "difference": -1.100695226341486e-05
+      },
+      "energyDifferencePerAtom": 9.019032860275465e-09,
+      "ewaldEnergyDifferencePerAtom": 4.9330124866709e-12,
+      "forcesTotal": {
+        "rmsDifference": 5.939287552431376e-07,
+        "rmsReference": 0.12844820224472667,
+        "rmsRatio": 4.6238775231088986e-06,
+        "maxAbsDifference": 1.3446949917832185e-06
+      },
+      "forcesEwald": {
+        "rmsDifference": 9.812538292912104e-12,
+        "rmsReference": 16.965511213872265,
+        "rmsRatio": 5.783815276305168e-13,
+        "maxAbsDifference": 3.05178105008963e-11
+      },
+      "failures": []
+    },
+    "relaxedEvenGrid": {
+      "pme": {
+        "alphaPerNm": 2.9210000000000003,
+        "grid": [
+          36,
+          48,
+          40
+        ],
+        "order": 5
+      },
+      "cutoffAngstrom": 9.0,
+      "totalEnergyKcalMol": {
+        "glysys": -31471.18978885949,
+        "openmm": -31471.189858411955,
+        "difference": 6.955246499273926e-05
+      },
+      "ewaldEnergyKcalMol": {
+        "glysys": -41088.70922491659,
+        "openmm": -41088.70922493428,
+        "difference": 1.7695128917694092e-08
+      },
+      "lennardJonesKcalMol": {
+        "glysys": 6119.515351012594,
+        "openmm": 6119.515362019546,
+        "difference": -1.100695226341486e-05
+      },
+      "energyDifferencePerAtom": 9.01639421736314e-09,
+      "ewaldEnergyDifferencePerAtom": 2.2938979670331983e-12,
+      "forcesTotal": {
+        "rmsDifference": 5.939287547324836e-07,
+        "rmsReference": 0.12872242241153958,
+        "rmsRatio": 4.6140271726213225e-06,
+        "maxAbsDifference": 1.344694934257186e-06
+      },
+      "forcesEwald": {
+        "rmsDifference": 9.811914914832962e-12,
+        "rmsReference": 16.96566434847623,
+        "rmsRatio": 5.783395635617546e-13,
+        "maxAbsDifference": 3.0460967082035495e-11
+      },
+      "failures": []
+    }
+  },
+  "accuracyOfSettings": {
+    "configuration": "relaxed",
+    "reference": {
+      "cutoffAngstrom": 16.0,
+      "alphaPerAngstrom": 0.34,
+      "grid": [
+        168,
+        210,
+        160
+      ],
+      "interpolationOrder": 6
+    },
+    "secondReference": {
+      "run": {
+        "cutoffAngstrom": 14.0,
+        "alphaPerAngstrom": 0.45,
+        "grid": [
+          200,
+          240,
+          192
+        ],
+        "interpolationOrder": 6
+      },
+      "ewaldEnergyDifferenceKcalMol": -4.456083115655929e-05,
+      "ewaldEnergyDifferencePerAtom": -5.776617987627597e-09,
+      "forcesEwald": {
+        "rmsDifference": 1.852973944504678e-07,
+        "rmsReference": 16.96559250267124,
+        "rmsRatio": 1.092195244117131e-08,
+        "maxAbsDifference": 2.728762337866897e-06
+      }
+    },
+    "gromacsDefaults": {
+      "run": {
+        "cutoffAngstrom": 9.0,
+        "alphaPerAngstrom": 0.3470459193712083,
+        "grid": [
+          35,
+          45,
+          35
+        ],
+        "interpolationOrder": 4
+      },
+      "ewaldEnergyDifferenceKcalMol": -0.9840655866719317,
+      "ewaldEnergyDifferencePerAtom": -0.00012756878230126155,
+      "forcesEwald": {
+        "rmsDifference": 0.008972911301796385,
+        "rmsReference": 16.96559250267124,
+        "rmsRatio": 0.0005288887670963214,
+        "maxAbsDifference": 0.06793357092999663
+      }
+    },
+    "gromacsDefaultsGromacsGrid": {
+      "run": {
+        "cutoffAngstrom": 9.0,
+        "alphaPerAngstrom": 0.3470459193712083,
+        "grid": [
+          36,
+          44,
+          36
+        ],
+        "interpolationOrder": 4
+      },
+      "ewaldEnergyDifferenceKcalMol": -0.9379144252452534,
+      "ewaldEnergyDifferencePerAtom": -0.00012158600275411634,
+      "forcesEwald": {
+        "rmsDifference": 0.008673250845413425,
+        "rmsReference": 16.96559250267124,
+        "rmsRatio": 0.0005112259323715231,
+        "maxAbsDifference": 0.06650413959130841
+      }
+    },
+    "order5": {
+      "run": {
+        "cutoffAngstrom": 9.0,
+        "alphaPerAngstrom": 0.3470459193712083,
+        "grid": [
+          35,
+          45,
+          35
+        ],
+        "interpolationOrder": 5
+      },
+      "ewaldEnergyDifferenceKcalMol": 0.5936598834814504,
+      "ewaldEnergyDifferencePerAtom": 7.695876114615639e-05,
+      "forcesEwald": {
+        "rmsDifference": 0.0023531025305103506,
+        "rmsReference": 16.96559250267124,
+        "rmsRatio": 0.00013869851761085585,
+        "maxAbsDifference": 0.013506066564580976
+      }
+    },
+    "order6": {
+      "run": {
+        "cutoffAngstrom": 9.0,
+        "alphaPerAngstrom": 0.3470459193712083,
+        "grid": [
+          35,
+          45,
+          35
+        ],
+        "interpolationOrder": 6
+      },
+      "ewaldEnergyDifferenceKcalMol": -0.13402571793994866,
+      "ewaldEnergyDifferencePerAtom": -1.7374347671758967e-05,
+      "forcesEwald": {
+        "rmsDifference": 0.0008795598747698736,
+        "rmsReference": 16.96559250267124,
+        "rmsRatio": 5.184374637262958e-05,
+        "maxAbsDifference": 0.005446652183367817
+      }
+    }
+  },
+  "bruteForceEwald": {
+    "source": "unit test pme::tests::matches_brute_force_ewald_on_random_systems: 30 random charges (neutral) in an 11.0 x 12.5 x 10.2 A box, alpha 0.92 1/A, cutoff 5 A, against explicit image and reciprocal sums at alpha 0.55 1/A; energy -490.777 kcal/mol, force RMS 32.4 kcal/mol/A",
+    "rows": [
+      {
+        "order": 4,
+        "grid": [
+          64,
+          72,
+          60
+        ],
+        "energyErrorKcalMol": -0.0222,
+        "forceRmsError": 0.00841
+      },
+      {
+        "order": 5,
+        "grid": [
+          64,
+          72,
+          60
+        ],
+        "energyErrorKcalMol": 0.0005,
+        "forceRmsError": 0.000213
+      },
+      {
+        "order": 6,
+        "grid": [
+          64,
+          72,
+          60
+        ],
+        "energyErrorKcalMol": -0.000103,
+        "forceRmsError": 4.27e-05
+      },
+      {
+        "order": 6,
+        "grid": [
+          108,
+          120,
+          100
+        ],
+        "energyErrorKcalMol": -4.53e-06,
+        "forceRmsError": 3.09e-06
+      }
+    ],
+    "waterBox": "425 atoms (dipeptide + 135 waters, 497 excluded pairs), order 6 on 96x90x80, alpha 0.66 1/A, cutoff 7 A: energy error -1.65e-4 of -1266.010 kcal/mol, force RMS error 5.0e-6 of 11.99 kcal/mol/A"
+  },
+  "clusterKernel": {
+    "ewaldPairErrorRelativeToCoulomb": {
+      "force": 4.997392728204603e-07,
+      "energy": 2.326131782924152e-07
+    },
+    "clusterPathVersusF64Path": {
+      "electrostaticsDifference": 0.0029600787675008178,
+      "energyDifference": 0.009012820071802707,
+      "ewaldForceRms": 16.965679058268243,
+      "forceRms": 0.12885866287503295,
+      "forceRmsDifference": 5.22107709971167e-05,
+      "virialDifference": 0.08732113224687055
+    }
+  },
+  "timings": {
+    "machine": "NVIDIA DGX Spark (aarch64), threads pinned to Cortex-X925 cores; portable (NEON) kernel path, the AVX2 path cannot run here",
+    "configuration": "relaxed, cutoff 9 A, skin 1.5 A, PME order 4 on 35x45x35, 300 calls each; median and minimum ms per call",
+    "note": "the machine is shared and another job ran at times; this run had the minimum close to the median. pmeForceStepMs is evaluate_with_cluster_pme without observables (bonded terms, pair kernel and long range side by side)",
+    "rows": [
+      {
+        "threads": 1,
+        "clusterReactionFieldForcesMs": {
+          "median": 9.013182,
+          "min": 9.007151
+        },
+        "clusterReactionFieldObservablesMs": {
+          "median": 12.145577,
+          "min": 12.133849
+        },
+        "clusterPmeForcesMs": {
+          "median": 11.109221000000002,
+          "min": 11.100261
+        },
+        "clusterPmeObservablesMs": {
+          "median": 12.123144,
+          "min": 12.112392
+        },
+        "clusterPmeForcesWithListRebuildMs": {
+          "median": 23.014043,
+          "min": 22.978282
+        },
+        "pmeLongRangeForcesMs": {
+          "median": 1.3526129999999998,
+          "min": 1.344036
+        },
+        "pmeLongRangeObservablesMs": {
+          "median": 1.364357,
+          "min": 1.3588369999999999
+        },
+        "pmeForceStepMs": {
+          "median": 12.61068,
+          "min": 12.596471999999999
+        }
+      },
+      {
+        "threads": 4,
+        "clusterReactionFieldForcesMs": {
+          "median": 2.413416,
+          "min": 2.3931270000000002
+        },
+        "clusterReactionFieldObservablesMs": {
+          "median": 3.192698,
+          "min": 3.173994
+        },
+        "clusterPmeForcesMs": {
+          "median": 2.938041,
+          "min": 2.914921
+        },
+        "clusterPmeObservablesMs": {
+          "median": 3.19001,
+          "min": 3.166057
+        },
+        "clusterPmeForcesWithListRebuildMs": {
+          "median": 6.6213169999999995,
+          "min": 6.120723
+        },
+        "pmeLongRangeForcesMs": {
+          "median": 0.49507399999999996,
+          "min": 0.468081
+        },
+        "pmeLongRangeObservablesMs": {
+          "median": 0.49573,
+          "min": 0.47158500000000003
+        },
+        "pmeForceStepMs": {
+          "median": 3.483707,
+          "min": 3.361339
+        }
+      },
+      {
+        "threads": 8,
+        "clusterReactionFieldForcesMs": {
+          "median": 1.5871089999999999,
+          "min": 1.522581
+        },
+        "clusterReactionFieldObservablesMs": {
+          "median": 1.969814,
+          "min": 1.913366
+        },
+        "clusterPmeForcesMs": {
+          "median": 1.865829,
+          "min": 1.806918
+        },
+        "clusterPmeObservablesMs": {
+          "median": 1.9877660000000001,
+          "min": 1.9280059999999999
+        },
+        "clusterPmeForcesWithListRebuildMs": {
+          "median": 4.533838,
+          "min": 4.256621
+        },
+        "pmeLongRangeForcesMs": {
+          "median": 0.520225,
+          "min": 0.47592100000000004
+        },
+        "pmeLongRangeObservablesMs": {
+          "median": 0.517202,
+          "min": 0.466898
+        },
+        "pmeForceStepMs": {
+          "median": 2.378055,
+          "min": 2.1466950000000002
+        }
+      }
+    ]
+  }
+}

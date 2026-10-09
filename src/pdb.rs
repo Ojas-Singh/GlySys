@@ -513,11 +513,50 @@ fn protonation_from_hydrogens(residue: &RawResidue) -> Option<&'static str> {
     }
 }
 
+/// ATOM residues of `selected_model` that carry a GLYCAM code for a sugar
+/// linked at several positions (`UYB`, `VMA`, ...; the prefix is one of
+/// `ZYXWVUTSRQP`) and hold a pyranose or furanose ring. The ring atoms make
+/// the reading safe: an amino acid or a ligand whose name merely looks like
+/// such a code has no C1 to C4 with a ring oxygen under those names.
+fn glycam_branch_residues(contents: &str, selected_model: u32) -> HashSet<String> {
+    let has_models = contents.lines().any(|line| line.starts_with("MODEL "));
+    let mut current_model = if has_models { 0 } else { 1 };
+    let mut atoms: HashMap<String, HashSet<&str>> = HashMap::new();
+    for line in contents.lines() {
+        if line.starts_with("MODEL ") {
+            current_model = field(line, 10, 14).trim().parse().unwrap_or(0);
+        } else if line.starts_with("ENDMDL") {
+            current_model = 0;
+        } else if line.starts_with("ATOM  ") && current_model == selected_model {
+            let name = field(line, 17, 20).trim();
+            let bytes = name.as_bytes();
+            if bytes.len() == 3
+                && b"ZYXWVUTSRQP".contains(&bytes[0])
+                && !PROTEIN_RESIDUES.contains(&name)
+            {
+                atoms
+                    .entry(field(line, 17, 27).to_owned())
+                    .or_default()
+                    .insert(field(line, 12, 16).trim());
+            }
+        }
+    }
+    atoms
+        .into_iter()
+        .filter(|(_, names)| {
+            ["C1", "C2", "C3", "C4"].iter().all(|atom| names.contains(atom))
+                && (names.contains("O5") || names.contains("O4"))
+        })
+        .map(|(residue, _)| residue)
+        .collect()
+}
+
 fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
     let has_models = contents.lines().any(|line| line.starts_with("MODEL "));
     let mut current_model = if has_models { 0 } else { 1 };
     let mut coordinate_records = Vec::new();
     let mut connectivity_records = Vec::new();
+    let branch_residues = glycam_branch_residues(contents, selected_model);
 
     for line in contents.lines() {
         if line.starts_with("MODEL ") {
@@ -547,6 +586,13 @@ fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
             // characters cannot collide with a standard amino-acid name.
             // Preserving them as HETATM lets crabWURCS retain one connected
             // GAG chain rather than splitting it at every sulfated residue.
+            //
+            // The third case is a sugar linked at several positions, whose
+            // code starts with a letter (`UYB` is GlcNAc linked at O4 and
+            // O6). GLYCAM-Web writes these as ATOM too; left as they are,
+            // every branch point is read as a foreign residue and a free
+            // N-glycan is reported as fragments "attached" to it. See
+            // [`glycam_branch_residues`] for why reading them is safe.
             let mut record = format!("{line:<80}");
             if record.starts_with("ATOM  ") {
                 let residue_name = record.get(17..20).unwrap_or_default().trim();
@@ -555,7 +601,10 @@ fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
                 let sulfated_glucosamine = bytes.len() == 3
                     && matches!(bytes[1], b'Y' | b'y')
                     && matches!(bytes[2], b'N' | b'n' | b'S' | b's');
-                if numeric_glycam || sulfated_glucosamine {
+                if numeric_glycam
+                    || sulfated_glucosamine
+                    || branch_residues.contains(field(&record, 17, 27))
+                {
                     record.replace_range(0..6, "HETATM");
                 }
             }

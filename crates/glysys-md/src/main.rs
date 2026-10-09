@@ -14,6 +14,9 @@ use glysys_runtime::{
 
 mod bundle;
 mod gromacs;
+mod trajectory;
+
+use trajectory::{TrajectoryAtoms, TrajectoryFormat, TrajectoryWriter};
 
 const NATIVE_GPU_EXPLICIT_BATCH_STEPS: usize = 2500;
 const NATIVE_GPU_IMPLICIT_BATCH_STEPS: usize = 2500;
@@ -150,12 +153,12 @@ struct CommonArgs {
     /// for a solvated snapshot and an implicit protocol for a dry snapshot.
     #[arg(long)]
     protocol: Option<PathBuf>,
-    /// Resolve a supported GROMACS .mdp file into the versioned GlySys
-    /// protocol contract. This records PME/Nose-Hoover/Parrinello-Rahman as
-    /// requested choices; the run stops explicitly until those kernels pass
-    /// their validation gates.
+    /// Take the protocol from GROMACS .mdp files of the GOTW recipe. Give
+    /// the option once per file, in the order the files run: an optional
+    /// energy minimisation first, then one stage per dynamics file (for
+    /// example NVT equilibration, NPT equilibration, production).
     #[arg(long, conflicts_with = "protocol")]
-    gromacs_mdp: Option<PathBuf>,
+    gromacs_mdp: Vec<PathBuf>,
     /// Execution backend. Auto prefers a compatible native resident GPU and
     /// falls back to CPU with the reason recorded in run.json.
     #[arg(long, value_enum, default_value_t = Backend::Auto)]
@@ -215,6 +218,26 @@ struct RunArgs {
     /// without generating additional coordinate frames.
     #[arg(long)]
     observables_every: Option<usize>,
+    #[command(flatten)]
+    trajectory: TrajectoryArgs,
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+struct TrajectoryArgs {
+    /// Trajectory format: `jsonl` holds every coordinate as text (short
+    /// validation runs); `dcd` is binary and comes with `trajectory.pdb` and
+    /// `frames.jsonl` (energies, temperature, pressure and box per frame).
+    #[arg(long = "trajectory", value_enum, default_value_t = TrajectoryFormat::Jsonl)]
+    format: TrajectoryFormat,
+    /// Atoms written to the trajectory. `solute` leaves out the water and
+    /// ions and also writes the dry solute's Amber and GROMACS files to
+    /// `solute/`.
+    #[arg(long = "trajectory-atoms", value_enum, default_value_t = TrajectoryAtoms::All)]
+    atoms: TrajectoryAtoms,
+    /// Simulated time between restart checkpoints, in ps. A checkpoint is a
+    /// few megabytes; long production runs can space them further apart.
+    #[arg(long, default_value_t = 5.0)]
+    checkpoint_ps: f64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -227,6 +250,9 @@ struct ResumeArgs {
     /// Write scalar observables to observables.jsonl at this step interval.
     #[arg(long)]
     observables_every: Option<usize>,
+    /// The same trajectory options as the run being resumed.
+    #[command(flatten)]
+    trajectory: TrajectoryArgs,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -284,7 +310,6 @@ fn resolve_mdp(args: ResolveMdpArgs) -> Result<()> {
     let audit = serde_json::json!({
         "resolved": resolved,
         "protocol": protocol,
-        "runtimeStatus": "requested model is retained; PME/Nose-Hoover/Parrinello-Rahman drivers remain capability-gated",
     });
     let bytes = serde_json::to_vec_pretty(&audit)?;
     if let Some(path) = args.protocol_out {
@@ -374,25 +399,59 @@ fn default_protocol(system: &ParameterizedSystem) -> SimulationProtocol {
     }
 }
 
+/// The files of a GROMACS recipe, resolved.
+struct Recipe {
+    minimization: Option<gromacs::Minimization>,
+    stages: Vec<gromacs::ResolvedMdp>,
+}
+
+impl Recipe {
+    fn read(files: &[PathBuf]) -> Result<Self> {
+        let mut minimization = None;
+        let mut stages = Vec::new();
+        for (index, path) in files.iter().enumerate() {
+            if path.extension().and_then(|s| s.to_str()) != Some("mdp") {
+                bail!("--gromacs-mdp must point to a .mdp file");
+            }
+            if gromacs::is_minimization(path)? {
+                if index != 0 {
+                    bail!("an energy-minimisation .mdp has to come first");
+                }
+                minimization = Some(gromacs::parse_minimization(path)?);
+            } else {
+                stages.push(gromacs::parse(path)?);
+            }
+        }
+        Ok(Self {
+            minimization,
+            stages,
+        })
+    }
+
+    fn protocol(&self) -> Result<SimulationProtocol> {
+        gromacs::recipe(&self.stages, self.minimization.as_ref())
+    }
+}
+
 fn load_protocol(
     path: Option<&Path>,
-    gromacs_mdp: Option<&Path>,
+    gromacs_mdp: &[PathBuf],
     system: &ParameterizedSystem,
 ) -> Result<SimulationProtocol> {
-    if let Some(path) = gromacs_mdp {
-        if path.extension().and_then(|s| s.to_str()) != Some("mdp") {
-            bail!("--gromacs-mdp must point to a .mdp file");
+    if !gromacs_mdp.is_empty() {
+        let recipe = Recipe::read(gromacs_mdp)?;
+        for stage in &recipe.stages {
+            eprintln!(
+                "resolved {}: coulombtype={} tcoupl={} pcoupl={} cutoff={:.3} A steps={}",
+                stage.source,
+                stage.coulomb_type,
+                stage.thermostat,
+                stage.pressure_coupling,
+                stage.cutoff_angstrom,
+                stage.steps
+            );
         }
-        let resolved = gromacs::parse(path)?;
-        eprintln!(
-            "resolved GROMACS recipe: coulombtype={} tcoupl={} pcoupl={} cutoff={:.3} A steps={}",
-            resolved.coulomb_type,
-            resolved.thermostat,
-            resolved.pressure_coupling,
-            resolved.cutoff_angstrom,
-            resolved.steps
-        );
-        return resolved.to_protocol();
+        return recipe.protocol();
     }
     let Some(path) = path else {
         return Ok(default_protocol(system));
@@ -661,16 +720,29 @@ fn run_loop(
     started: Instant,
     requested_backend: &str,
     observables_every: Option<usize>,
+    trajectory: TrajectoryArgs,
 ) -> Result<()> {
     if observables_every == Some(0) {
         bail!("--observables-every must be positive");
     }
     fs::create_dir_all(output)?;
-    let trajectory = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output.join("trajectory.jsonl"))?;
-    let mut trajectory = BufWriter::new(trajectory);
+    if trajectory.atoms == TrajectoryAtoms::Solute && !output.join("solute").exists() {
+        // The dry solute with its parameters: what a GROMACS workflow gets
+        // by stripping the solvent from its topology afterwards.
+        system
+            .solute()
+            .write_bundle(output.join("solute"))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    let checkpoint_ps = trajectory.checkpoint_ps;
+    let mut trajectory = TrajectoryWriter::open(
+        output,
+        system,
+        trajectory.format,
+        trajectory.atoms,
+        session.state().protocol.save_every,
+        session.state().protocol.timestep_fs * 0.001,
+    )?;
     let mut observables = observables_every
         .map(|_| {
             OpenOptions::new()
@@ -704,10 +776,15 @@ fn run_loop(
     let initial_file_output_seconds = initial_file_output.elapsed().as_secs_f64();
     file_output_seconds += initial_file_output_seconds;
     // Keep restart I/O off the per-100-step submission cadence. Five
-    // simulated picoseconds bounds recovery loss while avoiding thousands of
-    // multi-megabyte checkpoint rewrites in a nanosecond qualification run.
-    let checkpoint_interval =
-        ((5.0 / (session.state().protocol.timestep_fs * 0.001)).round() as usize).max(1);
+    // simulated picoseconds (the default) bounds recovery loss while avoiding
+    // thousands of multi-megabyte checkpoint rewrites in a nanosecond
+    // qualification run.
+    if !(checkpoint_ps.is_finite() && checkpoint_ps > 0.) {
+        bail!("--checkpoint-ps must be positive");
+    }
+    let checkpoint_interval = ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001))
+        .round() as usize)
+        .max(1);
     let masses: Vec<_> = system.atoms().iter().map(|atom| atom.mass()).collect();
     let starting_step = session.current_step();
     let simulation_started = Instant::now();
@@ -771,9 +848,8 @@ fn run_loop(
         };
         let has_frames = !frames.is_empty();
         let frame_output_started = Instant::now();
-        for frame in frames {
-            serde_json::to_writer(&mut trajectory, &frame)?;
-            trajectory.write_all(b"\n")?;
+        for frame in &frames {
+            trajectory.write(frame)?;
         }
         if has_frames {
             trajectory.flush()?;
@@ -876,7 +952,9 @@ fn run_loop(
 
 fn run(args: RunArgs) -> Result<()> {
     if args.output.join("checkpoint.json").exists()
-        || args.output.join("trajectory.jsonl").exists()
+        || trajectory::TRAJECTORY_FILES
+            .iter()
+            .any(|name| args.output.join(name).exists())
         || args
             .output
             .join("step-zero-reference-checkpoint.json")
@@ -891,7 +969,7 @@ fn run(args: RunArgs) -> Result<()> {
     let mut protocol = apply_cli_overrides(
         load_protocol(
             args.common.protocol.as_deref(),
-            args.common.gromacs_mdp.as_deref(),
+            &args.common.gromacs_mdp,
             &system,
         )?,
         args.common.minimization_iterations,
@@ -902,12 +980,12 @@ fn run(args: RunArgs) -> Result<()> {
         protocol.equilibration_steps = 0;
         protocol.stages = None;
     }
-    if let Some(mdp) = args.common.gromacs_mdp.as_deref() {
-        let resolved = gromacs::parse(mdp)?;
+    if !args.common.gromacs_mdp.is_empty() {
+        let recipe = Recipe::read(&args.common.gromacs_mdp)?;
         let audit = serde_json::json!({
-            "resolved": resolved,
+            "minimization": recipe.minimization,
+            "stages": recipe.stages,
             "protocol": protocol,
-            "runtimeStatus": "requested model is retained; PME/Nose-Hoover/Parrinello-Rahman drivers remain capability-gated",
         });
         fs::create_dir_all(&args.output)?;
         fs::write(
@@ -942,6 +1020,7 @@ fn run(args: RunArgs) -> Result<()> {
             Backend::Vulkan => "vulkan",
         },
         args.observables_every,
+        args.trajectory,
     )
 }
 
@@ -990,6 +1069,7 @@ fn resume(args: ResumeArgs) -> Result<()> {
             Backend::Vulkan => "vulkan",
         },
         args.observables_every,
+        args.trajectory,
     )
 }
 
@@ -1128,7 +1208,7 @@ fn benchmark(args: BenchmarkArgs) -> Result<()> {
         apply_cli_overrides(
             load_protocol(
                 args.common.protocol.as_deref(),
-                args.common.gromacs_mdp.as_deref(),
+                &args.common.gromacs_mdp,
                 &system,
             )?,
             args.common.minimization_iterations,

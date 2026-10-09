@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::model::System;
@@ -110,15 +110,39 @@ pub(crate) fn write_topology(system: &System) -> String {
         )
         .unwrap();
     }
+    // Every 1-4 pair carries its own scale factors: ff14SB divides the
+    // electrostatics by 1.2 and the Lennard-Jones well by 2, GLYCAM06 scales
+    // neither. The `fudge` values of [ defaults ] apply one pair of factors
+    // to the whole system, so the pairs are written with function 2, which
+    // takes the charge scale and the Lennard-Jones parameters per pair.
     let pairs = system
         .one_four_pairs()
         .into_iter()
-        .map(|(pair, _, _)| (pair[0], pair[1]))
-        .collect::<BTreeSet<_>>();
+        .map(|(pair, scee, scnb)| ((pair[0], pair[1]), (scee, scnb)))
+        .collect::<BTreeMap<_, _>>();
     writeln!(output).unwrap();
     writeln!(output, "[ pairs ]").unwrap();
-    for (first, second) in pairs {
-        writeln!(output, "{:>7} {:>7} 1", first + 1, second + 1).unwrap();
+    writeln!(
+        output,
+        "; ai aj funct fudgeQQ qi qj sigma(nm) epsilon(kJ/mol)"
+    )
+    .unwrap();
+    for ((first, second), (scee, scnb)) in pairs {
+        let (a, b) = (&system.atoms[first], &system.atoms[second]);
+        let sigma_nm = (a.radius + b.radius) / 2.0f64.powf(1.0 / 6.0) / 10.0;
+        let epsilon_kj = (a.epsilon * b.epsilon).sqrt() * 4.184 / scnb;
+        writeln!(
+            output,
+            "{:>7} {:>7} 2 {:.12} {:>12.8} {:>12.8} {:>14.8e} {:>14.8e}",
+            first + 1,
+            second + 1,
+            1.0 / scee,
+            a.charge,
+            b.charge,
+            sigma_nm,
+            epsilon_kj
+        )
+        .unwrap();
     }
     writeln!(output).unwrap();
     writeln!(output, "[ settles ]").unwrap();
@@ -134,6 +158,8 @@ pub(crate) fn write_topology(system: &System) -> String {
         }
     }
     writeln!(output).unwrap();
+    // A row excludes its first atom from the others, so a water needs two
+    // rows to exclude its hydrogens from each other as well.
     writeln!(output, "[ exclusions ]").unwrap();
     for residue in &system.residues {
         if residue.name == "WAT" && residue.atom_count == 3 {
@@ -141,6 +167,13 @@ pub(crate) fn write_topology(system: &System) -> String {
                 output,
                 "{} {} {}",
                 residue.first_atom + 1,
+                residue.first_atom + 2,
+                residue.first_atom + 3
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "{} {}",
                 residue.first_atom + 2,
                 residue.first_atom + 3
             )
