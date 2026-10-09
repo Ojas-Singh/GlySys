@@ -113,7 +113,7 @@ struct PrepareArgs {
     /// Solute-to-box-face padding in Å.
     #[arg(long)]
     padding: Option<f64>,
-    /// Added NaCl concentration in mol/L.
+    /// NaCl concentration in mol/L (ion counts by the SLTCAP rule).
     #[arg(long)]
     salt: Option<f64>,
     /// Write an unsolvated, non-periodic system without water or ions.

@@ -26,11 +26,13 @@ pub struct BuildOptions {
     pub profile: ForceFieldProfile,
     /// Minimum solute-to-box-face distance in Å.
     pub padding_angstrom: f64,
-    /// Added neutral NaCl concentration in mol/L.
+    /// NaCl concentration in mol/L of the bath the box is in equilibrium with
+    /// (ion counts by the SLTCAP rule; for a neutral solute, the concentration
+    /// in its water).
     pub salt_molar: f64,
     /// Add a periodic TIP3P water box.
     pub add_water: bool,
-    /// Add neutralizing ions and the requested salt concentration.
+    /// Add ions: neutral overall, at the requested salt concentration.
     pub add_ions: bool,
     pub seed: u64,
     pub model: u32,

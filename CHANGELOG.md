@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Ion counts follow SLTCAP (Schmit et al., J. Chem. Theory Comput. 2018, 14,
+  1823). The salt is counted from the water molecules of the box (N0 pairs at
+  the requested concentration) and a solute of charge Q gets
+  sqrt(N0² + Q²/4) ∓ Q/2 ions of each sign, so the box matches a bath of that
+  concentration. Preparation used to neutralize the solute and then add one
+  pair per volume of the box as built, which gave about 10% more salt than
+  asked for (the box is built slightly under liquid density and holds the
+  solute too) and more again around a charged solute: a glycan of charge −4
+  in 5,291 waters at 0.2 M now gets 21 Na⁺ and 17 Cl⁻ instead of 25 and 21.
+  A neutral solute gets N0 pairs; without salt only the neutralizing
+  counter-ions are added, as before.
 - Explicit-solvent dynamics on the CPU gains what the GOTW (GROMACS) recipe
   uses: smooth particle-mesh Ewald electrostatics (`glysys_energy::pme`, a PME
   mode of the cluster-pair kernel), Nose–Hoover temperature coupling per group

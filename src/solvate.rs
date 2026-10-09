@@ -5,7 +5,8 @@ use crate::model::{Angle, Atom, Bond, Residue, System, Vec3};
 use crate::{BuildError, BuildOptions, Result};
 
 const TIP3P_CELL_ANGSTROM: f64 = 18.774_349;
-const AVOGADRO_PER_NM3: f64 = 0.602_214_076;
+/// Molarity of pure water at 25 °C (997.05 g/L, 18.015 g/mol).
+const WATER_MOLAR: f64 = 55.34;
 
 #[derive(Clone)]
 struct Water {
@@ -140,21 +141,10 @@ pub(crate) fn solvate_and_ionize(
         .map(|atom| atom.charge)
         .sum::<f64>()
         .round() as i64;
-    let volume_nm3 = box_lengths.iter().product::<f64>() / 1000.0;
-    let salt_pairs = if options.add_ions {
-        (options.salt_molar * AVOGADRO_PER_NM3 * volume_nm3).round() as usize
+    let (sodium, chloride) = if options.add_ions {
+        ion_counts(waters.len(), solute_charge, options.salt_molar)
     } else {
-        0
-    };
-    let sodium = if options.add_ions {
-        salt_pairs + usize::try_from((-solute_charge).max(0)).unwrap_or(0)
-    } else {
-        0
-    };
-    let chloride = if options.add_ions {
-        salt_pairs + usize::try_from(solute_charge.max(0)).unwrap_or(0)
-    } else {
-        0
+        (0, 0)
     };
     let requested = sodium + chloride;
     if requested > waters.len() {
@@ -339,6 +329,31 @@ fn add_ion(
     Ok(())
 }
 
+/// Sodium and chloride ions for a solute of charge `solute_charge` (in e)
+/// among `waters` water molecules, at a salt concentration of `salt_molar`.
+///
+/// The counts follow SLTCAP (Schmit, Kariyawasam, Needham and Smith, J. Chem.
+/// Theory Comput. 2018, 14, 1823). With N0 the ion pairs that the water alone
+/// would hold at that concentration, the box is in equilibrium with a bath of
+/// the same concentration when N+ N- = N0^2, and it is neutral when
+/// N+ - N- = -Q, which gives N+- = sqrt(N0^2 + Q^2/4) -+ Q/2. A charged solute
+/// therefore brings fewer co-ions as well as more counter-ions; a neutral one
+/// gets N0 pairs, and without salt only the neutralizing counter-ions remain.
+/// N0 is counted from the water molecules, not from the volume of the box as
+/// built, which also holds the solute and relaxes under pressure coupling.
+fn ion_counts(waters: usize, solute_charge: i64, salt_molar: f64) -> (usize, usize) {
+    let pairs_in_water = salt_molar * waters as f64 / WATER_MOLAR;
+    let excess = usize::try_from(solute_charge.unsigned_abs()).unwrap_or(usize::MAX);
+    let half = excess as f64 / 2.0;
+    let co_ions = (pairs_in_water.hypot(half) - half).round().max(0.0) as usize;
+    let counter_ions = co_ions.saturating_add(excess);
+    if solute_charge < 0 {
+        (counter_ions, co_ions)
+    } else {
+        (co_ions, counter_ions)
+    }
+}
+
 fn ion_schedule(sodium: usize, chloride: usize, solute_charge: i64) -> Vec<bool> {
     let mut result = Vec::with_capacity(sodium + chloride);
     let neutral_sodium = usize::try_from((-solute_charge).max(0)).unwrap_or(0);
@@ -373,5 +388,35 @@ mod tests {
             vec![true, true, true, false, true, false]
         );
         assert_eq!(ion_schedule(1, 3, 2), vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn neutral_solute_gets_the_salt_of_its_water() {
+        // 0.15 M in 5,534 waters: 15 pairs
+        assert_eq!(ion_counts(5_534, 0, 0.15), (15, 15));
+        assert_eq!(ion_counts(5_534, 0, 0.0), (0, 0));
+    }
+
+    #[test]
+    fn charged_solute_trades_co_ions_for_counter_ions() {
+        // N0 = 0.2 * 5291 / 55.34 = 19.12; sqrt(N0^2 + 4) = 19.23: 21.23 and 17.23
+        assert_eq!(ion_counts(5_291, -4, 0.2), (21, 17));
+        assert_eq!(ion_counts(5_291, 4, 0.2), (17, 21));
+        // the product stays at N0^2 as the charge grows
+        let (sodium, chloride) = ion_counts(5_291, -12, 0.2);
+        assert_eq!((sodium, chloride), (26, 14));
+    }
+
+    #[test]
+    fn ion_counts_are_always_neutral() {
+        for charge in [-9_i64, -3, -1, 0, 1, 2, 7] {
+            for salt in [0.0, 0.05, 0.15, 0.5] {
+                let (sodium, chloride) = ion_counts(3_000, charge, salt);
+                assert_eq!(sodium as i64 - chloride as i64, -charge, "{charge} {salt}");
+            }
+        }
+        // without salt only the neutralizing ions are left
+        assert_eq!(ion_counts(3_000, -8, 0.0), (8, 0));
+        assert_eq!(ion_counts(3_000, 3, 0.0), (0, 3));
     }
 }
