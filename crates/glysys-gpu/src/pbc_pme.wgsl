@@ -22,8 +22,9 @@
 //! transforms carry two real lines (z and z + 1) as the real and imaginary
 //! part of one complex line. A workgroup owns a few neighbouring lines: it
 //! copies them to workgroup memory, runs the Stockham autosort stages there
-//! (radix 2, grid sizes are powers of two up to 256) and writes them back, so
-//! no two workgroups touch the same element and the transforms run in place.
+//! (radix 4 and 2; grid sizes are powers of two up to 256) and writes them
+//! back, so no two workgroups touch the same element and the transforms run
+//! in place.
 //!
 //! What a transform costs on a device is mostly how its loads and stores of
 //! the meshes are laid out, not its arithmetic: the lanes of a workgroup
@@ -191,15 +192,26 @@ fn spread(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
 // One-dimensional transforms in workgroup memory. `line` is two buffers of
 // LINE elements; a stage reads one and writes the other. A workgroup holds
 // as many mesh lines as fit, LINE / K of them side by side (line l at
-// elements l K ... l K + K - 1). Lane `lid` computes the output elements
-// lid, lid + 64, ..., each from two inputs, so a stage has no ordering among
-// the lanes and the barrier after it is the only synchronisation.
+// elements l K ... l K + K - 1).
+//
+// The transform is the decimation-in-frequency Stockham autosort one. At a
+// stage with stride s (a power of two, 1 at the first stage) a line is s
+// interleaved sequences of length n = N / s, and a radix-r stage turns each
+// into r sequences of length m = n / r: with w = exp(-+2 pi i / n),
+//
+//   y[q + s (r p + c)] = w^(c p) sum_k x[q + s (p + k m)] exp(-+2 pi i c k / r)
+//
+// for q < s, p < m and c, k < r. The r inputs of such a butterfly are the
+// elements h, h + N/r, ... of the line (h = q + s p), and its r outputs are
+// elements no other butterfly writes. Lane `lid` computes the butterflies
+// lid, lid + 64, ... whole, so a stage has no ordering among the lanes and
+// the barrier after it is the only synchronisation. The stages are radix 4,
+// after one radix-2 stage when log2 N is odd.
 
 var<workgroup> line: array<vec2<f32>, 2u * LINE>;
 // The twiddles of the workgroup's transform, exp(-2 pi i j / N) for j < N/2.
-// A stage reads a twiddle for every other output; taken from the storage
-// table each of those reads would wait on the device's memory, here it is as
-// fast as the line itself.
+// Taken from the storage table every read of one would wait on the device's
+// memory; here it is as fast as the line itself.
 var<workgroup> turns: array<vec2<f32>, 128>;
 
 // Copy the twiddles of a `1 << bits`-point transform. Every lane calls it
@@ -214,40 +226,80 @@ fn lines_per_group(points: u32, available: u32) -> u32 {
   return min(LINE / points, available);
 }
 
-// Stage `ls` of the decimation-in-frequency Stockham transform of
-// `1 << bits` points, on `count` elements (whole lines): the sequences have
-// length n = N >> ls and stride s = 1 << ls, and output q + s (2 p + r) is
-// (x[q + s p] + (-1)^r x[q + s (p + n/2)]) exp(-+2 pi i r p / n).
-fn fft_stage(lid: u32, bits: u32, count: u32, ls: u32, src: u32, dst: u32, direction: f32) {
-  let n = 1u << bits;
-  let half = n >> 1u;
-  let low = (1u << ls) - 1u;
-  for (var e = lid; e < count; e += 64u) {
-    let j = e & (n - 1u);
-    let t = j >> ls;
-    let turn = (t >> 1u) << ls;
-    let ia = src + (e - j) + (j & low) + turn;
-    let a = line[ia];
-    let b = line[ia + half];
-    var value = a + b;
-    if ((t & 1u) != 0u) {
-      let w = turns[turn];
-      let d = a - b;
-      value = vec2<f32>(d.x * w.x - direction * d.y * w.y, direction * d.x * w.y + d.y * w.x);
-    }
-    line[dst + e] = value;
+// `d` times the twiddle `w`, or times its conjugate for the inverse
+// (`direction` -1).
+fn rotate(d: vec2<f32>, w: vec2<f32>, direction: f32) -> vec2<f32> {
+  return vec2<f32>(d.x * w.x - direction * d.y * w.y, direction * d.x * w.y + d.y * w.x);
+}
+
+// Radix-2 stage with stride `1 << ls` of the `1 << bits`-point transform of
+// `count` elements (whole lines).
+fn stage2(lid: u32, bits: u32, count: u32, ls: u32, src: u32, dst: u32, direction: f32) {
+  let half = (1u << bits) >> 1u;
+  let stride = 1u << ls;
+  for (var b = lid; b < count / 2u; b += 64u) {
+    let h = b & (half - 1u);
+    let first = 2u * (b - h);
+    let q = h & (stride - 1u);
+    let x0 = line[src + first + h];
+    let x1 = line[src + first + h + half];
+    // Outputs q + s (2 p + c); the twiddle index is p s = h - q.
+    let out = dst + first + 2u * h - q;
+    line[out] = x0 + x1;
+    line[out + stride] = rotate(x0 - x1, turns[h - q], direction);
   }
 }
 
-// Stages `first..last` on the buffer at `start`; returns where the result is.
-// `direction` is 1 for the forward transform and -1 for the (unnormalised)
-// inverse. Must be called by every lane: the barriers need uniform control
-// flow, which the loop bounds (uniform values) keep.
+// Radix-4 stage with stride `1 << ls`.
+fn stage4(lid: u32, bits: u32, count: u32, ls: u32, src: u32, dst: u32, direction: f32) {
+  let quarter = (1u << bits) >> 2u;
+  let stride = 1u << ls;
+  for (var b = lid; b < count / 4u; b += 64u) {
+    let h = b & (quarter - 1u);
+    let first = 4u * (b - h);
+    let q = h & (stride - 1u);
+    let turn = h - q;
+    let at = src + first + h;
+    let x0 = line[at];
+    let x1 = line[at + quarter];
+    let x2 = line[at + 2u * quarter];
+    let x3 = line[at + 3u * quarter];
+    let s02 = x0 + x2;
+    let d02 = x0 - x2;
+    let s13 = x1 + x3;
+    let d13 = x1 - x3;
+    // -+i (x1 - x3)
+    let j13 = direction * vec2<f32>(d13.y, -d13.x);
+    // Outputs q + s (4 p + c); the twiddle indices are c p s = c (h - q),
+    // and the table's second half is minus its first.
+    let out = dst + first + 4u * h - 3u * q;
+    let wrapped = 3u * turn >= 2u * quarter;
+    let w3 = turns[3u * turn - select(0u, 2u * quarter, wrapped)];
+    line[out] = s02 + s13;
+    line[out + stride] = rotate(d02 + j13, turns[turn], direction);
+    line[out + 2u * stride] = rotate(s02 - s13, turns[2u * turn], direction);
+    line[out + 3u * stride] = rotate(d02 - j13, select(w3, -w3, wrapped), direction);
+  }
+}
+
+// The stages that resolve bits `first..last` of the transform, on the buffer
+// at `start`; returns where the result is. `direction` is 1 for the forward
+// transform and -1 for the (unnormalised) inverse. Must be called by every
+// lane: the barriers need uniform control flow, which the loop bounds
+// (uniform values) keep.
 fn fft_stages(lid: u32, bits: u32, count: u32, first: u32, last: u32, start: u32,
               direction: f32) -> u32 {
   var src = start;
-  for (var ls = first; ls < last; ls++) {
-    fft_stage(lid, bits, count, ls, src, LINE - src, direction);
+  var ls = first;
+  while (ls < last) {
+    // An odd number of bits to go: one radix-2 stage makes it even.
+    if (((bits - ls) & 1u) != 0u) {
+      stage2(lid, bits, count, ls, src, LINE - src, direction);
+      ls += 1u;
+    } else {
+      stage4(lid, bits, count, ls, src, LINE - src, direction);
+      ls += 2u;
+    }
     workgroupBarrier();
     src = LINE - src;
   }
@@ -329,19 +381,39 @@ fn frequency(k: u32, points: u32) -> f32 {
 
 var<workgroup> sums: array<vec2<f32>, 64>;
 
+// One mode of the line with squared frequency `m2_xy` in x and y: `value`
+// times the influence function
+//   G(m) = C exp(-pi^2 m^2 / alpha^2) / (pi V m^2 |b(m)|^2),  m = k / L,
+// of which `scale` holds the factors that do not depend on kz. With
+// COMPUTE_ENERGY the mode's energy `weight` G |S|^2 and its virial
+// e (1 - 2 pi^2 m^2 / alpha^2) are added to `total`.
+fn convolve_mode(value: vec2<f32>, k: u32, m2_xy: f32, scale: f32, weight: f32,
+                 total: ptr<function, vec2<f32>>) -> vec2<f32> {
+  let factor = PI * PI / (pc.box_.w * pc.box_.w);
+  let mz = frequency(k, pc.grid.z) / pc.box_.z;
+  let m2 = m2_xy + mz * mz;
+  var g = 0.0;
+  // The m = 0 term is the uniform background, not part of this sum.
+  if (m2 > 0.0) {
+    g = scale * moduli[pc.grid.x + pc.grid.y + k] * exp(-factor * m2) / m2;
+  }
+  if (COMPUTE_ENERGY) {
+    let energy = weight * g * dot(value, value);
+    *total += vec2<f32>(energy, energy * (1.0 - 2.0 * factor * m2));
+  }
+  return g * value;
+}
+
 // z forward, influence function, z inverse: the workgroup (ky group, kx)
 // holds the lines of consecutive ky, a contiguous block of the half
-// spectrum. The influence function
-//   G(m) = C exp(-pi^2 m^2 / alpha^2) / (pi V m^2 |b(m)|^2),  m = k / L,
-// multiplies the outputs of the last forward stage, which needs no twiddle
-// (out[j] = x[j] + x[j + N/2], out[j + N/2] = x[j] - x[j + N/2]). With
-// COMPUTE_ENERGY the energy 1/2 sum G |S|^2 and the virial
-// sum e(m) (1 - 2 pi^2 m^2 / alpha^2) of these lines are returned by lane 0;
-// a line with 0 < kx < Kx/2 stands for its mirror image too.
+// spectrum. The influence function multiplies the outputs of the last
+// forward stage, a radix-4 one whose twiddles are all 1. With COMPUTE_ENERGY
+// the energy 1/2 sum G |S|^2 and the virial of these lines are returned by
+// lane 0; a line with 0 < kx < Kx/2 stands for its mirror image too.
 fn convolve_z(group: vec3<u32>, lid: u32) -> vec2<f32> {
   let points = pc.grid.z;
   let bits = pc.bits.z;
-  let half = points >> 1u;
+  let quarter = points >> 2u;
   let lines = lines_per_group(points, pc.grid.y);
   let count = lines * points;
   let first_ky = lines * group.x;
@@ -349,36 +421,39 @@ fn convolve_z(group: vec3<u32>, lid: u32) -> vec2<f32> {
   for (var e = lid; e < count; e += 64u) { line[e] = spectrum[base + e]; }
   load_turns(lid, bits);
   workgroupBarrier();
-  let done = fft_stages(lid, bits, count, 0u, bits - 1u, 0u, 1.0);
+  let done = fft_stages(lid, bits, count, 0u, bits - 2u, 0u, 1.0);
   let scaled = LINE - done;
 
   let lengths = pc.box_.xyz;
-  let factor = PI * PI / (pc.box_.w * pc.box_.w);
   let mx = f32(group.y) / lengths.x;
   let prefactor = COULOMB / (PI * lengths.x * lengths.y * lengths.z) * moduli[group.y];
   let weight = select(1.0, 0.5, group.y == 0u || 2u * group.y == pc.grid.x);
   var total = vec2<f32>(0.0);
-  for (var e = lid; e < count; e += 64u) {
-    let k = e & (points - 1u);
-    let ky = first_ky + (e >> bits);
-    let low = done + (e - k) + (k & (half - 1u));
-    let a = line[low];
-    let b = line[low + half];
-    let value = select(a + b, a - b, k >= half);
+  for (var b = lid; b < count / 4u; b += 64u) {
+    let h = b & (quarter - 1u);
+    let first = 4u * (b - h);
+    let ky = first_ky + (first >> bits);
     let my = frequency(ky, pc.grid.y) / lengths.y;
-    let mz = frequency(k, points) / lengths.z;
-    let m2 = mx * mx + my * my + mz * mz;
-    var g = 0.0;
-    // The m = 0 term is the uniform background, not part of this sum.
-    if (m2 > 0.0) {
-      g = prefactor * moduli[pc.grid.x + ky] * moduli[pc.grid.x + pc.grid.y + k]
-        * exp(-factor * m2) / m2;
-    }
-    if (COMPUTE_ENERGY) {
-      let energy = weight * g * dot(value, value);
-      total += vec2<f32>(energy, energy * (1.0 - 2.0 * factor * m2));
-    }
-    line[scaled + e] = g * value;
+    let m2_xy = mx * mx + my * my;
+    let scale = prefactor * moduli[pc.grid.x + ky];
+    let at = done + first + h;
+    let x0 = line[at];
+    let x1 = line[at + quarter];
+    let x2 = line[at + 2u * quarter];
+    let x3 = line[at + 3u * quarter];
+    let s02 = x0 + x2;
+    let d02 = x0 - x2;
+    let s13 = x1 + x3;
+    let d13 = x1 - x3;
+    let j13 = vec2<f32>(d13.y, -d13.x);
+    let out = scaled + first + h;
+    line[out] = convolve_mode(s02 + s13, h, m2_xy, scale, weight, &total);
+    line[out + quarter] =
+      convolve_mode(d02 + j13, h + quarter, m2_xy, scale, weight, &total);
+    line[out + 2u * quarter] =
+      convolve_mode(s02 - s13, h + 2u * quarter, m2_xy, scale, weight, &total);
+    line[out + 3u * quarter] =
+      convolve_mode(d02 - j13, h + 3u * quarter, m2_xy, scale, weight, &total);
   }
   workgroupBarrier();
   let back = fft_stages(lid, bits, count, 0u, bits, scaled, -1.0);
