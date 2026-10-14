@@ -570,9 +570,10 @@ fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
         if (line.starts_with("ATOM  ") || line.starts_with("HETATM"))
             && current_model == selected_model
         {
-            // crabWURCS 0.3.1 deliberately limits its loose GLYCAM-code
-            // heuristic to HETATM records: otherwise protein names such as
-            // VAL can be mistaken for a three-character GLYCAM code.  A few
+            // crabWURCS deliberately limits its loose GLYCAM-code heuristic
+            // to HETATM records (0.3.2 also to ATOM codes that begin with a
+            // digit): otherwise protein names such as VAL can be mistaken
+            // for a three-character GLYCAM code.  A few
             // deposited standalone GLYCAM files nevertheless encode their
             // sugar records as ATOM (the common 0YB/0GL-style codes).  Mark
             // only the unambiguous numeric-prefix GLYCAM spelling as HETATM
@@ -594,6 +595,18 @@ fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
             // N-glycan is reported as fragments "attached" to it. See
             // [`glycam_branch_residues`] for why reading them is safe.
             let mut record = format!("{line:<80}");
+            // crabWURCS 0.3.2 trims every record before handing it to
+            // pdbtbx, which rejects an ATOM/HETATM line that ends before the
+            // element columns (77-78). Padding alone therefore no longer
+            // suffices for files without elements: write the element GlySys
+            // reads for the atom (pdbtbx guessed it from the name before).
+            if record
+                .get(76..78)
+                .is_some_and(|element| element.trim().is_empty())
+            {
+                let element = guess_element(field(&record, 12, 16), field(&record, 17, 20).trim());
+                record.replace_range(76..78, &format!("{element:>2}"));
+            }
             if record.starts_with("ATOM  ") {
                 let residue_name = record.get(17..20).unwrap_or_default().trim();
                 let bytes = residue_name.as_bytes();

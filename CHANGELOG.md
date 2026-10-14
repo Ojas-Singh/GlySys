@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- crabWURCS 0.3.2 (tag `v0.3.2`). The GLYCAM name of a glycan in the report
+  carries its reducing end when the structure declares it (`DGlcpNAcb1-OH`,
+  was `DGlcpNAc`), lists substituents the GLYCAM way (`DNeup5Ac[9A]`,
+  `DGalp[3S,6S]`), names furanoses and non-default configurations
+  (`LAraf`, `DGalf`, `LTalp`) and the configuration of N-sulfated
+  glucosamine (`DGlcpNS`). The WURCS of the report is unchanged. crabWURCS
+  0.3.2 trims the records it hands to its PDB parser, which rejects an atom
+  record that ends before the element columns, so GlySys now writes the
+  element it reads for an atom into the view of the file crabWURCS receives
+  when the input leaves those columns blank; before, padding the line was
+  enough.
 - Ions are spread through the solvent. Each ion replaces a water taken in a
   seeded pseudo-random order, at least 5 Å from the solute and from every
   other ion (by the minimum image). Ions used to go where the solute's own
