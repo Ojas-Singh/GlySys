@@ -117,7 +117,7 @@ fn recognizes_and_prepares_standalone_glycam_glycan() {
     assert!(system.report().glycans[0].wurcs.starts_with("WURCS=2.0/"));
     assert_eq!(
         system.report().glycans[0].glycam.as_deref(),
-        Some("DGlcpNAc")
+        Some("DGlcpNAcb1-OH")
     );
     assert!(system.report().solute_charge.abs() < 1.0e-3);
 }
