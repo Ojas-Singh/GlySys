@@ -421,8 +421,8 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "crabwurcs-core",
  "crabwurcs-iupac",
@@ -434,8 +434,8 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs-core"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
@@ -447,8 +447,8 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs-iupac"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "crabwurcs-core",
  "nom",
@@ -459,8 +459,8 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs-mol"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "chematic",
  "crabwurcs-core",
@@ -470,10 +470,11 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs-pdb"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "crabwurcs-core",
+ "crabwurcs-iupac",
  "crabwurcs-mol",
  "pdbtbx",
  "petgraph",
@@ -483,8 +484,8 @@ dependencies = [
 
 [[package]]
 name = "crabwurcs-snfg"
-version = "0.3.2"
-source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.2#c83f360afc2fd38631ef3488fa7b3cce975fbba1"
+version = "0.3.3"
+source = "git+https://github.com/Ojas-Singh/crabWURCS?tag=v0.3.3#5048bb5cbfdc95808eb00e1a3f32507e73bc40f7"
 dependencies = [
  "crabwurcs-core",
  "crabwurcs-iupac",

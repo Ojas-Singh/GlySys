@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- crabWURCS 0.3.3 (tag `v0.3.3`). The glycans of the report are read from
+  the coordinates: every residue whose atoms form a sugar ring is a sugar
+  whatever it is called, and its configuration, anomer and substituents are
+  those of its atoms, with the residue name used only where the atoms cannot
+  tell. The report changes where a file's residue names and atoms disagree:
+  GLYCAM-coded L-iduronic acid is `LIdopA` (was `DIdopA`), an `NDG`-named
+  Asn-linked GlcNAc reads `b` (`example/glycoprotein.pdb`), and a GlycoShape
+  Level 1 file whose reducing residue keeps the other anomer's code reads the
+  anomer of its atoms. Glycans that were split at a residue crabWURCS did not
+  know as a sugar (`RHM`, GLYCAM letter codes, `SO3`) are one glycan, with
+  the attachment site of its root. GLYCAM-coded and wwPDB-coded files of the
+  same structure now give the same glycans.
 - crabWURCS 0.3.2 (tag `v0.3.2`). The GLYCAM name of a glycan in the report
   carries its reducing end when the structure declares it (`DGlcpNAcb1-OH`,
   was `DGlcpNAc`), lists substituents the GLYCAM way (`DNeup5Ac[9A]`,
