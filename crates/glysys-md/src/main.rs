@@ -782,9 +782,8 @@ fn run_loop(
     if !(checkpoint_ps.is_finite() && checkpoint_ps > 0.) {
         bail!("--checkpoint-ps must be positive");
     }
-    let checkpoint_interval = ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001))
-        .round() as usize)
-        .max(1);
+    let checkpoint_interval =
+        ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001)).round() as usize).max(1);
     let masses: Vec<_> = system.atoms().iter().map(|atom| atom.mass()).collect();
     let starting_step = session.current_step();
     let simulation_started = Instant::now();

@@ -761,9 +761,11 @@ impl SettleWaters {
                         dhh,
                     )?;
                     triple.copy_from_slice(&corrected);
-                    Result::Ok(residual(corrected[0], corrected[1], doh)
-                        .max(residual(corrected[0], corrected[2], doh))
-                        .max(residual(corrected[1], corrected[2], dhh)))
+                    Result::Ok(
+                        residual(corrected[0], corrected[1], doh)
+                            .max(residual(corrected[0], corrected[2], doh))
+                            .max(residual(corrected[1], corrected[2], dhh)),
+                    )
                 })
                 .try_reduce(|| 0., |a: f64, b: f64| Ok(a.max(b)))?;
             if !worst.is_finite() || worst > 1e-8 {

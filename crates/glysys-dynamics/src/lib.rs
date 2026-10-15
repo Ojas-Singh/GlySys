@@ -752,7 +752,9 @@ impl SimulationProtocol {
             || self
                 .fourier_spacing_angstrom
                 .is_some_and(|s| !s.is_finite() || s <= 0.)
-            || self.pme_order.is_some_and(|order| !(4..=6).contains(&order))
+            || self
+                .pme_order
+                .is_some_and(|order| !(4..=6).contains(&order))
         {
             return Err(invalid(
                 "PME needs 0 < ewaldTolerance < 1, a positive grid spacing and order 4 to 6",

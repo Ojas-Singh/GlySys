@@ -1157,8 +1157,7 @@ impl<'a> ExplicitSimulation<'a> {
         let masses: Vec<_> = system.atoms().iter().map(|a| a.mass()).collect();
         let h_bonds = solute_h_bonds(system, &waters);
         let targets = water_targets(system, &waters)?;
-        let coupling_plan =
-            coupling_plan(system.atom_count(), &waters, &h_bonds, &state.protocol)?;
+        let coupling_plan = coupling_plan(system.atom_count(), &waters, &h_bonds, &state.protocol)?;
         if coupling_plan.as_ref().map(|plan| plan.groups.len())
             != state.coupling.as_ref().map(|c| c.thermostat_velocity.len())
             || state.coupling.as_ref().is_some_and(|c| {
@@ -1758,7 +1757,11 @@ impl<'a> ExplicitSimulation<'a> {
             y: 0.,
             z: 0.,
         };
-        for buffer in [&mut scratch.velocities, &mut scratch.trial, &mut scratch.coordinates] {
+        for buffer in [
+            &mut scratch.velocities,
+            &mut scratch.trial,
+            &mut scratch.coordinates,
+        ] {
             buffer.resize(atoms, zero);
         }
         let LeapfrogScratch {
@@ -1807,7 +1810,11 @@ impl<'a> ExplicitSimulation<'a> {
                     .with_min_len(PER_ATOM_TASK)
                     .for_each(advance);
             } else {
-                next_vel.iter_mut().zip(trial.iter_mut()).enumerate().for_each(advance);
+                next_vel
+                    .iter_mut()
+                    .zip(trial.iter_mut())
+                    .enumerate()
+                    .for_each(advance);
             }
         }
 
@@ -1820,22 +1827,20 @@ impl<'a> ExplicitSimulation<'a> {
         // One pass adds the constraint displacement to the velocities and
         // finds the largest move of the step.
         let inverse_dt = 1. / dt;
-        let correct = |(((velocity, next), unconstrained), old): (
-            ((&mut Vec3, &Vec3), &Vec3),
-            &Vec3,
-        )| {
-            if constrained {
-                *velocity = add(
-                    *velocity,
-                    scale(add(*next, scale(*unconstrained, -1.)), inverse_dt),
-                );
-            }
-            if finite(next) && finite(velocity) {
-                norm2(add(*next, scale(*old, -1.)))
-            } else {
-                f64::INFINITY
-            }
-        };
+        let correct =
+            |(((velocity, next), unconstrained), old): (((&mut Vec3, &Vec3), &Vec3), &Vec3)| {
+                if constrained {
+                    *velocity = add(
+                        *velocity,
+                        scale(add(*next, scale(*unconstrained, -1.)), inverse_dt),
+                    );
+                }
+                if finite(next) && finite(velocity) {
+                    norm2(add(*next, scale(*old, -1.)))
+                } else {
+                    f64::INFINITY
+                }
+            };
         let largest_move = if atoms >= PARALLEL_ATOMS {
             next_vel
                 .par_iter_mut()
@@ -1908,9 +1913,7 @@ impl<'a> ExplicitSimulation<'a> {
             )
             .map_err(Error::Energy)?
         };
-        if cutoff_angstrom(&self.state.protocol)
-            >= 0.5 * new_box.x.min(new_box.y).min(new_box.z)
-        {
+        if cutoff_angstrom(&self.state.protocol) >= 0.5 * new_box.x.min(new_box.y).min(new_box.z) {
             return Err(invalid(
                 "the box shrank below twice the cutoff; checkpoint retained",
             ));
@@ -2938,7 +2941,10 @@ mod tests {
         let system = solvated_dipeptide();
         // 601 steps: the last one removes center-of-mass motion.
         let mut sim = ExplicitSimulation::new(&system, leapfrog_protocol(601)).unwrap();
-        assert_eq!(sim.state.velocity_convention, VelocityConvention::LeapfrogHalfStep);
+        assert_eq!(
+            sim.state.velocity_convention,
+            VelocityConvention::LeapfrogHalfStep
+        );
         let mut temperatures = Vec::new();
         for _ in 0..601 {
             sim.step().unwrap();
@@ -2948,7 +2954,12 @@ mod tests {
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         assert!((mean - 300.).abs() < 30., "mean temperature {mean} K");
         let coupling = sim.state.coupling.as_ref().unwrap();
-        assert!(coupling.thermostat_velocity.iter().all(|v| v.is_finite() && v.abs() < 50.));
+        assert!(
+            coupling
+                .thermostat_velocity
+                .iter()
+                .all(|v| v.is_finite() && v.abs() < 50.)
+        );
         assert!(
             sim.settle
                 .as_ref()
@@ -2966,7 +2977,10 @@ mod tests {
             };
             let mut mass = 0.;
             for &atom in group {
-                momentum = add(momentum, scale(sim.state.velocities[atom], sim.masses[atom]));
+                momentum = add(
+                    momentum,
+                    scale(sim.state.velocities[atom], sim.masses[atom]),
+                );
                 mass += sim.masses[atom];
             }
             assert!(norm2(scale(momentum, 1. / mass)).sqrt() < 1e-9);
@@ -2998,7 +3012,10 @@ mod tests {
         let head = series[..20].iter().sum::<f64>() / 20.;
         let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
         let drift = ((tail - head) / sim.masses.len() as f64).abs();
-        assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+        assert!(
+            drift < 0.02,
+            "per-atom drift of the extended energy {drift}"
+        );
     }
 
     #[test]
@@ -3016,7 +3033,10 @@ mod tests {
         let volume: f64 = sim.state.box_angstrom.iter().product();
         let density = sim.frame().density_g_ml;
         assert!(density > 0.85 && density < 1.15, "density {density}");
-        assert!((volume / initial_volume - 1.).abs() > 1e-4, "the box did not move");
+        assert!(
+            (volume / initial_volume - 1.).abs() > 1e-4,
+            "the box did not move"
+        );
         assert!(pressures.iter().all(|p| p.is_finite()));
         eprintln!(
             "volume ratio {:.4}, density {density:.3}, first pressures {:?}, last {:?}",
@@ -3024,7 +3044,10 @@ mod tests {
             &pressures[..4],
             &pressures[pressures.len() - 4..]
         );
-        assert_eq!(sim.state.pressure_estimator, "atomic-virial-with-constraints");
+        assert_eq!(
+            sim.state.pressure_estimator,
+            "atomic-virial-with-constraints"
+        );
         // The box keeps its shape under isotropic coupling.
         let initial = system.box_angstrom();
         let ratio = sim.state.box_angstrom[0] / initial[0];
@@ -3051,9 +3074,14 @@ mod tests {
         let box_vec = sim.box_vectors().unwrap();
         let energy_at = |factor: f64| {
             let scaled_box =
-                BoxVectors::new(box_vec.x * factor, box_vec.y * factor, box_vec.z * factor).unwrap();
-            let coordinates: Vec<Vec3> =
-                sim.state.coordinates.iter().map(|p| scale(*p, factor)).collect();
+                BoxVectors::new(box_vec.x * factor, box_vec.y * factor, box_vec.z * factor)
+                    .unwrap();
+            let coordinates: Vec<Vec3> = sim
+                .state
+                .coordinates
+                .iter()
+                .map(|p| scale(*p, factor))
+                .collect();
             let wrapped: Vec<Vec3> = coordinates.iter().map(|p| scaled_box.wrap(*p)).collect();
             let pairs = PbcNeighborList::build(&wrapped, &scaled_box, 4.0, SKIN_ANGSTROM).unwrap();
             sim.field
@@ -3147,7 +3175,10 @@ mod tests {
         let head = series[..20].iter().sum::<f64>() / 20.;
         let tail = series[series.len() - 20..].iter().sum::<f64>() / 20.;
         let drift = ((tail - head) / sim.masses.len() as f64).abs();
-        assert!(drift < 0.02, "per-atom drift of the extended energy {drift}");
+        assert!(
+            drift < 0.02,
+            "per-atom drift of the extended energy {drift}"
+        );
     }
 
     #[test]
@@ -3165,7 +3196,10 @@ mod tests {
         // dominated by the attractive term, for which the factor is two
         assert!(energy < 0. && pressure < 0.);
         let ratio = pressure / energy;
-        assert!(ratio > 1.99 && ratio < 2.0, "tail pressure / tail energy = {ratio}");
+        assert!(
+            ratio > 1.99 && ratio < 2.0,
+            "tail pressure / tail energy = {ratio}"
+        );
         // and exactly 4 E12 + 2 E6 with E12 + E6 the energy coefficient at
         // two cutoffs, which separates the two powers of the cutoff
         let (e1, e2) = (energy, field.dispersion_coefficient(2. * cutoff).unwrap());

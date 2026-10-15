@@ -2796,7 +2796,11 @@ impl ResidentPbc {
     /// resident state must come from an evaluation with energies (any static
     /// evaluation, or the end of an earlier advance). The final step
     /// publishes energies and the pressure.
-    pub async fn dynamics_steps_leapfrog(&self, first_step: u64, steps: usize) -> Result<(), Error> {
+    pub async fn dynamics_steps_leapfrog(
+        &self,
+        first_step: u64,
+        steps: usize,
+    ) -> Result<(), Error> {
         let Some(engine) = &self.leapfrog else {
             return Err(Error::Input("leap-frog integrator is not configured"));
         };

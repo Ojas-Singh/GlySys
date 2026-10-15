@@ -1091,7 +1091,9 @@ impl SimulationSession {
                 let variables = leapfrog_variables(&simulation.state);
                 gpu.set_leapfrog_variables(&variables)
                     .map_err(SessionError::from_gpu)?;
-                let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+                let groups = simulation
+                    .coupling_plan()
+                    .map_or(0, |plan| plan.groups.len());
                 let coupling = coupling_state(&variables, groups, 0);
                 let box_angstrom = simulation.state.box_angstrom;
                 let energy = energy + simulation.dispersion_energy();
@@ -1485,7 +1487,9 @@ impl SimulationSession {
             let variables = leapfrog_variables(&state);
             gpu.set_leapfrog_variables(&variables)
                 .map_err(SessionError::from_gpu)?;
-            let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+            let groups = simulation
+                .coupling_plan()
+                .map_or(0, |plan| plan.groups.len());
             let energy = energy + simulation.dispersion_energy();
             simulation.install_leapfrog_state(
                 state.coordinates.clone(),
@@ -1688,7 +1692,9 @@ impl SimulationSession {
                     self.diagnostics.neighbor_rebuild_count = Some(resident.neighbor_rebuild_count);
                     let (potential, gradients, virial) = gpu_total(&energy)?;
                     let next_step = first + count;
-                    let groups = simulation.coupling_plan().map_or(0, |plan| plan.groups.len());
+                    let groups = simulation
+                        .coupling_plan()
+                        .map_or(0, |plan| plan.groups.len());
                     simulation.state.box_angstrom = variables.box_angstrom;
                     let potential = potential + simulation.dispersion_energy();
                     simulation.install_leapfrog_state(

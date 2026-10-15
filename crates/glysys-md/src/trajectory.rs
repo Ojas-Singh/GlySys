@@ -50,9 +50,15 @@ pub struct DcdWriter {
 }
 
 impl DcdWriter {
-    pub fn create(path: &Path, atoms: usize, interval_steps: usize, timestep_ps: f64) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        atoms: usize,
+        interval_steps: usize,
+        timestep_ps: f64,
+    ) -> Result<Self> {
         let atoms_i32 = i32::try_from(atoms).context("too many atoms for a DCD file")?;
-        let interval = u32::try_from(interval_steps).context("frame interval too large for a DCD file")?;
+        let interval =
+            u32::try_from(interval_steps).context("frame interval too large for a DCD file")?;
         let mut header = Vec::with_capacity(276);
         header.extend_from_slice(&84i32.to_le_bytes());
         header.extend_from_slice(b"CORD");
@@ -105,7 +111,8 @@ impl DcdWriter {
         let mut header = [0u8; 276];
         file.read_exact(&mut header)
             .with_context(|| format!("{} is not a DCD file", path.display()))?;
-        let int = |offset: usize| i32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        let int =
+            |offset: usize| i32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
         if int(0) != 84 || &header[4..8] != b"CORD" || int(48) != 1 || int(268) as usize != atoms {
             bail!(
                 "{} does not hold a GlySys DCD trajectory of {atoms} atoms",
@@ -144,7 +151,14 @@ impl DcdWriter {
         self.scratch.clear();
         self.scratch.extend_from_slice(&48i32.to_le_bytes());
         // a, gamma, b, beta, alpha, c with the angles in degrees
-        for value in [box_angstrom[0], 90., box_angstrom[1], 90., 90., box_angstrom[2]] {
+        for value in [
+            box_angstrom[0],
+            90.,
+            box_angstrom[1],
+            90.,
+            90.,
+            box_angstrom[2],
+        ] {
             self.scratch.extend_from_slice(&value.to_le_bytes());
         }
         self.scratch.extend_from_slice(&48i32.to_le_bytes());
@@ -315,7 +329,13 @@ mod tests {
         for _ in 0..frames {
             assert_eq!(int(offset), 48);
             let cell: Vec<f64> = (0..6)
-                .map(|k| f64::from_le_bytes(bytes[offset + 4 + 8 * k..offset + 12 + 8 * k].try_into().unwrap()))
+                .map(|k| {
+                    f64::from_le_bytes(
+                        bytes[offset + 4 + 8 * k..offset + 12 + 8 * k]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
                 .collect();
             offset += 56;
             let mut xyz = vec![[0f32; 3]; atoms];
@@ -338,8 +358,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("t.dcd");
         let mut writer = DcdWriter::create(&path, 5, 5000, 0.002).unwrap();
-        writer.write_frame([40., 50., 45.], &frame(7, 0.25)).unwrap();
-        writer.write_frame([40.1, 50.1, 45.1], &frame(7, 1.5)).unwrap();
+        writer
+            .write_frame([40., 50., 45.], &frame(7, 0.25))
+            .unwrap();
+        writer
+            .write_frame([40.1, 50.1, 45.1], &frame(7, 1.5))
+            .unwrap();
         drop(writer);
         // a half-written third frame, as a killed run leaves it
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -348,7 +372,9 @@ mod tests {
 
         let mut writer = DcdWriter::append(&path, 5).unwrap();
         assert_eq!(writer.frames(), 2);
-        writer.write_frame([40.2, 50.2, 45.2], &frame(5, -3.)).unwrap();
+        writer
+            .write_frame([40.2, 50.2, 45.2], &frame(5, -3.))
+            .unwrap();
         drop(writer);
 
         let (atoms, frames) = read(&path);

@@ -544,7 +544,9 @@ fn glycam_branch_residues(contents: &str, selected_model: u32) -> HashSet<String
     atoms
         .into_iter()
         .filter(|(_, names)| {
-            ["C1", "C2", "C3", "C4"].iter().all(|atom| names.contains(atom))
+            ["C1", "C2", "C3", "C4"]
+                .iter()
+                .all(|atom| names.contains(atom))
                 && (names.contains("O5") || names.contains("O4"))
         })
         .map(|(residue, _)| residue)

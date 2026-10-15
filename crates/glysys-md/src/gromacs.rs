@@ -288,33 +288,37 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
     }
 
     let pressure_coupling = value(&raw, "pcoupl")?.to_ascii_lowercase();
-    let (pressure_coupling_type, pressure_tau_ps, reference_pressure_bar, compressibility_bar_inverse) =
-        match pressure_coupling.as_str() {
-            "no" => (String::new(), None, None, Vec::new()),
-            "parrinello-rahman" => {
-                let coupling_type = value(&raw, "pcoupltype")?.to_ascii_lowercase();
-                if coupling_type != "isotropic" {
-                    bail!(
-                        "unsupported pcoupltype='{coupling_type}'; only isotropic coupling is in the first GOTW profile"
-                    );
-                }
-                let compressibility: Vec<f64> = parse_list(&raw, "compressibility")?;
-                if compressibility.is_empty()
-                    || compressibility.iter().any(|v| !v.is_finite() || *v <= 0.)
-                {
-                    bail!("compressibility must contain positive finite values");
-                }
-                (
-                    coupling_type,
-                    Some(parse_f64(&raw, "tau-p")?),
-                    Some(parse_f64(&raw, "ref-p")?),
-                    compressibility,
-                )
+    let (
+        pressure_coupling_type,
+        pressure_tau_ps,
+        reference_pressure_bar,
+        compressibility_bar_inverse,
+    ) = match pressure_coupling.as_str() {
+        "no" => (String::new(), None, None, Vec::new()),
+        "parrinello-rahman" => {
+            let coupling_type = value(&raw, "pcoupltype")?.to_ascii_lowercase();
+            if coupling_type != "isotropic" {
+                bail!(
+                    "unsupported pcoupltype='{coupling_type}'; only isotropic coupling is in the first GOTW profile"
+                );
             }
-            other => bail!(
-                "unsupported pcoupl='{other}'; the GOTW profile uses Parrinello-Rahman, or no for constant volume"
-            ),
-        };
+            let compressibility: Vec<f64> = parse_list(&raw, "compressibility")?;
+            if compressibility.is_empty()
+                || compressibility.iter().any(|v| !v.is_finite() || *v <= 0.)
+            {
+                bail!("compressibility must contain positive finite values");
+            }
+            (
+                coupling_type,
+                Some(parse_f64(&raw, "tau-p")?),
+                Some(parse_f64(&raw, "ref-p")?),
+                compressibility,
+            )
+        }
+        other => bail!(
+            "unsupported pcoupl='{other}'; the GOTW profile uses Parrinello-Rahman, or no for constant volume"
+        ),
+    };
     let com_mode = raw
         .get("comm-mode")
         .map_or_else(|| "linear".to_owned(), |v| v.to_ascii_lowercase());
@@ -372,7 +376,10 @@ pub fn parse(path: &Path) -> Result<ResolvedMdp> {
 /// with an optional minimisation before them. The files may differ in length,
 /// output cadence and pressure coupling (`no` for a constant-volume stage);
 /// everything else has to agree, because GlySys keeps one model for a run.
-pub fn recipe(stages: &[ResolvedMdp], minimization: Option<&Minimization>) -> Result<SimulationProtocol> {
+pub fn recipe(
+    stages: &[ResolvedMdp],
+    minimization: Option<&Minimization>,
+) -> Result<SimulationProtocol> {
     let Some(last) = stages.last() else {
         bail!("a recipe needs at least one dynamics .mdp file");
     };
@@ -384,7 +391,8 @@ pub fn recipe(stages: &[ResolvedMdp], minimization: Option<&Minimization>) -> Re
             && stage.reference_temperature_k == last.reference_temperature_k
             && stage.com_groups == last.com_groups
             && stage.com_removal_interval_steps == last.com_removal_interval_steps
-            && stage.temperature_coupling_interval_steps == last.temperature_coupling_interval_steps
+            && stage.temperature_coupling_interval_steps
+                == last.temperature_coupling_interval_steps
             && stage.fourier_spacing_angstrom == last.fourier_spacing_angstrom
             && stage.pme_order == last.pme_order
             && stage.ewald_tolerance == last.ewald_tolerance;
@@ -440,7 +448,10 @@ pub fn recipe(stages: &[ResolvedMdp], minimization: Option<&Minimization>) -> Re
     let protocol = SimulationProtocol {
         temperature_k: last.reference_temperature_k[0],
         timestep_fs,
-        equilibration_steps: stages[..stages.len() - 1].iter().map(|stage| stage.steps).sum(),
+        equilibration_steps: stages[..stages.len() - 1]
+            .iter()
+            .map(|stage| stage.steps)
+            .sum(),
         production_steps: last.steps,
         save_every: last
             .compressed_coordinate_interval_steps
@@ -580,7 +591,9 @@ mod tests {
             "production.mdp",
             &format!(
                 "{}{COUPLED}nstxout-compressed = 5000\nvdwtype = Cut-off\nvdw-modifier = None\n",
-                EQUILIBRATION.replace("125000", "250000000").replace("nstenergy = 500", "nstenergy = 5000")
+                EQUILIBRATION
+                    .replace("125000", "250000000")
+                    .replace("nstenergy = 500", "nstenergy = 5000")
             ),
         );
         assert!(is_minimization(&minimisation).unwrap());
@@ -592,7 +605,10 @@ mod tests {
         let protocol = recipe(&stages, Some(&parse_minimization(&minimisation).unwrap())).unwrap();
         let listed = protocol.execution_stages();
         assert_eq!(
-            listed.iter().map(|s| (s.id.as_str(), s.ensemble, s.steps)).collect::<Vec<_>>(),
+            listed
+                .iter()
+                .map(|s| (s.id.as_str(), s.ensemble, s.steps))
+                .collect::<Vec<_>>(),
             vec![
                 ("equilibration_nvt", Ensemble::Nvt, 125_000),
                 ("equilibration_npt", Ensemble::Npt, 250_000),
@@ -603,7 +619,10 @@ mod tests {
         assert_eq!(protocol.save_every, 5000);
         assert_eq!(protocol.com_removal_interval, Some(100));
         assert_eq!(protocol.pressure_tau_ps, Some(5.0));
-        assert_eq!(protocol.pressure_coupling, PressureCoupling::ParrinelloRahman);
+        assert_eq!(
+            protocol.pressure_coupling,
+            PressureCoupling::ParrinelloRahman
+        );
 
         // a constant-volume recipe carries no barostat
         let alone = recipe(&stages[..1], None).unwrap();
