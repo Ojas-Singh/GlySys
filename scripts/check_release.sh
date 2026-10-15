@@ -4,7 +4,8 @@
 #
 #   scripts/check_release.sh [VERSION]   # default: the version in Cargo.toml
 #
-# Run it from a clean checkout of the commit to be tagged.
+# Run it from a clean checkout of the commit to be tagged; then tag it and
+# publish with scripts/publish_crates.sh VERSION (docs/release.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -99,3 +100,4 @@ done
 
 echo "release metadata and crate packages are consistent at $version"
 echo "publish order: ${crates[*]}"
+echo "next: tag v$version, then scripts/publish_crates.sh $version (docs/release.md)"
