@@ -233,7 +233,7 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
                 defaults_seen = true;
                 if fields[0] != "1"
                     || fields[1] != "2"
-                    || fields[2].to_ascii_lowercase() != "yes"
+                    || !fields[2].eq_ignore_ascii_case("yes")
                     || (parse_f64(fields[3], "fudgeLJ")? - 0.5).abs() > 1e-9
                     || (parse_f64(fields[4], "fudgeQQ")? - 0.833333333333).abs() > 1e-9
                 {

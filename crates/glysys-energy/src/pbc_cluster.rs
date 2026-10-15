@@ -832,6 +832,7 @@ impl ClusterPairEngine {
                         low = low.min(slot);
                         high = high.max(slot + 1);
                     };
+                    #[allow(clippy::needless_range_loop)] // `index` also names the cluster's lanes
                     for index in bounds[chunk]..bounds[chunk + 1] {
                         (index * LANES..(index + 1) * LANES).for_each(&mut mark);
                         lists[index]
@@ -840,6 +841,7 @@ impl ClusterPairEngine {
                             .for_each(|&slot| mark(slot as usize));
                     }
                     let mut slots_of_chunk = Vec::new();
+                    #[allow(clippy::needless_range_loop)] // `slot` is also the value collected
                     for slot in low..high {
                         if std::mem::take(&mut seen[slot]) {
                             slots_of_chunk.push(slot as u32);

@@ -30,8 +30,8 @@ mod tests {
     #[test]
     fn shader_is_valid_portable_wgsl() {
         let source = include_str!("energy.wgsl");
-        let module = naga::front::wgsl::parse_str(&source)
-            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -94,11 +94,11 @@ mod execution_tests {
                 )
                 .await
                 .unwrap();
-            assert!((result.components[0][5] + 332.063713299 / 2.).abs() < 0.001);
-            assert!((result.components[1][5] + 332.063713299 / 4.).abs() < 0.001);
+            assert!((result.components[0][5] + 332.063_72 / 2.).abs() < 0.001);
+            assert!((result.components[1][5] + 332.063_72 / 4.).abs() < 0.001);
             let g = result.gradients.unwrap();
-            assert!((g[0][0] + 332.063713299 / 4.).abs() < 0.001);
-            assert!((g[1][0] - 332.063713299 / 4.).abs() < 0.001);
+            assert!((g[0][0] + 332.063_72 / 4.).abs() < 0.001);
+            assert!((g[1][0] - 332.063_72 / 4.).abs() < 0.001);
             // Reuse resident allocations with a smaller batch and scores-only readback.
             let result = gpu
                 .evaluate(
@@ -112,7 +112,7 @@ mod execution_tests {
                 .await
                 .unwrap();
             assert!(result.gradients.is_none());
-            assert!((result.components[0][5] + 332.063713299 / 2.).abs() < 0.001);
+            assert!((result.components[0][5] + 332.063_72 / 2.).abs() < 0.001);
         });
     }
 }

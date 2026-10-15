@@ -118,7 +118,7 @@ fn resident_gpu_free_ou_thermostat_samples_the_requested_temperature() {
         const SEEDS: usize = 1_024;
         const STEPS: u32 = 10_000;
         const BURN_IN: u32 = 1_000;
-        const KB: f32 = 0.00198720425864083;
+        const KB: f32 = 0.001_987_204_2;
         const ACCEL: f32 = 418.4;
         const TARGET_K: f32 = 300.0;
         let words = glysys_dynamics::resident_rng::ResidentThermostatRng::seeded(41, SEEDS).words;

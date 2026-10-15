@@ -33,7 +33,7 @@ pub struct MinimizationProgress {
 impl PreparationMinimizer {
     pub fn new(point: &[f64], budget: usize, pre_relax: bool) -> Result<Self> {
         if point.is_empty()
-            || point.len() % 3 != 0
+            || !point.len().is_multiple_of(3)
             || budget == 0
             || point.iter().any(|x| !x.is_finite())
         {
@@ -177,29 +177,6 @@ impl PreparationMinimizer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn suspended_trials_replay_without_changing_minimum() {
-        let mut optimizer = PreparationMinimizer::new(&[8., -4., 2.], 40, true).unwrap();
-        let mut replay = optimizer.clone();
-        for _ in 0..1000 {
-            let Some(point) = optimizer.request().map(<[f64]>::to_vec) else {
-                break;
-            };
-            assert_eq!(replay.request().unwrap(), point);
-            let value = point.iter().map(|x| 100. * x * x).sum();
-            let gradient: Vec<_> = point.iter().map(|x| 200. * x).collect();
-            optimizer.submit(value, gradient.clone()).unwrap();
-            replay.submit(value, gradient).unwrap();
-        }
-        let result = optimizer.outcome().unwrap();
-        assert_eq!(Some(result.clone()), replay.outcome());
-        assert!(result.iter().all(|x| x.abs() < 1e-6));
-    }
-}
-
 /// Reusable reference/fallback evaluator for preparation. It owns immutable
 /// chemistry once; line-search trials only change coordinates and neighbors.
 pub enum CpuMinimizationEvaluator {
@@ -290,5 +267,28 @@ impl CpuMinimizationEvaluator {
                 Ok((energy.components.total(), energy.gradients))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn suspended_trials_replay_without_changing_minimum() {
+        let mut optimizer = PreparationMinimizer::new(&[8., -4., 2.], 40, true).unwrap();
+        let mut replay = optimizer.clone();
+        for _ in 0..1000 {
+            let Some(point) = optimizer.request().map(<[f64]>::to_vec) else {
+                break;
+            };
+            assert_eq!(replay.request().unwrap(), point);
+            let value = point.iter().map(|x| 100. * x * x).sum();
+            let gradient: Vec<_> = point.iter().map(|x| 200. * x).collect();
+            optimizer.submit(value, gradient.clone()).unwrap();
+            replay.submit(value, gradient).unwrap();
+        }
+        let result = optimizer.outcome().unwrap();
+        assert_eq!(Some(result.clone()), replay.outcome());
+        assert!(result.iter().all(|x| x.abs() < 1e-6));
     }
 }

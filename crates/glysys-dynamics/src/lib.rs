@@ -1,5 +1,9 @@
 //! Molecular dynamics: implicit-solvent Langevin plus explicit-water PBC.
 //! Distances Å, time ps, energy kcal/mol.
+
+// `!(x > limit)` is the integrators' test that also rejects NaN.
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+
 pub mod accumulators;
 pub mod analysis;
 pub mod coupling;
@@ -983,6 +987,7 @@ where
             masses,
         )?;
         constraints.shake_solute_positions_from_old(&old_coordinates, &mut next.coordinates)?;
+        #[allow(clippy::needless_range_loop)] // three arrays indexed by atom
         for i in 0..next.velocities.len() {
             next.velocities[i] = add(
                 next.velocities[i],
@@ -1003,6 +1008,7 @@ where
             "nonfinite energy or gradient; previous checkpoint retained",
         ));
     }
+    #[allow(clippy::needless_range_loop)] // three arrays indexed by atom
     for i in 0..masses.len() {
         let displacement = add(next.coordinates[i], scale(old_coordinates[i], -1.));
         if !finite(&next.coordinates[i]) || !finite(&next.velocities[i]) || norm2(displacement) > 1.
@@ -1462,14 +1468,13 @@ pub fn frame_from_state_wrapped(
         .box_angstrom
         .iter()
         .all(|length| length.is_finite() && *length > 0.0)
-    {
-        if let Ok(box_vectors) = glysys_energy::pbc::BoxVectors::new(
+        && let Ok(box_vectors) = glysys_energy::pbc::BoxVectors::new(
             state.box_angstrom[0],
             state.box_angstrom[1],
             state.box_angstrom[2],
-        ) {
-            frame.coordinates = box_vectors.wrap_molecules(&frame.coordinates, molecules);
-        }
+        )
+    {
+        frame.coordinates = box_vectors.wrap_molecules(&frame.coordinates, molecules);
     }
     frame
 }
@@ -1750,8 +1755,8 @@ mod tests {
             masses.len()
         ];
         let mut rng = resident_rng::ResidentThermostatRng::seeded(20260925, masses.len());
-        let dt = 0.002;
-        let decay = (-dt as f64).exp();
+        let dt = 0.002_f64;
+        let decay = (-dt).exp();
         let mut sum = 0.0;
         let mut samples = 0usize;
         for step in 0..200_000 {

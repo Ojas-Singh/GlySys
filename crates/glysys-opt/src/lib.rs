@@ -416,8 +416,7 @@ where
     let started = Instant::now();
     let pending = seeds
         .into_iter()
-        .enumerate()
-        .map(|(_index, seed)| {
+        .map(|seed| {
             let mut position = seed.position;
             let mut velocity = vec![0.0; dimension];
             for (axis, ((lower, upper), velocity_axis)) in
@@ -643,10 +642,9 @@ where
                         .unwrap_or(start)
                 })
                 .collect::<Vec<_>>();
-            for swarm in 0..config.swarms {
+            for (swarm, &source) in bests.iter().enumerate() {
                 let destination = (swarm + 1) % config.swarms;
                 let start = destination * config.particles_per_swarm;
-                let source = bests[swarm];
                 for offset in 0..config.migration_count.min(config.particles_per_swarm) {
                     let index = start + config.particles_per_swarm - 1 - offset;
                     particles[index].context = particles[source].best_context.clone();

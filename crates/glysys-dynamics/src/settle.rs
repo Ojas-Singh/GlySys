@@ -600,7 +600,7 @@ impl SettleWaters {
             }
             let d = sub(coords[a], coords[b]);
             let target = dot(d, d).sqrt();
-            if !target.is_finite() || target < 0.3 || target > 3.0 {
+            if !target.is_finite() || !(0.3..=3.0).contains(&target) {
                 return Err(invalid("unphysical solute bond length"));
             }
             if masses[a] <= 0. || masses[b] <= 0. {
@@ -629,7 +629,7 @@ impl SettleWaters {
                 }
                 let d = sub(coords[a], coords[b]);
                 let target = dot(d, d).sqrt();
-                if !target.is_finite() || target < 0.3 || target > 3.0 {
+                if !target.is_finite() || !(0.3..=3.0).contains(&target) {
                     return Err(invalid(
                         "reference water geometry is unphysical; minimize before constraining",
                     ));
@@ -844,12 +844,12 @@ impl SettleWaters {
         old_coords: &[Vec3],
         drifted: &[Vec3],
         coords: &mut [Vec3],
-        mut velocities: Option<&mut [Vec3]>,
+        velocities: Option<&mut [Vec3]>,
         masses: &[f64],
         inverse_dt: f64,
     ) -> Result<()> {
         self.settle_positions(old_coords, drifted, coords, masses)?;
-        if let Some(velocities) = velocities.as_deref_mut() {
+        if let Some(velocities) = velocities {
             if !inverse_dt.is_finite() || inverse_dt <= 0. {
                 return Err(invalid("SETTLE velocity projection requires dt > 0"));
             }

@@ -1306,10 +1306,12 @@ impl<'a> ExplicitSimulation<'a> {
         // the complete pre-step state (including both RNG streams) without
         // cloning the solvated system on ordinary steps.
         let barostat_snapshot = (ensemble == Ensemble::Npt
-            && self.state.barostat_step_counter.saturating_add(1)
-                % self.state.protocol.barostat_interval
-                == 0)
-            .then(|| (self.state.clone(), self.pairs.clone()));
+            && self
+                .state
+                .barostat_step_counter
+                .saturating_add(1)
+                .is_multiple_of(self.state.protocol.barostat_interval))
+        .then(|| (self.state.clone(), self.pairs.clone()));
         match ensemble {
             Ensemble::Nve => self.nve_step(),
             Ensemble::Nvt => self.nvt_step(),
@@ -1324,14 +1326,17 @@ impl<'a> ExplicitSimulation<'a> {
                 self.nvt_step()?;
                 self.state.barostat_step_counter =
                     self.state.barostat_step_counter.saturating_add(1);
-                if self.state.barostat_step_counter % self.state.protocol.barostat_interval == 0 {
-                    if let Err(error) = self.try_barostat(adaptation_enabled) {
-                        if let Some((state, pairs)) = barostat_snapshot {
-                            self.state = state;
-                            self.pairs = pairs;
-                        }
-                        return Err(error);
+                if self
+                    .state
+                    .barostat_step_counter
+                    .is_multiple_of(self.state.protocol.barostat_interval)
+                    && let Err(error) = self.try_barostat(adaptation_enabled)
+                {
+                    if let Some((state, pairs)) = barostat_snapshot {
+                        self.state = state;
+                        self.pairs = pairs;
                     }
+                    return Err(error);
                 }
                 Ok(())
             }
@@ -2167,8 +2172,8 @@ impl<'a> ExplicitSimulation<'a> {
             return Err(invalid("invalid external dynamics state"));
         }
         if let Some(settle) = &self.settle {
-            let position_error = settle.max_violation(&coordinates);
-            let velocity_error = settle.max_velocity_violation(&coordinates, &velocities);
+            let position_error = settle.max_violation(coordinates);
+            let velocity_error = settle.max_velocity_violation(coordinates, velocities);
             if !position_error.is_finite()
                 || !velocity_error.is_finite()
                 || position_error > 5e-4
@@ -2752,7 +2757,7 @@ mod tests {
         let mut temps = Vec::new();
         for _ in 0..400 {
             sim.step().unwrap();
-            if sim.state.step % 2 == 0 {
+            if sim.state.step.is_multiple_of(2) {
                 temps.push(sim.frame().temperature_k);
             }
         }
@@ -3051,8 +3056,8 @@ mod tests {
         // The box keeps its shape under isotropic coupling.
         let initial = system.box_angstrom();
         let ratio = sim.state.box_angstrom[0] / initial[0];
-        for d in 1..3 {
-            assert!((sim.state.box_angstrom[d] / initial[d] / ratio - 1.).abs() < 1e-9);
+        for (length, start) in sim.state.box_angstrom.iter().zip(initial).skip(1) {
+            assert!((length / start / ratio - 1.).abs() < 1e-9);
         }
         assert!(
             sim.settle

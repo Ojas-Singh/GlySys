@@ -440,6 +440,7 @@ pub struct ScalarObservation {
     pub readback_bytes: u64,
 }
 
+#[allow(clippy::large_enum_variant)] // one driver per session, never moved in a hot loop
 enum SimulationDriver {
     ExplicitCpu(ExplicitSimulation<'static>),
     ImplicitCpu(CpuSimulation<'static>),
@@ -1774,10 +1775,10 @@ impl SimulationSession {
                     virial,
                 )?;
                 *device_step = next_step;
-                if let Some(rng) = &mut simulation.state.resident_rng {
-                    if resident.rng_words.len() == rng.words.len() {
-                        rng.words.clone_from(&resident.rng_words);
-                    }
+                if let Some(rng) = &mut simulation.state.resident_rng
+                    && resident.rng_words.len() == rng.words.len()
+                {
+                    rng.words.clone_from(&resident.rng_words);
                 }
                 self.gpu_advances = self.gpu_advances.saturating_add(1);
                 let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
@@ -1857,10 +1858,9 @@ impl SimulationSession {
                 *device_step = next_step;
                 if let (Some(state_rng), Some(batch_rng)) =
                     (&mut simulation.state.resident_rng, batch.rng_words)
+                    && batch_rng.len() == state_rng.words.len()
                 {
-                    if batch_rng.len() == state_rng.words.len() {
-                        state_rng.words = batch_rng;
-                    }
+                    state_rng.words = batch_rng;
                 }
                 self.gpu_advances = self.gpu_advances.saturating_add(1);
                 let save = next_step.is_multiple_of(simulation.state.protocol.save_every)
@@ -2321,7 +2321,7 @@ impl HydrationSession {
     pub fn capacity(&self) -> usize {
         match &self.driver {
             HydrationDriver::Cpu(_) => 1,
-            HydrationDriver::Gpu { resident, .. } => resident.capacity.max(1) as usize,
+            HydrationDriver::Gpu { resident, .. } => resident.capacity.max(1),
         }
     }
 
@@ -2395,6 +2395,8 @@ impl HydrationSession {
             .map_err(|e| SessionError::new(SessionErrorKind::InvalidInput, e.to_string(), false))?;
         let points = dims.iter().product::<usize>();
         let mut best = vec![None; points];
+        // `index` is also the grid point the poses are built at
+        #[allow(clippy::needless_range_loop)]
         for index in 0..points {
             let poses = PhysicalProbe::poses(request, dims, index);
             let scores = self.evaluate_poses(&poses, request.cutoff).await?;
@@ -2561,8 +2563,10 @@ impl StericSession {
             .create_steric(library, capacity)
             .await
             .map_err(SessionError::from_gpu)?;
-        let mut options = ExecutionOptions::default();
-        options.backend = BackendPreference::Gpu;
+        let options = ExecutionOptions {
+            backend: BackendPreference::Gpu,
+            ..ExecutionOptions::default()
+        };
         Ok(Self {
             resident,
             diagnostics: ExecutionDiagnostics::gpu(&options, context),

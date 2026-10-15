@@ -16,20 +16,15 @@ pub const BUFFER_BUDGET: u64 = LOW_MEMORY_BUDGET;
 /// by the requested workload; OOM is handled by the existing batch fallback.
 pub const ADAPTIVE_MEMORY_BUDGET: u64 = u64::MAX;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MemoryProfile {
     /// Allocate the requested workload subject to device limits.
+    #[default]
     Adaptive,
     /// Preserve the old 256 MiB ceiling for low-memory devices or tests.
     LowMemory,
     /// Caller-supplied aggregate allocation budget.
     Explicit(u64),
-}
-
-impl Default for MemoryProfile {
-    fn default() -> Self {
-        Self::Adaptive
-    }
 }
 
 impl MemoryProfile {

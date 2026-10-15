@@ -292,7 +292,7 @@ impl PbcPacking {
         }
         let bonded_offsets = [bonds, angles, torsions, restraints, ends];
         let bonded_counts = [
-            (angles - bonds) as u32 / 1,
+            ((angles - bonds) as u32),
             (torsions - angles) as u32 / 2,
             (restraints - torsions) as u32 / 2,
             water_count,
@@ -2911,8 +2911,8 @@ impl ResidentPbc {
         velocity_bytes: &[u8],
         box_xyz: [f32; 3],
     ) -> ResidentDynamicsState {
-        let sys: &[f32] = bytemuck::cast_slice(&coord_bytes);
-        let vel: &[f32] = bytemuck::cast_slice(&velocity_bytes);
+        let sys: &[f32] = bytemuck::cast_slice(coord_bytes);
+        let vel: &[f32] = bytemuck::cast_slice(velocity_bytes);
         let mut coordinates = Vec::with_capacity(self.n as usize);
         let mut velocities = Vec::with_capacity(self.n as usize);
         let mut rng_words = Vec::with_capacity(self.n as usize);

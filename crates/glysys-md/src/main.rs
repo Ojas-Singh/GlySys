@@ -500,7 +500,7 @@ fn apply_cli_overrides(
 }
 
 fn configure_threads(threads: Option<usize>) -> Result<usize> {
-    let requested = threads.unwrap_or_else(|| rayon::current_num_threads());
+    let requested = threads.unwrap_or_else(rayon::current_num_threads);
     if requested == 0 {
         bail!("--threads must be positive");
     }
@@ -1130,7 +1130,7 @@ fn median(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
     } else {
         values[values.len() / 2]
