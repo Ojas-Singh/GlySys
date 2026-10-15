@@ -1,0 +1,117 @@
+name: Release
+
+# Runs on a version tag only (or by hand for an existing tag). The crates are
+# published here only when the repository has a CARGO_REGISTRY_TOKEN secret;
+# without it the publish job skips with a notice, and the crates are published
+# from a maintainer machine with scripts/publish_crates.sh (docs/release.md).
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version of an existing tag, without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', inputs.version) || github.ref }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The GPU tests run on lavapipe, Mesa's software Vulkan device.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+      - run: cd data/amber && sha256sum -c CHECKSUMS.sha256
+      - name: Check release metadata and package every crate
+        run: ./scripts/check_release.sh "${RELEASE_VERSION#v}"
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-22.04
+    outputs:
+      published: ${{ steps.token.outputs.present }}
+    steps:
+      - name: Look for the crates.io token
+        id: token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=crates.io publication skipped::This repository has no CARGO_REGISTRY_TOKEN secret, so nothing was published. Publish from a maintainer machine with scripts/publish_crates.sh ${RELEASE_VERSION#v} (docs/release.md), then re-run this workflow to attach the crates to the GitHub release."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.token.outputs.present == 'true'
+        with:
+          toolchain: "1.97"
+      - name: Publish crates in dependency order
+        if: steps.token.outputs.present == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./scripts/publish_crates.sh "${RELEASE_VERSION#v}"
+
+  github-release:
+    needs: [validate, publish]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Collect the published crates and their checksums
+        id: release
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          missing=()
+          while read -r crate; do
+            index="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
+            cksum=$(curl --fail --silent "$index" | jq -r --arg v "$version" 'select(.vers == $v) | .cksum' || true)
+            if [ -z "$cksum" ]; then
+              missing+=("$crate")
+              continue
+            fi
+            curl --fail --silent --show-error --location -o "dist/${crate}-${version}.crate" \
+              "https://static.crates.io/crates/${crate}/${crate}-${version}.crate"
+            echo "${cksum}  dist/${crate}-${version}.crate" | sha256sum --check --quiet
+          done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/release-crates.txt)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice title=Crates not attached::Not on crates.io at ${version} yet: ${missing[*]}. Re-run this workflow (Run workflow, version ${version}) after publishing to attach them."
+          fi
+          if compgen -G "dist/*.crate" >/dev/null; then
+            (cd dist && sha256sum -- *.crate > SHA256SUMS)
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.release.outputs.version }}
+          name: GlySys ${{ steps.release.outputs.version }}
+          generate_release_notes: true
+          files: dist/*

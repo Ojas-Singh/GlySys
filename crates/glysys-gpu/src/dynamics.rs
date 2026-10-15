@@ -247,8 +247,8 @@ impl ResidentDynamics {
         }
         let reservation = context.reserve(additional)?;
         let device = &energy.device;
-        crate::push_error_scope(&device, wgpu::ErrorFilter::OutOfMemory);
-        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(device, wgpu::ErrorFilter::OutOfMemory);
+        crate::push_error_scope(device, wgpu::ErrorFilter::Validation);
         let alloc = |size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -436,7 +436,7 @@ impl ResidentDynamics {
         // failures (backend translation, e.g. Metal library creation) need
         // different fixes, and the adapter identity matters for both.
         let adapter = crate::adapter::describe(&energy.adapter_info);
-        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(device, wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("BAOAB"),
             source: wgpu::ShaderSource::Wgsl(
@@ -448,7 +448,7 @@ impl ResidentDynamics {
                 .into(),
             ),
         });
-        if let Some(e) = crate::pop_error_scope(&device).await {
+        if let Some(e) = crate::pop_error_scope(device).await {
             return Err(Error::Execution(format!(
                 "GlySys dynamics shader rejected on {adapter}: {e}"
             )));
@@ -461,7 +461,7 @@ impl ResidentDynamics {
             "lf_drift_thermostat_snapshot",
             "lf_position_projection",
         ] {
-            crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
+            crate::push_error_scope(device, wgpu::ErrorFilter::Validation);
             pipelines.push(
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(name),
@@ -472,7 +472,7 @@ impl ResidentDynamics {
                     cache: None,
                 }),
             );
-            if let Some(e) = crate::pop_error_scope(&device).await {
+            if let Some(e) = crate::pop_error_scope(device).await {
                 return Err(Error::Execution(format!(
                     "GlySys dynamics pipeline '{name}' rejected on {adapter}: {e}"
                 )));
@@ -487,8 +487,8 @@ impl ResidentDynamics {
         ] {
             context.record_pipeline(name);
         }
-        let validation = crate::pop_error_scope(&device).await;
-        let allocation = crate::pop_error_scope(&device).await;
+        let validation = crate::pop_error_scope(device).await;
+        let allocation = crate::pop_error_scope(device).await;
         if let Some(e) = validation {
             return Err(Error::Execution(e.to_string()));
         }
@@ -1265,7 +1265,7 @@ impl ResidentDynamics {
         }
         let device = &self.energy.device;
         let queue = &self.energy.queue;
-        crate::push_error_scope(&device, wgpu::ErrorFilter::Validation);
+        crate::push_error_scope(device, wgpu::ErrorFilter::Validation);
         if rng.is_none() {
             queue.write_buffer(&self.noise, 0, bytemuck::cast_slice(noise));
         }
@@ -1318,7 +1318,7 @@ impl ResidentDynamics {
         queue.submit([encoder.finish()]);
         let host_enqueue_wait_ms = integration_started.elapsed().as_secs_f64() * 1000.0;
         let readback_started = Instant::now();
-        if let Some(e) = crate::pop_error_scope(&device).await {
+        if let Some(e) = crate::pop_error_scope(device).await {
             return Err(Error::Execution(e.to_string()));
         }
         let slice = self

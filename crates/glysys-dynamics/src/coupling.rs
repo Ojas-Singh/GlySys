@@ -210,7 +210,10 @@ impl CouplingPlan {
                     let mut groups = Vec::new();
                     for name in &protocol.com_groups {
                         let group = members(selection(name)?, is_water);
-                        if group.iter().any(|&atom| std::mem::replace(&mut seen[atom], true)) {
+                        if group
+                            .iter()
+                            .any(|&atom| std::mem::replace(&mut seen[atom], true))
+                        {
                             return Err(invalid("center-of-mass groups overlap"));
                         }
                         groups.push(group);
@@ -224,7 +227,8 @@ impl CouplingPlan {
                 )));
             }
         };
-        let com_groups: Vec<Vec<usize>> = com_groups.into_iter().filter(|g| !g.is_empty()).collect();
+        let com_groups: Vec<Vec<usize>> =
+            com_groups.into_iter().filter(|g| !g.is_empty()).collect();
         let com_interval = if com_groups.is_empty() {
             0
         } else {
@@ -250,7 +254,9 @@ impl CouplingPlan {
                 }
             }
             if dof.iter().zip(&unremoved).any(|(d, u)| *d <= 0. && *u > 0.) {
-                return Err(invalid("a temperature group has no degrees of freedom left"));
+                return Err(invalid(
+                    "a temperature group has no degrees of freedom left",
+                ));
             }
         }
 
@@ -274,7 +280,10 @@ impl CouplingPlan {
             });
         }
 
-        let shortest_tau = groups.iter().map(|g| g.tau_ps).fold(f64::INFINITY, f64::min);
+        let shortest_tau = groups
+            .iter()
+            .map(|g| g.tau_ps)
+            .fold(f64::INFINITY, f64::min);
         let temperature_interval = interval(
             protocol.temperature_coupling_interval,
             LONGEST_TEMPERATURE_INTERVAL,
@@ -337,7 +346,9 @@ impl CouplingPlan {
         for (index, group) in self.groups.iter().enumerate() {
             let old = state.thermostat_velocity[index];
             let new = old
-                + dt_ps * group.inverse_mass() * (temperatures[index] - group.reference_temperature_k);
+                + dt_ps
+                    * group.inverse_mass()
+                    * (temperatures[index] - group.reference_temperature_k);
             state.thermostat_velocity[index] = new;
             state.thermostat_position[index] += 0.5 * dt_ps * (old + new);
         }
@@ -354,7 +365,8 @@ impl CouplingPlan {
                 let velocity = state.thermostat_velocity[index];
                 group.degrees_of_freedom
                     * kt
-                    * (0.5 * velocity * velocity / (group.inverse_mass() * group.reference_temperature_k)
+                    * (0.5 * velocity * velocity
+                        / (group.inverse_mass() * group.reference_temperature_k)
                         + state.thermostat_position[index])
             })
             .sum()
@@ -403,7 +415,9 @@ fn interval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ensemble, PressureCoupling, SimulationStage, SolventModel, Thermostat, ThermostatGroup};
+    use crate::{
+        Ensemble, PressureCoupling, SimulationStage, SolventModel, Thermostat, ThermostatGroup,
+    };
 
     fn protocol() -> SimulationProtocol {
         SimulationProtocol {

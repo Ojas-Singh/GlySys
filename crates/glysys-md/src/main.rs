@@ -500,7 +500,7 @@ fn apply_cli_overrides(
 }
 
 fn configure_threads(threads: Option<usize>) -> Result<usize> {
-    let requested = threads.unwrap_or_else(|| rayon::current_num_threads());
+    let requested = threads.unwrap_or_else(rayon::current_num_threads);
     if requested == 0 {
         bail!("--threads must be positive");
     }
@@ -782,9 +782,8 @@ fn run_loop(
     if !(checkpoint_ps.is_finite() && checkpoint_ps > 0.) {
         bail!("--checkpoint-ps must be positive");
     }
-    let checkpoint_interval = ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001))
-        .round() as usize)
-        .max(1);
+    let checkpoint_interval =
+        ((checkpoint_ps / (session.state().protocol.timestep_fs * 0.001)).round() as usize).max(1);
     let masses: Vec<_> = system.atoms().iter().map(|atom| atom.mass()).collect();
     let starting_step = session.current_step();
     let simulation_started = Instant::now();
@@ -1131,7 +1130,7 @@ fn median(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
     } else {
         values[values.len() / 2]

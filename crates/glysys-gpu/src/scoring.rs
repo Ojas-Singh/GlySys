@@ -74,10 +74,10 @@ impl PreparedGpuEvaluator {
                 .evaluate(batch, request)
                 .map_err(|e| Error::Execution(e.to_string()));
         }
-        if let Some(selected) = &request.components {
-            if selected.iter().any(|n| !TERMS.contains(&n.as_str())) {
-                return Err(Error::Input("unknown requested component"));
-            }
+        if let Some(selected) = &request.components
+            && selected.iter().any(|n| !TERMS.contains(&n.as_str()))
+        {
+            return Err(Error::Input("unknown requested component"));
         }
         let n = self.reference.scene.system.atom_count();
         let movable = vec![true; n];

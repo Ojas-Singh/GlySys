@@ -12,6 +12,7 @@ use crate::{
 };
 use glysys::ParameterizedSystem;
 
+#[allow(clippy::large_enum_variant)] // one driver per session, never moved in a hot loop
 enum Driver<'a> {
     Explicit(ExplicitSimulation<'a>),
     Implicit(CpuSimulation<'a>),

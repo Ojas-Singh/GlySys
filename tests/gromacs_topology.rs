@@ -38,7 +38,9 @@ fn charge_scales(topology: &str) -> Vec<(String, usize)> {
     for row in section(topology, "pairs") {
         assert_eq!(row.len(), 8, "pair row {row:?}");
         assert_eq!(row[2], "2", "pairs carry their own scale factors");
-        *counts.entry(format!("{:.4}", row[3].parse::<f64>().unwrap())).or_insert(0) += 1;
+        *counts
+            .entry(format!("{:.4}", row[3].parse::<f64>().unwrap()))
+            .or_insert(0) += 1;
     }
     counts.into_iter().collect()
 }
@@ -77,7 +79,11 @@ fn glycan_one_four_pairs_carry_the_glycam_scale_factors() {
         assert!((charges.1 - atoms[second - 1].charge()).abs() < 1e-7);
     }
     let scales = charge_scales(&top);
-    let unscaled = scales.iter().find(|(scale, _)| scale == "1.0000").unwrap().1;
+    let unscaled = scales
+        .iter()
+        .find(|(scale, _)| scale == "1.0000")
+        .unwrap()
+        .1;
     assert!(unscaled > 20 * (rows.len() - unscaled), "{scales:?}");
 }
 
@@ -104,7 +110,11 @@ fn every_pair_of_atoms_in_a_water_is_excluded() {
     assert_eq!(excluded.len(), 3 * waters);
     for row in section(&top, "settles") {
         let oxygen: usize = row[0].parse().unwrap();
-        for pair in [(oxygen, oxygen + 1), (oxygen, oxygen + 2), (oxygen + 1, oxygen + 2)] {
+        for pair in [
+            (oxygen, oxygen + 1),
+            (oxygen, oxygen + 2),
+            (oxygen + 1, oxygen + 2),
+        ] {
             assert!(excluded.contains(&pair), "water at {oxygen} lacks {pair:?}");
         }
     }

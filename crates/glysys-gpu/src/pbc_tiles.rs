@@ -390,9 +390,8 @@ impl TilePacking {
                     if b <= a {
                         continue;
                     }
-                    let qq = COULOMB
-                        * f64::from(packing.params[a][0])
-                        * f64::from(packing.params[b][0]);
+                    let qq =
+                        COULOMB * f64::from(packing.params[a][0]) * f64::from(packing.params[b][0]);
                     if qq == 0.0 {
                         continue;
                     }

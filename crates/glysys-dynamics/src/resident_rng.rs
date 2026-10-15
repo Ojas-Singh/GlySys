@@ -72,6 +72,8 @@ mod tests {
         let mut cross = 0.;
         let mut count = 0.;
         for step in 0..8192 {
+            // the stream and `previous` are both indexed by atom
+            #[allow(clippy::needless_range_loop)]
             for atom in 0..atoms {
                 let p = rng.normal3(atom);
                 sum += p.x;

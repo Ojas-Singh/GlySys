@@ -233,7 +233,7 @@ fn parse_topology(path: &Path) -> Result<ParsedTop> {
                 defaults_seen = true;
                 if fields[0] != "1"
                     || fields[1] != "2"
-                    || fields[2].to_ascii_lowercase() != "yes"
+                    || !fields[2].eq_ignore_ascii_case("yes")
                     || (parse_f64(fields[3], "fudgeLJ")? - 0.5).abs() > 1e-9
                     || (parse_f64(fields[4], "fudgeQQ")? - 0.833333333333).abs() > 1e-9
                 {
@@ -413,10 +413,7 @@ fn expected_pairs(system: &ParameterizedSystem) -> BTreeMap<(usize, usize), (f64
             .sqrt()
                 * 4.184
                 / scnb;
-            (
-                canonical_pair(pair[0] + 1, pair[1] + 1),
-                (1.0 / scee, well),
-            )
+            (canonical_pair(pair[0] + 1, pair[1] + 1), (1.0 / scee, well))
         })
         .collect()
 }
@@ -427,9 +424,12 @@ fn same_pairs(
 ) -> bool {
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1e-6);
     found.len() == expected.len()
-        && found.iter().zip(expected).all(|((pair, scales), (other, wanted))| {
-            pair == other && close(scales.0, wanted.0) && close(scales.1, wanted.1)
-        })
+        && found
+            .iter()
+            .zip(expected)
+            .all(|((pair, scales), (other, wanted))| {
+                pair == other && close(scales.0, wanted.0) && close(scales.1, wanted.1)
+            })
 }
 
 fn is_water_atom(system: &ParameterizedSystem, atom: usize) -> bool {
@@ -561,7 +561,13 @@ pub fn verify_bundle(
         .collect();
     let expected_exclusions: BTreeSet<(usize, usize)> = expected_water_oxygens
         .iter()
-        .flat_map(|&oxygen| [(oxygen, oxygen + 1), (oxygen, oxygen + 2), (oxygen + 1, oxygen + 2)])
+        .flat_map(|&oxygen| {
+            [
+                (oxygen, oxygen + 1),
+                (oxygen, oxygen + 2),
+                (oxygen + 1, oxygen + 2),
+            ]
+        })
         .collect();
     if top.settles != expected_water_oxygens || top.exclusions != expected_exclusions {
         bail!("GROMACS SETTLE/exclusion declarations differ from the snapshot");

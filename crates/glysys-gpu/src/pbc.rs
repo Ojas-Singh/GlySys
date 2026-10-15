@@ -292,7 +292,7 @@ impl PbcPacking {
         }
         let bonded_offsets = [bonds, angles, torsions, restraints, ends];
         let bonded_counts = [
-            (angles - bonds) as u32 / 1,
+            ((angles - bonds) as u32),
             (torsions - angles) as u32 / 2,
             (restraints - torsions) as u32 / 2,
             water_count,
@@ -2796,7 +2796,11 @@ impl ResidentPbc {
     /// resident state must come from an evaluation with energies (any static
     /// evaluation, or the end of an earlier advance). The final step
     /// publishes energies and the pressure.
-    pub async fn dynamics_steps_leapfrog(&self, first_step: u64, steps: usize) -> Result<(), Error> {
+    pub async fn dynamics_steps_leapfrog(
+        &self,
+        first_step: u64,
+        steps: usize,
+    ) -> Result<(), Error> {
         let Some(engine) = &self.leapfrog else {
             return Err(Error::Input("leap-frog integrator is not configured"));
         };
@@ -2907,8 +2911,8 @@ impl ResidentPbc {
         velocity_bytes: &[u8],
         box_xyz: [f32; 3],
     ) -> ResidentDynamicsState {
-        let sys: &[f32] = bytemuck::cast_slice(&coord_bytes);
-        let vel: &[f32] = bytemuck::cast_slice(&velocity_bytes);
+        let sys: &[f32] = bytemuck::cast_slice(coord_bytes);
+        let vel: &[f32] = bytemuck::cast_slice(velocity_bytes);
         let mut coordinates = Vec::with_capacity(self.n as usize);
         let mut velocities = Vec::with_capacity(self.n as usize);
         let mut rng_words = Vec::with_capacity(self.n as usize);

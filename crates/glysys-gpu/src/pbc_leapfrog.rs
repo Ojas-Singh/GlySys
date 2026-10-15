@@ -88,10 +88,10 @@ impl LeapfrogCoupling {
         StepPlan {
             thermostat: self.thermostat && acts_on(step, self.temperature_interval),
             barostat: self.barostat && acts_on(step, self.pressure_interval),
-            pressure: self.barostat && step % pressure_interval == 0,
-            com: self.com_interval > 0 && step % self.com_interval as u64 == 0,
-            wrap: step % WRAP_INTERVAL == 0,
-            virial_next: self.barostat && (step + 1) % pressure_interval == 0,
+            pressure: self.barostat && step.is_multiple_of(pressure_interval),
+            com: self.com_interval > 0 && step.is_multiple_of(self.com_interval as u64),
+            wrap: step.is_multiple_of(WRAP_INTERVAL),
+            virial_next: self.barostat && (step + 1).is_multiple_of(pressure_interval),
         }
     }
 

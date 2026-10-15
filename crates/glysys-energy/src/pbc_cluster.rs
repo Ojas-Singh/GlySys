@@ -514,7 +514,10 @@ impl ClusterPairEngine {
         // |dL| covers atoms re-imaged across the changed box.
         let change = {
             let (now, then) = (box_vec.as_array(), built.as_array());
-            (0..3).map(|d| (now[d] - then[d]).powi(2)).sum::<f64>().sqrt()
+            (0..3)
+                .map(|d| (now[d] - then[d]).powi(2))
+                .sum::<f64>()
+                .sqrt()
         };
         let allowance = 0.5 * (self.skin - 3.0 * change);
         if allowance <= 0. {
@@ -829,11 +832,16 @@ impl ClusterPairEngine {
                         low = low.min(slot);
                         high = high.max(slot + 1);
                     };
+                    #[allow(clippy::needless_range_loop)] // `index` also names the cluster's lanes
                     for index in bounds[chunk]..bounds[chunk + 1] {
                         (index * LANES..(index + 1) * LANES).for_each(&mut mark);
-                        lists[index].atoms.iter().for_each(|&slot| mark(slot as usize));
+                        lists[index]
+                            .atoms
+                            .iter()
+                            .for_each(|&slot| mark(slot as usize));
                     }
                     let mut slots_of_chunk = Vec::new();
+                    #[allow(clippy::needless_range_loop)] // `slot` is also the value collected
                     for slot in low..high {
                         if std::mem::take(&mut seen[slot]) {
                             slots_of_chunk.push(slot as u32);
@@ -1962,7 +1970,8 @@ mod tests {
         for _ in 0..5 {
             scale *= 1.0 - 2e-4;
         }
-        let small = BoxVectors::new(box_vec.x * scale, box_vec.y * scale, box_vec.z * scale).unwrap();
+        let small =
+            BoxVectors::new(box_vec.x * scale, box_vec.y * scale, box_vec.z * scale).unwrap();
         let scaled: Vec<Vec3> = coordinates
             .iter()
             .map(|p| Vec3 {
@@ -1972,15 +1981,24 @@ mod tests {
             })
             .collect();
         let mut kept = zeros();
-        let kept_totals = engine.evaluate_into(&scaled, &small, &mut kept, true).unwrap();
-        assert_eq!(engine.rebuild_count(), 1, "a 0.1% box change kept the lists");
+        let kept_totals = engine
+            .evaluate_into(&scaled, &small, &mut kept, true)
+            .unwrap();
+        assert_eq!(
+            engine.rebuild_count(),
+            1,
+            "a 0.1% box change kept the lists"
+        );
         let mut fresh_engine = ClusterPairEngine::new(&system, 9.0, 1.5, 78.5).unwrap();
         let mut fresh = zeros();
         let fresh_totals = fresh_engine
             .evaluate_into(&scaled, &small, &mut fresh, true)
             .unwrap();
         let scale_of = |values: &[Vec3]| {
-            (values.iter().map(|g| g.x * g.x + g.y * g.y + g.z * g.z).sum::<f64>()
+            (values
+                .iter()
+                .map(|g| g.x * g.x + g.y * g.y + g.z * g.z)
+                .sum::<f64>()
                 / values.len() as f64)
                 .sqrt()
         };
@@ -2008,7 +2026,9 @@ mod tests {
                 z: p.z * 0.98,
             })
             .collect();
-        engine.evaluate_into(&shrunk, &far, &mut zeros(), false).unwrap();
+        engine
+            .evaluate_into(&shrunk, &far, &mut zeros(), false)
+            .unwrap();
         assert_eq!(engine.rebuild_count(), 2);
     }
 

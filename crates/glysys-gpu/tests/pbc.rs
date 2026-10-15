@@ -12,6 +12,10 @@
 //! Environment: default wgpu adapter selection (lavapipe `lvp` on headless
 //! CI; any real adapter also works for these correctness tests). For a
 //! forced software device: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
+
+// GPU tests hold GPU_TEST_LOCK for their whole body, awaits included: the
+// lock serialises them on the one device, which is what it is for.
+#![allow(clippy::await_holding_lock)]
 use glysys::{BuildOptions, ParameterizedSystem, SystemBuilder, Vec3};
 use glysys_dynamics::explicit::{ExplicitSimulation, kinetic_energy};
 use glysys_dynamics::{ConstraintModel, Ensemble, SimulationProtocol, SolventModel, Thermostat};

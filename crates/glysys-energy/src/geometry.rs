@@ -217,6 +217,7 @@ impl RigidTransform {
     pub fn apply(&self, p: Vec3) -> Vec3 {
         let a = [p.x, p.y, p.z];
         let mut v = [0.; 3];
+        #[allow(clippy::needless_range_loop)] // matrix indices, as in the algebra
         for i in 0..3 {
             v[i] = (0..3).map(|j| self.rotation[i][j] * a[j]).sum();
         }

@@ -87,6 +87,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::identity_op)] // voxel indices written out as (x * n + y) * n + z
     fn occupancy_bins_wrapped_positions() {
         let mut acc = WaterOccupancy::new([10., 10., 10.], 1.);
         assert_eq!(acc.dimensions, [10, 10, 10]);

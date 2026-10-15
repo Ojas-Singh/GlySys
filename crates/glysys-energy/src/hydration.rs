@@ -59,7 +59,7 @@ pub fn is_gc_request(request: &HydrationRequest) -> bool {
 
 pub fn gc_chemical_potential(request: &HydrationRequest) -> Result<f64> {
     let mu = request.chemical_potential.unwrap_or(GC_DEFAULT_MU_KCAL_MOL);
-    if !mu.is_finite() || mu < -20. || mu > 5. {
+    if !mu.is_finite() || !(-20. ..=5.).contains(&mu) {
         return Err(invalid("invalid GC chemical potential"));
     }
     Ok(mu)
@@ -67,7 +67,7 @@ pub fn gc_chemical_potential(request: &HydrationRequest) -> Result<f64> {
 
 pub fn gc_step_count(request: &HydrationRequest) -> Result<usize> {
     let steps = request.gc_steps.unwrap_or(GC_DEFAULT_STEPS);
-    if steps < 1_000 || steps > 500_000 {
+    if !(1_000..=500_000).contains(&steps) {
         return Err(invalid("invalid GC step count"));
     }
     Ok(steps)
@@ -532,12 +532,12 @@ impl PhysicalProbe {
                             {
                                 continue;
                             }
-                            if let Some(e) = self.score(next, cutoff) {
-                                if e.total() < score.total() {
-                                    pose = next;
-                                    score = e;
-                                    changed = true;
-                                }
+                            if let Some(e) = self.score(next, cutoff)
+                                && e.total() < score.total()
+                            {
+                                pose = next;
+                                score = e;
+                                changed = true;
                             }
                         }
                     }
@@ -879,12 +879,12 @@ impl PhysicalProbe {
                         {
                             continue;
                         }
-                        if let Some(e) = self.score(next, request.cutoff) {
-                            if e.total() < score.total() {
-                                pose = next;
-                                score = e;
-                                changed = true;
-                            }
+                        if let Some(e) = self.score(next, request.cutoff)
+                            && e.total() < score.total()
+                        {
+                            pose = next;
+                            score = e;
+                            changed = true;
                         }
                     }
                 }
@@ -1047,6 +1047,110 @@ impl HydrationField {
             text.push('\n');
         }
         text + "attribute \"dep\" string \"positions\"\nobject \"probe energy\" class field\ncomponent \"positions\" value 1\ncomponent \"connections\" value 2\ncomponent \"data\" value 3\n"
+    }
+}
+
+/// Imported and deposited sites retain provenance without acquiring probe energies.
+pub struct SiteProvider {
+    pub sites: Vec<HydrationSite>,
+    pub receptor_fingerprint: String,
+    pub source: String,
+}
+impl SiteProvider {
+    pub fn deposited(structure: &glysys::Structure, receptor_fingerprint: String) -> Self {
+        // Only HOH counts as experimental: WAT/TIP3 residues are simulation
+        // bulk solvent added by preparation, not crystallographic waters.
+        let sites = structure
+            .atoms()
+            .into_iter()
+            .filter(|a| a.residue_name.as_str() == "HOH" && a.element.eq_ignore_ascii_case("O"))
+            .map(|a| HydrationSite {
+                id: format!("deposited-{}", a.id.0),
+                position: a.position,
+                hydrogens: None,
+                source: "deposited_water".into(),
+                score: None,
+                experimental_occupancy: Some(a.occupancy),
+                confidence: None,
+                displacement_free_energy: None,
+                occupancy: None,
+                water_water: None,
+                bridging: None,
+            })
+            .collect();
+        Self {
+            sites,
+            receptor_fingerprint,
+            source: "deposited-waters-v1".into(),
+        }
+    }
+    pub fn imported(sites: Vec<HydrationSite>, receptor_fingerprint: String) -> Result<Self> {
+        if sites.len() > 100_000 {
+            return Err(invalid("too many imported hydration sites"));
+        }
+        if sites.iter().any(|s| {
+            !finite(s.position)
+                || s.hydrogens.is_some_and(|h| h.iter().any(|p| !finite(*p)))
+                || s.score
+                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
+                || s.source.is_empty()
+                || s.id.is_empty()
+                || s.experimental_occupancy
+                    .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+                || s.confidence.is_some_and(|x| !x.is_finite())
+                || s.displacement_free_energy.is_some_and(|x| !x.is_finite())
+                || s.occupancy
+                    .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+                || s.water_water
+                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
+                || s.bridging
+                    .as_ref()
+                    .is_some_and(|b| b.is_empty() || b.len() > 32)
+        }) {
+            return Err(invalid("invalid imported hydration site"));
+        }
+        let mut ids = std::collections::HashSet::new();
+        if sites.iter().any(|s| !ids.insert(s.id.clone())) {
+            return Err(invalid("duplicate hydration site ID"));
+        }
+        Ok(Self {
+            sites,
+            receptor_fingerprint,
+            source: "imported-sites-v1".into(),
+        })
+    }
+}
+impl HydrationProvider for SiteProvider {
+    fn model_version(&self) -> &str {
+        &self.source
+    }
+    fn predict(&self, request: &HydrationRequest) -> Result<HydrationField> {
+        let dimensions = PhysicalProbe::dimensions(request)?;
+        let sites = self
+            .sites
+            .iter()
+            .filter(|s| {
+                s.position.x >= request.minimum.x
+                    && s.position.y >= request.minimum.y
+                    && s.position.z >= request.minimum.z
+                    && s.position.x <= request.maximum.x
+                    && s.position.y <= request.maximum.y
+                    && s.position.z <= request.maximum.z
+            })
+            .take(request.max_sites)
+            .cloned()
+            .collect();
+        Ok(HydrationField {
+            source_context: None,
+            schema_version: 1,
+            model_version: self.source.clone(),
+            receptor_fingerprint: self.receptor_fingerprint.clone(),
+            request: request.clone(),
+            sites,
+            dimensions,
+            probe_energy: vec![None; dimensions.iter().product()],
+            backend: "cpu".into(),
+        })
     }
 }
 #[cfg(test)]
@@ -1396,109 +1500,5 @@ END\n";
         let field = probe.finish_tiled(&request, [3, 1, 1], tiles, Vec::new(), "cpu");
         assert_eq!(field.probe_energy, vec![Some(-1.), None, Some(-2.)]);
         assert!(field.sites.is_empty());
-    }
-}
-
-/// Imported and deposited sites retain provenance without acquiring probe energies.
-pub struct SiteProvider {
-    pub sites: Vec<HydrationSite>,
-    pub receptor_fingerprint: String,
-    pub source: String,
-}
-impl SiteProvider {
-    pub fn deposited(structure: &glysys::Structure, receptor_fingerprint: String) -> Self {
-        // Only HOH counts as experimental: WAT/TIP3 residues are simulation
-        // bulk solvent added by preparation, not crystallographic waters.
-        let sites = structure
-            .atoms()
-            .into_iter()
-            .filter(|a| a.residue_name.as_str() == "HOH" && a.element.eq_ignore_ascii_case("O"))
-            .map(|a| HydrationSite {
-                id: format!("deposited-{}", a.id.0),
-                position: a.position,
-                hydrogens: None,
-                source: "deposited_water".into(),
-                score: None,
-                experimental_occupancy: Some(a.occupancy),
-                confidence: None,
-                displacement_free_energy: None,
-                occupancy: None,
-                water_water: None,
-                bridging: None,
-            })
-            .collect();
-        Self {
-            sites,
-            receptor_fingerprint,
-            source: "deposited-waters-v1".into(),
-        }
-    }
-    pub fn imported(sites: Vec<HydrationSite>, receptor_fingerprint: String) -> Result<Self> {
-        if sites.len() > 100_000 {
-            return Err(invalid("too many imported hydration sites"));
-        }
-        if sites.iter().any(|s| {
-            !finite(s.position)
-                || s.hydrogens.is_some_and(|h| h.iter().any(|p| !finite(*p)))
-                || s.score
-                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
-                || s.source.is_empty()
-                || s.id.is_empty()
-                || s.experimental_occupancy
-                    .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-                || s.confidence.is_some_and(|x| !x.is_finite())
-                || s.displacement_free_energy.is_some_and(|x| !x.is_finite())
-                || s.occupancy
-                    .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-                || s.water_water
-                    .is_some_and(|e| !e.lennard_jones.is_finite() || !e.electrostatics.is_finite())
-                || s.bridging
-                    .as_ref()
-                    .is_some_and(|b| b.is_empty() || b.len() > 32)
-        }) {
-            return Err(invalid("invalid imported hydration site"));
-        }
-        let mut ids = std::collections::HashSet::new();
-        if sites.iter().any(|s| !ids.insert(s.id.clone())) {
-            return Err(invalid("duplicate hydration site ID"));
-        }
-        Ok(Self {
-            sites,
-            receptor_fingerprint,
-            source: "imported-sites-v1".into(),
-        })
-    }
-}
-impl HydrationProvider for SiteProvider {
-    fn model_version(&self) -> &str {
-        &self.source
-    }
-    fn predict(&self, request: &HydrationRequest) -> Result<HydrationField> {
-        let dimensions = PhysicalProbe::dimensions(request)?;
-        let sites = self
-            .sites
-            .iter()
-            .filter(|s| {
-                s.position.x >= request.minimum.x
-                    && s.position.y >= request.minimum.y
-                    && s.position.z >= request.minimum.z
-                    && s.position.x <= request.maximum.x
-                    && s.position.y <= request.maximum.y
-                    && s.position.z <= request.maximum.z
-            })
-            .take(request.max_sites)
-            .cloned()
-            .collect();
-        Ok(HydrationField {
-            source_context: None,
-            schema_version: 1,
-            model_version: self.source.clone(),
-            receptor_fingerprint: self.receptor_fingerprint.clone(),
-            request: request.clone(),
-            sites,
-            dimensions,
-            probe_energy: vec![None; dimensions.iter().product()],
-            backend: "cpu".into(),
-        })
     }
 }

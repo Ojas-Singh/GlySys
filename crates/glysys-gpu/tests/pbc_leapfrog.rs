@@ -313,6 +313,7 @@ fn follows_in_npt(electrostatics: ElectrostaticsModel) {
         {
             expected[*group as usize] += mass * (v.x * v.x + v.y * v.y + v.z * v.z) / (2.0 * 418.4);
         }
+        #[allow(clippy::needless_range_loop)] // device and host values of each group
         for group in 0..2 {
             let got = variables.kinetic_energy[group];
             assert!(

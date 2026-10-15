@@ -617,6 +617,7 @@ impl<'a> PbcForceField<'a> {
                 ((f64::from_bits(sigma), f64::from_bits(epsilon)), count)
             })
             .collect();
+        #[allow(clippy::needless_range_loop)] // the upper triangle of the type pairs
         for i in 0..entries.len() {
             let (a, na) = entries[i];
             for j in i..entries.len() {
@@ -1214,6 +1215,7 @@ fn dihedral_with_gradient_dual(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> (f64, 
         v: f64,
         g: [f64; 12],
     }
+    #[allow(clippy::needless_range_loop)] // gradient components of two operands
     impl D {
         fn var(v: f64, k: usize) -> Self {
             let mut g = [0.; 12];
