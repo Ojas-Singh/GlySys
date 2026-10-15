@@ -15,6 +15,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The GPU tests run on lavapipe, Mesa's software Vulkan device; the
+      # runner has no Vulkan driver of its own.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
       - run: cargo package --allow-dirty
