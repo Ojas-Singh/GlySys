@@ -20,8 +20,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
-      - run: cargo package --allow-dirty
-      - run: cargo package -p glysys-opt --allow-dirty --no-verify
+      # All members together, so Cargo verifies each against the others
+      # before their new version is on crates.io.
+      - run: cargo package --workspace --allow-dirty
       - run: cd data/amber && sha256sum -c CHECKSUMS.sha256
 
   consumers:
