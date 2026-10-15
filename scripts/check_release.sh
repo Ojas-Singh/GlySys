@@ -22,8 +22,9 @@ version=${version#v}
 grep -q "^## $version " CHANGELOG.md || fail "CHANGELOG.md has no '## $version - DATE' section"
 ! grep -qi '^## Unreleased' CHANGELOG.md || fail "CHANGELOG.md still has an Unreleased section"
 
-metadata=$(cargo metadata --no-deps --format-version 1 --locked) ||
+cargo metadata --format-version 1 --locked >/dev/null ||
   fail "Cargo.lock is not up to date (cargo metadata --locked failed)"
+metadata=$(cargo metadata --no-deps --format-version 1)
 
 # The list holds every publishable workspace member and nothing else.
 listed=$(printf '%s\n' "${crates[@]}" | sort)
