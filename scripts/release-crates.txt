@@ -1,0 +1,10 @@
+# Crates published to crates.io, in dependency order (dev-dependencies
+# included: crates.io needs every listed dependency to exist). Read by
+# scripts/check_release.sh, scripts/publish_crates.sh and the release workflow.
+glysys
+glysys-opt
+glysys-energy
+glysys-dynamics
+glysys-gpu
+glysys-runtime
+glysys-md

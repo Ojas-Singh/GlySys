@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 - 2026-10-15
+
+Everything since 0.1.1 (2026-09-24). The main additions are a
+PDBFixer-equivalent structure fixer (`glysysbuilder fix`), small molecules
+with OpenFF Sage 2.2.1 and AM1-BCC charges, DNA/RNA and structural metal ions
+in `prepare`, and explicit-solvent dynamics with the GOTW (GROMACS) recipe,
+particle-mesh Ewald with Nose-Hoover and Parrinello-Rahman coupling, on the
+CPU and resident on the GPU. GlySys now builds against crabWURCS 0.3.3.
+
+Output changes (the same input can give different files than 0.1.1):
+
+- Ion counts follow SLTCAP and ions are spread through the solvent with
+  `--seed` selecting the placement.
+- GROMACS topologies write 1-4 pairs with their own scale factors
+  (function 2) and exclude water hydrogens from each other.
+- 1-4 interactions across five-membered rings are excluded as in tleap.
+- Glycans in the preparation report are read from the coordinates
+  (crabWURCS 0.3.3), and their GLYCAM names carry the reducing end.
+
+### Changes
 
 - crabWURCS 0.3.3 (tag `v0.3.3`). The glycans of the report are read from
   the coordinates: every residue whose atoms form a sugar ring is a sugar
@@ -159,15 +178,16 @@
   the CUDA platform (mixed precision); `aggregate_1crn_replicas.py` accepts
   `--expected-backend CPU`; `openmm_force_snapshot.py` and
   `compare_force_snapshots.py` accept `--allow-unpinned-openmm`.
-- crabWURCS is now taken from its GitHub repository at tag `v0.3.1` instead of
-  a sibling `../crabWURCS` checkout, so clean clones and CI build without it;
-  published crates still depend on crabwurcs 0.3.1 from crates.io.
+- crabWURCS is now taken from its GitHub repository at a release tag instead
+  of a sibling `../crabWURCS` checkout, so clean clones and CI build without
+  it; the published crates depend on the matching crabwurcs release on
+  crates.io (0.3.3 for this release).
 - Add `benchmarks/openmm_replica_control.py` (the replica-aggregation gate
   applied to two independent replica sets, e.g. OpenMM against OpenMM) and the
   1 ns explicit validation protocol
   `benchmarks/dynamics/1crn-explicit-lf-middle-2fs-1ns-validation.json`.
 
-## 0.1.2 — 2026-09-25
+### Earlier in this cycle (2026-09-25)
 
 - Add explicit LF-middle NVT integration, hydrogen-bond constraints, and v3
   checkpoint velocity-convention validation while preserving legacy BAOAB
@@ -178,7 +198,7 @@
   evaluation; add WASM-compatible RNG dependencies for browser builds.
 - Add reproducible 1CRN OpenMM comparison and trajectory-validation scripts.
 
-### Validation status
+### Validation status (2026-09-25, LF-middle integrator)
 
 The full explicit 1CRN GPU run completed 0.308 ns at 2 fs without CPU fallback,
 and the tested initial-state energy/force comparisons passed. The independent
