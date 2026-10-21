@@ -78,6 +78,58 @@ impl ParameterSet {
             .unwrap_or_else(|| element_mass(element))
     }
 
+    /// Every atom type, bond, angle and proper torsion inside `template` has
+    /// parameters (terms that cross into a neighbouring residue are not checked).
+    pub(crate) fn covers(&self, template: &super::Template) -> bool {
+        let types = template
+            .atoms
+            .iter()
+            .map(|atom| atom.atom_type.as_str())
+            .collect::<Vec<_>>();
+        if types
+            .iter()
+            .any(|atom_type| self.nonbonded(atom_type).is_err())
+        {
+            return false;
+        }
+        let mut neighbors = vec![Vec::new(); types.len()];
+        for &[first, second] in &template.bonds {
+            if self.bond(types[first], types[second]).is_err() {
+                return false;
+            }
+            neighbors[first].push(second);
+            neighbors[second].push(first);
+        }
+        for (centre, bonded) in neighbors.iter().enumerate() {
+            for (position, &first) in bonded.iter().enumerate() {
+                for &third in &bonded[position + 1..] {
+                    if self
+                        .angle(types[first], types[centre], types[third])
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        for &[second, third] in &template.bonds {
+            for &first in neighbors[second].iter().filter(|&&atom| atom != third) {
+                for &fourth in neighbors[third]
+                    .iter()
+                    .filter(|&&atom| atom != second && atom != first)
+                {
+                    if self
+                        .dihedrals([types[first], types[second], types[third], types[fourth]])
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) fn nonbonded(&self, atom_type: &str) -> Result<(f64, f64)> {
         self.nonbonded
             .get(atom_type)

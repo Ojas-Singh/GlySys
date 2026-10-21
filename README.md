@@ -261,6 +261,33 @@ listed in the JSON report.
 PDB entries covering alternate locations, NMR models, modified residues,
 ligands, metals, nucleic acids, glycoproteins and a 58,000-atom assembly.
 
+## Carbohydrates are read from their atoms
+
+A carbohydrate residue is identified from its coordinates, not its name. Its
+heavy-atom graph and the configuration of every stereocentre select the GLYCAM
+residue, the bonds it makes to other residues select the linkage form, and its
+atoms are renamed to GLYCAM's. Atoms that are not part of the GLYCAM residue
+become the GLYCAM residue for an aglycone (`ROH`, `OME`) or an O-substituent
+(`SO3`, `MEX`, `ACX`), and the oxygen a substituent replaces the hydrogen of
+takes GLYCAM's charge correction (+0.031 for SO3, -0.039 for MEX, +0.008 for
+ACX), so every system sums to an integer charge. wwPDB (CCD), GLYCAM and
+CHARMM names all work, and a name that contradicts the coordinates loses.
+
+The residue name decides only what the coordinates cannot: the anomer of a
+reducing end deposited without its O1 (the oxygen is rebuilt as `ROH`) and a
+centre too distorted to read. Forms with the same atoms and configuration
+(protonation states, duplicate library entries) are chosen by the input's
+hydrogens, else the pH 7 ionization.
+
+The templates are GLYCAM06j-1 (AmberTools) plus the residues GLYCAM-Web adds
+(`GLYCAM_06k_gmml2.lib`: galactofuranose, KDN, Kdo, ...), restricted to those
+GLYCAM_06j.dat parameterizes completely. Where GLYCAM's library coordinates
+contradict a residue's name (its galactofuranoses are built with C5 inverted,
+L-altro), a structure that follows the library is parameterized and reported
+(`glycan_stereochemistry`). On the 2,542 reference lectin-glycan sites of
+SugarGLIDER, 91.8% prepare with GLYCAM alone (48.0% with 0.1.2) and 99.3% with
+`--fix` and the generic force field below.
+
 ## Generic force field for everything else (`prepare`)
 
 Residues that no ff14SB, GLYCAM06j-1, OL15/OL3 or ion template covers — drug

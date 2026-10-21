@@ -16,6 +16,11 @@ pub(crate) const GLYCAM_PREP: &str = include_str!("../data/amber/prep/GLYCAM_06j
 // sulfated glycosaminoglycans (for example QYS and VYS) are fully supported.
 pub(crate) const GLYCAM_GAG_PREP: &str = include_str!("../data/amber/prep/GLYCAM_06j-1_GAGS.prep");
 pub(crate) const GLYCAM_GAG_LIB: &str = include_str!("../data/amber/lib/GLYCAM_06k_GAGS.lib");
+// Residues GLYCAM-Web builds with that GLYCAM06j-1 lacks (furanose Gal, KDN,
+// Kdo, protonated amines, ...), copied unmodified from GMML's
+// GLYCAM_06k_gmml2.lib by scripts/data/extract_glycam_gmml2.py.
+pub(crate) const GLYCAM_GMML2_LIB: &str =
+    include_str!("../data/amber/lib/GLYCAM_06k_gmml2_additions.lib");
 
 pub(crate) const PARM10: &str = include_str!("../data/amber/parm/parm10.dat");
 pub(crate) const FF14SB: &str = include_str!("../data/amber/parm/frcmod.ff14SB");

@@ -63,6 +63,12 @@ pub enum BuildWarning {
     TerminalPhosphateRemoved(String),
     /// The input was repaired by the structure fixer before preparation.
     StructureRepaired(String),
+    /// A carbohydrate's coordinates put a stereocentre in a configuration
+    /// other than the one its residue type means (see
+    /// `carbohydrate::LIBRARY_STEREO_ERRORS`).
+    GlycanStereochemistry(String),
+    /// Why `inspect` lists a residue as unsupported.
+    UnsupportedResidue(String),
 }
 
 pub type Result<T> = std::result::Result<T, BuildError>;

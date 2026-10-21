@@ -59,7 +59,10 @@ pub(crate) fn force_field_versions() -> BTreeMap<String, String> {
     [
         ("source", "AmberTools 23.6"),
         ("protein", "Amber ff14SB"),
-        ("carbohydrate", "GLYCAM06j-1"),
+        (
+            "carbohydrate",
+            "GLYCAM06j-1 + GLYCAM-Web GLYCAM_06k_gmml2 additions",
+        ),
         ("water", "Amber TIP3P"),
         ("ions", "Joung-Chetham Na+/Cl- for TIP3P"),
         ("nucleic_acids", "Amber OL15 DNA, OL3 RNA"),

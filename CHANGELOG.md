@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+Carbohydrates are read from their atoms, and GLYCAM-Web's residues are added.
+On the 2,542 reference lectin-glycan sites of SugarGLIDER, `inspect` now
+parameterizes 91.8% with GLYCAM (0.1.2: 48.0%), 99.3% with `prepare --fix`.
+
+Output changes:
+
+- Carbohydrate residues get the GLYCAM residue their coordinates fit, with
+  GLYCAM atom names, whatever they were called. A GLYCAM name that
+  contradicts the coordinates is corrected (a beta GlcNAc named `0YA` becomes
+  `0YB`); 0.1.2 picked the alpha template for `GAL` on a tie and the beta one
+  for `XYS` (alpha in the CCD).
+- Methyl glycosides split into the sugar and `OME`, sulfate, methyl and
+  acetyl groups into `SO3`, `MEX` and `ACX`, with GLYCAM's charge correction on
+  the oxygen they replace the hydrogen of. Sulfated GAGs now sum to an
+  integer charge (a heparin fragment was -8.124), and the 0.15 e tolerance
+  for them is gone.
+- PREP templates are rebuilt with correct torsions: every internal coordinate
+  was placed 180 degrees off its torsion (ring-closing bonds up to 4.9 A),
+  which moved hydrogens built from template geometry.
+- A free reducing end without O1 gets it back as `ROH`, for the anomer the
+  residue name gives.
+
+### Changes
+
+- `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
+  match, stereocentre configuration, linkage form and aglycone/substituent
+  split. It replaces the 12-name CCD table in `prepare` and in the fixer.
+- GLYCAM-Web's residues missing from GLYCAM06j-1 (538, from GMML's
+  `GLYCAM_06k_gmml2.lib`), and its corrections of `3dR`, `4AE` and `WdR`; see
+  `data/amber/PROVENANCE.md`. Templates GLYCAM_06j.dat cannot parameterize
+  completely are never chosen.
+- Fructose of sucrose and raffinose (`2CU`, the residue holds its own
+  glycosidic oxygen) and the other closed anomeric forms.
+- New warnings: `glycan_stereochemistry` (an input follows a GLYCAM library
+  coordinate error, e.g. GLYCAM-Web galactofuranose with C5 inverted) and
+  `unsupported_residue` (why `inspect` lists a residue).
+- `inspect` decides support with the same carbohydrate reading as `prepare`.
+- Removed: the reducing-O1 splitter that moved any atom named O1 (a ketose's
+  C1 hydroxyl) into `ROH`.
+
 ## 0.1.2 - 2026-10-15
 
 Everything since 0.1.1 (2026-09-24). The main additions are a
