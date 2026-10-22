@@ -79,6 +79,20 @@ pub struct GridOptions {
     pub lj_cap: Option<f64>,
     /// A reward for ligand O and N atoms near receptor N and O atoms.
     pub polar_reward: Option<PolarReward>,
+    /// Point sources that are not atoms of the system (for example crystal waters the structure fixer removed).
+    pub extra_sources: &'static [ExtraSource],
+}
+
+/// An extra receptor point source: a Lennard-Jones sphere with an optional charge, and whether it counts as a polar
+/// (N or O) atom for the [`PolarReward`] field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtraSource {
+    pub position: [f64; 3],
+    pub charge: f64,
+    /// Lennard-Jones radius (Rmin / 2) in angstrom and well depth in kcal/mol.
+    pub radius: f64,
+    pub epsilon: f64,
+    pub polar: bool,
 }
 
 /// An empirical reward for ligand O and N atoms near receptor N and O atoms (a hydrogen bond without direction).
@@ -124,6 +138,7 @@ impl GridOptions {
             metal_coordination: None,
             lj_cap: None,
             polar_reward: None,
+            extra_sources: &[],
         }
     }
 }
@@ -261,6 +276,7 @@ impl DockingGrid {
             metal_coordination,
             lj_cap,
             polar_reward,
+            extra_sources,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -376,6 +392,12 @@ impl DockingGrid {
                 )
             })
             .collect();
+        let mut sources = sources;
+        sources.extend(
+            extra_sources
+                .iter()
+                .map(|e| (e.position, e.charge, e.radius, e.epsilon)),
+        );
         let source_count = sources.len();
         let positions: Vec<[f64; 3]> = sources.iter().map(|s| s.0).collect();
         // Charge per source with the Coulomb constant folded in.
@@ -499,6 +521,7 @@ impl DockingGrid {
                 .iter()
                 .filter(|&&j| matches!(atoms[j].element(), 7 | 8))
                 .map(|&j| [coordinates[j].x, coordinates[j].y, coordinates[j].z])
+                .chain(extra_sources.iter().filter(|e| e.polar).map(|e| e.position))
                 .collect();
             let reach = reward.distance + 4.0 * reward.width;
             let reach2 = reach * reach;

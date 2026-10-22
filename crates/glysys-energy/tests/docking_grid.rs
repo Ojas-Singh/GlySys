@@ -703,3 +703,64 @@ fn soft_wall_and_polar_reward_are_consistent_and_one_sided() {
         }
     }
 }
+
+#[test]
+fn an_extra_source_acts_where_it_is_and_nowhere_else() {
+    use glysys_energy::grid::{ExtraSource, GridOptions};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let build = |sources: &'static [ExtraSource]| {
+        DockingGrid::build_with(
+            &system,
+            &coords,
+            &receptor,
+            &ligand,
+            center,
+            12.0,
+            GridOptions {
+                extra_sources: sources,
+                ..base
+            },
+        )
+        .unwrap()
+    };
+    let at = |p: Vec3, dx: f64| -> &'static [ExtraSource] {
+        Box::leak(Box::new([ExtraSource {
+            position: [p.x + dx, p.y, p.z],
+            charge: 0.0,
+            radius: 1.7683,
+            epsilon: 0.1521,
+            polar: true,
+        }]))
+    };
+    let plain = build(&[]);
+    // on top of the first ligand atom: a clash
+    let on_top = build(at(positions[0], 0.6));
+    assert!(
+        on_top.energy(&positions) > plain.energy(&positions) + 1.0,
+        "a sphere 0.6 A from a ligand atom must repel it"
+    );
+    // far outside the grid and the ligand's reach: no effect
+    let far = build(at(positions[0], 60.0));
+    assert!((far.energy(&positions) - plain.energy(&positions)).abs() < 1.0e-6);
+}
