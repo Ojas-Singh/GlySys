@@ -74,6 +74,22 @@ pub struct GridOptions {
     pub temperature: f64,
     /// Replace the generic ion-oxygen interaction near a metal with a coordination well.
     pub metal_coordination: Option<MetalCoordination>,
+    /// Ceiling (kcal/mol) on the van der Waals energy a ligand atom feels at a grid point, in place of the
+    /// default of 500: a soft wall that lets tight crystal contacts cost little.
+    pub lj_cap: Option<f64>,
+    /// A reward for ligand O and N atoms near receptor N and O atoms.
+    pub polar_reward: Option<PolarReward>,
+}
+
+/// An empirical reward for ligand O and N atoms near receptor N and O atoms (a hydrogen bond without direction).
+///
+/// Each ligand O or N gains `depth` kcal/mol times the Gaussian `exp(-(d - distance)^2 / (2 width^2))` summed over
+/// the receptor N and O atoms at distance `d`, tabulated on the grid; it is added to the force-field terms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolarReward {
+    pub depth: f64,
+    pub distance: f64,
+    pub width: f64,
 }
 
 /// An empirical bonus for a ligand oxygen coordinating a receptor metal ion.
@@ -106,6 +122,8 @@ impl GridOptions {
             flexible_hydroxyls: false,
             temperature: 0.6,
             metal_coordination: None,
+            lj_cap: None,
+            polar_reward: None,
         }
     }
 }
@@ -163,6 +181,15 @@ pub struct DockingGrid {
     oxygens: Vec<OxygenProbe>,
     /// `1 / (eps(r) r)` every `PAIR_STEP` angstrom up to `FLEX_RANGE`, for the flexible hydrogens.
     pair_table: Vec<f64>,
+    polar: Option<PolarField>,
+}
+
+/// The polar reward's grid: the sum of Gaussians around the receptor N and O atoms, and which ligand atoms are O or N.
+#[derive(Debug, Clone)]
+struct PolarField {
+    reward: PolarReward,
+    field: Vec<f32>,
+    ligand: Vec<bool>,
 }
 
 /// A trilinear interpolant's value and gradient (per angstrom).
@@ -232,7 +259,10 @@ impl DockingGrid {
             flexible_hydroxyls,
             temperature,
             metal_coordination,
+            lj_cap,
+            polar_reward,
         } = options;
+        let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
             return Err(EnergyError::InvalidConfiguration(
                 "grid needs a positive spacing, a larger half-width and one coordinate per atom"
@@ -420,7 +450,7 @@ impl DockingGrid {
                         let at = y * n + z;
                         potential_slab[at] = phi.clamp(-CAP, CAP) as f32;
                         for (k, slab_k) in vdw_slab.iter_mut().enumerate() {
-                            slab_k[at] = (well[k].min(CAP) / VDW_SCALE).asinh() as f32;
+                            slab_k[at] = (well[k].min(lj_ceiling) / VDW_SCALE).asinh() as f32;
                         }
                     }
                 }
@@ -464,6 +494,48 @@ impl DockingGrid {
                     < half_width + FLEX_RANGE
             })
             .collect();
+        let polar = polar_reward.map(|reward| {
+            let sources: Vec<[f64; 3]> = receptor
+                .iter()
+                .filter(|&&j| matches!(atoms[j].element(), 7 | 8))
+                .map(|&j| [coordinates[j].x, coordinates[j].y, coordinates[j].z])
+                .collect();
+            let reach = reward.distance + 4.0 * reward.width;
+            let reach2 = reach * reach;
+            let mut field = vec![0.0f32; total];
+            field
+                .par_chunks_mut(slab)
+                .enumerate()
+                .for_each(|(x, chunk)| {
+                    for y in 0..n {
+                        for z in 0..n {
+                            let p = [
+                                origin[0] + x as f64 * spacing,
+                                origin[1] + y as f64 * spacing,
+                                origin[2] + z as f64 * spacing,
+                            ];
+                            let mut sum = 0.0;
+                            for q in &sources {
+                                let (dx, dy, dz) = (p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+                                let d2 = dx * dx + dy * dy + dz * dz;
+                                if d2 < reach2 {
+                                    let u = (d2.sqrt() - reward.distance) / reward.width;
+                                    sum += (-0.5 * u * u).exp();
+                                }
+                            }
+                            chunk[y * n + z] = sum as f32;
+                        }
+                    }
+                });
+            PolarField {
+                reward,
+                field,
+                ligand: ligand
+                    .iter()
+                    .map(|&i| matches!(atoms[i].element(), 7 | 8))
+                    .collect(),
+            }
+        });
         let (ions, oxygens) = if metal_coordination.is_some() {
             let ions = receptor
                 .iter()
@@ -506,6 +578,7 @@ impl DockingGrid {
                     1.0 / (screening.permittivity(r) * r)
                 })
                 .collect(),
+            polar,
         })
     }
 
@@ -565,11 +638,28 @@ impl DockingGrid {
             ];
             let (phi, phi_gradient) = trilinear(&self.potential, self.dims, self.spacing, f, cell);
             let charge = self.ligand_charge[a];
-            total += well + charge * phi + penalty;
+            let (mut reward, mut reward_gradient) = (0.0, [0.0; 3]);
+            if let Some(polar) = &self.polar
+                && polar.ligand[a]
+            {
+                let (value, slope) = trilinear(&polar.field, self.dims, self.spacing, f, cell);
+                reward = -polar.reward.depth * value;
+                reward_gradient = slope.map(|g| -polar.reward.depth * g);
+            }
+            total += well + charge * phi + penalty + reward;
             if let Some(gradient) = gradient.as_deref_mut() {
-                gradient[a].x += well_gradient[0] + charge * phi_gradient[0] + penalty_gradient[0];
-                gradient[a].y += well_gradient[1] + charge * phi_gradient[1] + penalty_gradient[1];
-                gradient[a].z += well_gradient[2] + charge * phi_gradient[2] + penalty_gradient[2];
+                gradient[a].x += well_gradient[0]
+                    + charge * phi_gradient[0]
+                    + penalty_gradient[0]
+                    + reward_gradient[0];
+                gradient[a].y += well_gradient[1]
+                    + charge * phi_gradient[1]
+                    + penalty_gradient[1]
+                    + reward_gradient[1];
+                gradient[a].z += well_gradient[2]
+                    + charge * phi_gradient[2]
+                    + penalty_gradient[2]
+                    + reward_gradient[2];
             }
         }
         let flexible = self.flexible_term(positions, gradient.as_deref_mut());

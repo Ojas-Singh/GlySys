@@ -40,6 +40,10 @@ Output changes:
   glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry. On 40 development
   lectin sites it did not improve redocking over letting the glycan's own hydroxyl rotations vary (17 vs 19 sites with
   the deposited pose within 2 A; an oracle placement of the receptor hydroxyls gave 20), so it is opt-in.
+- `GridOptions::lj_cap` and `GridOptions::polar_reward`: a ceiling on the van der Waals energy a ligand atom feels at a grid
+  point (a soft wall for tight contacts) and a Gaussian reward for each ligand O or N atom near receptor N and O atoms,
+  tabulated as one extra scalar grid. Both default off. Empirical terms, in the spirit of docking scoring functions; they
+  change the energy and gradient of the grid only.
 - `GridOptions::metal_coordination`: a Gaussian reward for ligand oxygens at coordination distance of a receptor
   metal ion, added to the generic terms. Under the distance-dependent screening a metal-bound sugar is held by
   the attraction of its oxygens but pushed off by the ion's repulsion of the neighbouring carbons and hydroxyl hydrogens,

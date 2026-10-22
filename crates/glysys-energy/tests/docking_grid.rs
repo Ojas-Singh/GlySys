@@ -583,3 +583,123 @@ fn metal_coordination_is_a_consistent_local_well() {
         }
     }
 }
+
+#[test]
+fn soft_wall_and_polar_reward_are_consistent_and_one_sided() {
+    use glysys_energy::grid::{GridOptions, PolarReward};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let build = |options: GridOptions| {
+        DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, options)
+            .unwrap()
+    };
+    let plain = build(base);
+    let capped = build(GridOptions {
+        lj_cap: Some(3.0),
+        ..base
+    });
+    let polar = build(GridOptions {
+        polar_reward: Some(PolarReward {
+            depth: 0.5,
+            distance: 2.85,
+            width: 0.35,
+        }),
+        ..base
+    });
+    let both = build(GridOptions {
+        lj_cap: Some(3.0),
+        polar_reward: Some(PolarReward {
+            depth: 0.5,
+            distance: 2.85,
+            width: 0.35,
+        }),
+        ..base
+    });
+    // A cap can only lower the energy, and a pushed-in pose gains the most from it.
+    let pushed: Vec<Vec3> = positions
+        .iter()
+        .map(|p| Vec3 {
+            x: p.x + 0.7,
+            y: p.y + 0.4,
+            z: p.z,
+        })
+        .collect();
+    for pose in [&positions, &pushed] {
+        assert!(capped.energy(pose) <= plain.energy(pose) + 1.0e-9);
+        // the reward never costs energy
+        assert!(polar.energy(pose) <= plain.energy(pose) + 1.0e-9);
+        assert!(both.energy(pose) <= capped.energy(pose) + 1.0e-9);
+    }
+    eprintln!(
+        "deposited pose: plain {:.2}, capped {:.2}, polar {:.2}, both {:.2}; pushed 0.8 A: plain {:.2}, capped {:.2}",
+        plain.energy(&positions),
+        capped.energy(&positions),
+        polar.energy(&positions),
+        both.energy(&positions),
+        plain.energy(&pushed),
+        capped.energy(&pushed)
+    );
+    assert!(
+        polar.energy(&positions) < plain.energy(&positions) - 0.5,
+        "the deposited glycan sits among receptor N and O atoms, so the reward must lower its energy"
+    );
+    // Gradient against finite differences.
+    for shift in [0.0, 0.15] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x + shift,
+                y: p.y - 0.5 * shift,
+                z: p.z,
+            })
+            .collect();
+        let mut gradient = vec![
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0
+            };
+            moved.len()
+        ];
+        both.energy_gradient(&moved, Some(&mut gradient));
+        let h = 1.0e-4;
+        for atom in 0..moved.len() {
+            for axis in 0..3 {
+                let (mut up, mut down) = (moved.clone(), moved.clone());
+                let bump = |p: &mut Vec3, d: f64| match axis {
+                    0 => p.x += d,
+                    1 => p.y += d,
+                    _ => p.z += d,
+                };
+                bump(&mut up[atom], h);
+                bump(&mut down[atom], -h);
+                let numeric = (both.energy(&up) - both.energy(&down)) / (2.0 * h);
+                let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+                assert!(
+                    (numeric - analytic).abs() < 3.0e-3 * (1.0 + analytic.abs()),
+                    "atom {atom} axis {axis}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
+}
