@@ -60,6 +60,45 @@ impl Screening {
     }
 }
 
+/// Options for [`DockingGrid::build_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct GridOptions {
+    pub spacing: f64,
+    pub screening: Screening,
+    /// Treat receptor O-H and S-H hydrogens as free to turn about their C-O
+    /// axis: each is carried as `ROTAMERS` positions instead of being part of
+    /// the tabulated potential, and its energy with the ligand is a
+    /// Boltzmann-weighted minimum over the rotamers (at `temperature`).
+    pub flexible_hydroxyls: bool,
+    /// kT in kcal/mol for the rotamer average.
+    pub temperature: f64,
+}
+
+impl GridOptions {
+    pub fn new(spacing: f64, screening: Screening) -> Self {
+        Self {
+            spacing,
+            screening,
+            flexible_hydroxyls: false,
+            temperature: 0.6,
+        }
+    }
+}
+
+/// Rotamers per flexible hydroxyl hydrogen.
+const ROTAMERS: usize = 12;
+/// Ligand atoms farther than this from a flexible hydrogen are not paired with it.
+const FLEX_RANGE: f64 = 10.0;
+
+/// A receptor hydroxyl hydrogen carried as discrete rotamers.
+#[derive(Debug, Clone)]
+struct FlexibleHydrogen {
+    charge: f64,
+    positions: [[f64; 3]; ROTAMERS],
+    /// Screened Coulomb energy of each rotamer with the rest of the receptor.
+    self_energy: [f64; ROTAMERS],
+}
+
 #[derive(Debug, Clone)]
 pub struct DockingGrid {
     origin: [f64; 3],
@@ -75,6 +114,8 @@ pub struct DockingGrid {
     ligand_class: Vec<usize>,
     ligand_charge: Vec<f64>,
     screening: Screening,
+    flexible: Vec<FlexibleHydrogen>,
+    temperature: f64,
 }
 
 /// A trilinear interpolant's value and gradient (per angstrom).
@@ -118,6 +159,32 @@ impl DockingGrid {
         spacing: f64,
         screening: Screening,
     ) -> Result<Self> {
+        Self::build_with(
+            system,
+            coordinates,
+            receptor,
+            ligand,
+            center,
+            half_width,
+            GridOptions::new(spacing, screening),
+        )
+    }
+
+    pub fn build_with(
+        system: &ParameterizedSystem,
+        coordinates: &[Vec3],
+        receptor: &[usize],
+        ligand: &[usize],
+        center: Vec3,
+        half_width: f64,
+        options: GridOptions,
+    ) -> Result<Self> {
+        let GridOptions {
+            spacing,
+            screening,
+            flexible_hydroxyls,
+            temperature,
+        } = options;
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
             return Err(EnergyError::InvalidConfiguration(
                 "grid needs a positive spacing, a larger half-width and one coordinate per atom"
@@ -150,13 +217,82 @@ impl DockingGrid {
             center.z - half_width,
         ];
 
+        // Receptor hydroxyl hydrogens handled as rotamers (O-H or S-H with one heavy neighbour).
+        let mut flexible_atoms = std::collections::BTreeSet::new();
+        let mut flexible = Vec::new();
+        if flexible_hydroxyls {
+            let in_receptor: std::collections::BTreeSet<usize> = receptor.iter().copied().collect();
+            let mut neighbors = vec![Vec::new(); atoms.len()];
+            for bond in system.bonds() {
+                let [a, b] = bond.atoms();
+                neighbors[a].push(b);
+                neighbors[b].push(a);
+            }
+            for &h in receptor {
+                if atoms[h].element() != 1 || neighbors[h].len() != 1 {
+                    continue;
+                }
+                let o = neighbors[h][0];
+                if !matches!(atoms[o].element(), 8 | 16)
+                    || neighbors[o].len() != 2
+                    || !in_receptor.contains(&o)
+                {
+                    continue;
+                }
+                let c = neighbors[o].iter().copied().find(|&n| n != h).unwrap();
+                if atoms[c].element() == 1 {
+                    continue;
+                }
+                let (po, pc, ph) = (coordinates[o], coordinates[c], coordinates[h]);
+                let axis = [po.x - pc.x, po.y - pc.y, po.z - pc.z];
+                let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+                if norm < 1.0e-9 {
+                    continue;
+                }
+                let axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+                let rel = [ph.x - po.x, ph.y - po.y, ph.z - po.z];
+                let along = rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2];
+                let radial = [
+                    rel[0] - along * axis[0],
+                    rel[1] - along * axis[1],
+                    rel[2] - along * axis[2],
+                ];
+                let radius =
+                    (radial[0] * radial[0] + radial[1] * radial[1] + radial[2] * radial[2]).sqrt();
+                if radius < 1.0e-9 {
+                    continue;
+                }
+                let e1 = [radial[0] / radius, radial[1] / radius, radial[2] / radius];
+                let e2 = [
+                    axis[1] * e1[2] - axis[2] * e1[1],
+                    axis[2] * e1[0] - axis[0] * e1[2],
+                    axis[0] * e1[1] - axis[1] * e1[0],
+                ];
+                let mut positions = [[0.0; 3]; ROTAMERS];
+                for (k, p) in positions.iter_mut().enumerate() {
+                    let (sn, cs) = (std::f64::consts::TAU * k as f64 / ROTAMERS as f64).sin_cos();
+                    let origin = [po.x, po.y, po.z];
+                    for d in 0..3 {
+                        p[d] = origin[d] + along * axis[d] + radius * (cs * e1[d] + sn * e2[d]);
+                    }
+                }
+                flexible_atoms.insert(h);
+                flexible.push((h, positions));
+            }
+        }
         let sources: Vec<([f64; 3], f64, f64, f64)> = receptor
             .iter()
             .map(|&j| {
                 let c = coordinates[j];
+                // A flexible hydrogen is not part of the tabulated potential.
+                let charge = if flexible_atoms.contains(&j) {
+                    0.0
+                } else {
+                    atoms[j].charge()
+                };
                 (
                     [c.x, c.y, c.z],
-                    atoms[j].charge(),
+                    charge,
                     atoms[j].lennard_jones_radius(),
                     atoms[j].lennard_jones_epsilon(),
                 )
@@ -241,6 +377,45 @@ impl DockingGrid {
                     }
                 }
             });
+        // Self energy of each rotamer: its Coulomb energy with the rest of the receptor.
+        let flexible: Vec<FlexibleHydrogen> = flexible
+            .into_iter()
+            .map(|(h, positions)| {
+                let charge = atoms[h].charge();
+                let excluded = &system.exclusions()[h];
+                let mut self_energy = [0.0; ROTAMERS];
+                for (k, p) in positions.iter().enumerate() {
+                    let mut e = 0.0;
+                    for &j in receptor {
+                        if j == h || excluded.contains(&j) || atoms[j].charge() == 0.0 {
+                            continue;
+                        }
+                        let c = coordinates[j];
+                        let r =
+                            ((p[0] - c.x).powi(2) + (p[1] - c.y).powi(2) + (p[2] - c.z).powi(2))
+                                .sqrt()
+                                .max(0.5);
+                        e += COULOMB * charge * atoms[j].charge() / (screening.permittivity(r) * r);
+                    }
+                    self_energy[k] = e;
+                }
+                FlexibleHydrogen {
+                    charge,
+                    positions,
+                    self_energy,
+                }
+            })
+            // Only hydrogens that can reach the ligand's region matter.
+            .filter(|f| {
+                let to_center = [
+                    f.positions[0][0] - center.x,
+                    f.positions[0][1] - center.y,
+                    f.positions[0][2] - center.z,
+                ];
+                (to_center[0].powi(2) + to_center[1].powi(2) + to_center[2].powi(2)).sqrt()
+                    < half_width + FLEX_RANGE + 6.0
+            })
+            .collect();
         Ok(Self {
             origin,
             spacing,
@@ -251,6 +426,8 @@ impl DockingGrid {
             ligand_class,
             ligand_charge: ligand.iter().map(|&i| atoms[i].charge()).collect(),
             screening,
+            flexible,
+            temperature,
         })
     }
 
@@ -315,6 +492,83 @@ impl DockingGrid {
                 gradient[a].x += well_gradient[0] + charge * phi_gradient[0] + penalty_gradient[0];
                 gradient[a].y += well_gradient[1] + charge * phi_gradient[1] + penalty_gradient[1];
                 gradient[a].z += well_gradient[2] + charge * phi_gradient[2] + penalty_gradient[2];
+            }
+        }
+        total + self.flexible_term(positions, gradient)
+    }
+
+    /// Number of receptor hydroxyl hydrogens carried as rotamers.
+    pub fn flexible_hydrogens(&self) -> usize {
+        self.flexible.len()
+    }
+
+    /// The Boltzmann-weighted minimum over rotamers of each flexible hydrogen's
+    /// energy with the ligand and the receptor, relative to the same quantity
+    /// with no ligand (so the term vanishes far from the ligand).
+    fn flexible_term(&self, positions: &[Vec3], mut gradient: Option<&mut [Vec3]>) -> f64 {
+        if self.flexible.is_empty() {
+            return 0.0;
+        }
+        let kt = self.temperature;
+        let range2 = FLEX_RANGE * FLEX_RANGE;
+        let mut total = 0.0;
+        for hydrogen in &self.flexible {
+            let mut energies = [0.0; ROTAMERS];
+            for (k, p) in hydrogen.positions.iter().enumerate() {
+                let mut e = hydrogen.self_energy[k];
+                for (a, q) in positions.iter().enumerate() {
+                    let d2 = (p[0] - q.x).powi(2) + (p[1] - q.y).powi(2) + (p[2] - q.z).powi(2);
+                    if d2 > range2 {
+                        continue;
+                    }
+                    let r = d2.sqrt().max(0.5);
+                    e += COULOMB * hydrogen.charge * self.ligand_charge[a]
+                        / (self.screening.permittivity(r) * r);
+                }
+                energies[k] = e;
+            }
+            let lowest = energies.iter().copied().fold(f64::INFINITY, f64::min);
+            let weights: Vec<f64> = energies
+                .iter()
+                .map(|e| (-(e - lowest) / kt).exp())
+                .collect();
+            let partition: f64 = weights.iter().sum();
+            let free = lowest - kt * partition.ln();
+            let reference_lowest = hydrogen
+                .self_energy
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            let reference: f64 = hydrogen
+                .self_energy
+                .iter()
+                .map(|e| (-(e - reference_lowest) / kt).exp())
+                .sum();
+            total += free - (reference_lowest - kt * reference.ln());
+            if let Some(gradient) = gradient.as_deref_mut() {
+                for (k, p) in hydrogen.positions.iter().enumerate() {
+                    let weight = weights[k] / partition;
+                    if weight < 1.0e-6 {
+                        continue;
+                    }
+                    for (a, q) in positions.iter().enumerate() {
+                        let delta = [q.x - p[0], q.y - p[1], q.z - p[2]];
+                        let d2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+                        if d2 > range2 {
+                            continue;
+                        }
+                        let r = d2.sqrt().max(0.5);
+                        let pair = |r: f64| {
+                            COULOMB * hydrogen.charge * self.ligand_charge[a]
+                                / (self.screening.permittivity(r) * r)
+                        };
+                        let h = 1.0e-4;
+                        let slope = (pair(r + h) - pair(r - h)) / (2.0 * h);
+                        gradient[a].x += weight * slope * delta[0] / r;
+                        gradient[a].y += weight * slope * delta[1] / r;
+                        gradient[a].z += weight * slope * delta[2] / r;
+                    }
+                }
             }
         }
         total

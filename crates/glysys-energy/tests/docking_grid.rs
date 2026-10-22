@@ -330,3 +330,77 @@ fn a_subsystem_has_the_internal_energy_of_its_atoms() {
         "{internal} vs {alone}"
     );
 }
+
+#[test]
+fn flexible_hydroxyl_energy_has_a_consistent_gradient_and_lowers_the_energy() {
+    use glysys_energy::grid::GridOptions;
+    let pocket = pocket();
+    let coords = pocket.system.coordinates();
+    let ligand: Vec<Vec3> = pocket.ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&ligand);
+    let fixed = DockingGrid::build(
+        &pocket.system,
+        &coords,
+        &pocket.receptor,
+        &pocket.ligand,
+        center,
+        12.0,
+        0.4,
+        Screening::MehlerSolmajer,
+    )
+    .unwrap();
+    let options = GridOptions {
+        flexible_hydroxyls: true,
+        ..GridOptions::new(0.4, Screening::MehlerSolmajer)
+    };
+    let flexible = DockingGrid::build_with(
+        &pocket.system,
+        &coords,
+        &pocket.receptor,
+        &pocket.ligand,
+        center,
+        12.0,
+        options,
+    )
+    .unwrap();
+    assert!(
+        flexible.flexible_hydrogens() > 0,
+        "the pocket has serine/threonine/tyrosine hydroxyls"
+    );
+    // The ligand may take the best rotamer of every hydroxyl, so for a pose with
+    // contacts the flexible energy is not above the fixed one by more than the
+    // rotamer-entropy bookkeeping (a few kT).
+    let (fixed_energy, flexible_energy) = (fixed.energy(&ligand), flexible.energy(&ligand));
+    eprintln!(
+        "fixed hydroxyls {fixed_energy:.2}, flexible {flexible_energy:.2} kcal/mol, {} rotamer sets",
+        flexible.flexible_hydrogens()
+    );
+    let mut gradient = vec![
+        Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0
+        };
+        ligand.len()
+    ];
+    flexible.energy_gradient(&ligand, Some(&mut gradient));
+    let h = 1.0e-4;
+    for atom in [1, 7, ligand.len() / 2, ligand.len() - 2] {
+        for axis in 0..3 {
+            let (mut up, mut down) = (ligand.clone(), ligand.clone());
+            let bump = |p: &mut Vec3, d: f64| match axis {
+                0 => p.x += d,
+                1 => p.y += d,
+                _ => p.z += d,
+            };
+            bump(&mut up[atom], h);
+            bump(&mut down[atom], -h);
+            let numeric = (flexible.energy(&up) - flexible.energy(&down)) / (2.0 * h);
+            let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+            assert!(
+                (numeric - analytic).abs() < 2.0e-3 * (1.0 + analytic.abs()),
+                "atom {atom} axis {axis}: {numeric} vs {analytic}"
+            );
+        }
+    }
+}

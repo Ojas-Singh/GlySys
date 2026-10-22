@@ -33,6 +33,11 @@ Output changes:
   gradients. A search tool: on the lectin pocket test it agrees with the exact
   evaluator to 0.7 kcal/mol on average for poses below +10 kcal/mol. The
   Lennard-Jones grids hold `asinh(E)`, which halves the error of storing `E`.
+- `GridOptions::flexible_hydroxyls`: receptor O-H and S-H hydrogens are carried as 12 rotamers
+  about their C-O axis, left out of the tabulated potential, and enter the docking energy as a
+  Boltzmann-weighted minimum over the rotamers. GlySys places hydroxyl hydrogens where they are
+  farthest from their neighbours, which turns a donor away from its acceptor: in prepared deposited
+  glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry.
 - `ParameterizedSystem::subsystem`: a system of chosen atoms with the terms among
   them, so a docked glycan's internal energy is that of its own small system.
 - `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
