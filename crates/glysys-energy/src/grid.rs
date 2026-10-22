@@ -91,6 +91,8 @@ const ROTAMERS: usize = 12;
 const FLEX_RANGE: f64 = 10.0;
 /// Spacing of the tabulated screened Coulomb kernel used for flexible hydrogens.
 const PAIR_STEP: f64 = 0.01;
+/// Ligand atoms with a smaller partial charge are not paired with flexible hydrogens.
+const MIN_PAIR_CHARGE: f64 = 0.05;
 
 /// A receptor hydroxyl hydrogen carried as discrete rotamers.
 #[derive(Debug, Clone)]
@@ -522,11 +524,36 @@ impl DockingGrid {
         let kt = self.temperature;
         let range2 = FLEX_RANGE * FLEX_RANGE;
         let mut total = 0.0;
+        // Ligand atoms that carry charge, and their bounding box: a hydroxyl
+        // farther than the pair range from the box has nothing to pair with.
+        let charged: Vec<usize> = (0..positions.len())
+            .filter(|&a| self.ligand_charge[a].abs() > MIN_PAIR_CHARGE)
+            .collect();
+        if charged.is_empty() {
+            return 0.0;
+        }
+        let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for &a in &charged {
+            let q = [positions[a].x, positions[a].y, positions[a].z];
+            for k in 0..3 {
+                low[k] = low[k].min(q[k]);
+                high[k] = high[k].max(q[k]);
+            }
+        }
         for hydrogen in &self.flexible {
+            let p = hydrogen.positions[0];
+            let outside: f64 = (0..3)
+                .map(|k| (low[k] - p[k]).max(p[k] - high[k]).max(0.0).powi(2))
+                .sum();
+            // The rotamer cone is within 1 A of the first position.
+            if outside.sqrt() > FLEX_RANGE + 1.0 {
+                continue;
+            }
             let mut energies = [0.0; ROTAMERS];
             for (k, p) in hydrogen.positions.iter().enumerate() {
                 let mut e = hydrogen.self_energy[k];
-                for (a, q) in positions.iter().enumerate() {
+                for &a in &charged {
+                    let q = &positions[a];
                     let d2 = (p[0] - q.x).powi(2) + (p[1] - q.y).powi(2) + (p[2] - q.z).powi(2);
                     if d2 > range2 {
                         continue;
@@ -559,7 +586,8 @@ impl DockingGrid {
                     if weight < 1.0e-6 {
                         continue;
                     }
-                    for (a, q) in positions.iter().enumerate() {
+                    for &a in &charged {
+                        let q = &positions[a];
                         let delta = [q.x - p[0], q.y - p[1], q.z - p[2]];
                         let d2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
                         if d2 > range2 {
