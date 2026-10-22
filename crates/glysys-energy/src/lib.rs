@@ -1,6 +1,7 @@
 //! Molecular-mechanics energies and gradients for parameterized GlySys systems.
 
 pub mod geometry;
+pub mod grid;
 pub mod hydration;
 pub mod implicit_cluster;
 mod obc2;

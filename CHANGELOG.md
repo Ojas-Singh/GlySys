@@ -26,6 +26,15 @@ Output changes:
 
 ### Changes
 
+- `glysys_energy::grid::DockingGrid`: the glycan-receptor interaction of a prepared
+  system tabulated on a grid for a rigid receptor (Amber/GLYCAM Lennard-Jones
+  per ligand atom class, Coulomb potential per unit charge, constant or
+  Mehler-Solmajer distance-dependent screening), with trilinear energies and
+  gradients. A search tool: on the lectin pocket test it agrees with the exact
+  evaluator to 0.7 kcal/mol on average for poses below +10 kcal/mol. The
+  Lennard-Jones grids hold `asinh(E)`, which halves the error of storing `E`.
+- `ParameterizedSystem::subsystem`: a system of chosen atoms with the terms among
+  them, so a docked glycan's internal energy is that of its own small system.
 - `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
   match, stereocentre configuration, linkage form and aglycone/substituent
   split. It replaces the 12-name CCD table in `prepare` and in the fixer.

@@ -252,6 +252,119 @@ impl ParameterizedSystem {
         }
     }
 
+    /// A system made of only the listed atoms, with every bond, angle,
+    /// torsion and exclusion among them, renumbered in the order given
+    /// (strictly increasing). The energy of the pieces of one molecule inside
+    /// a larger system -- a docked glycan's internal energy, say -- is then
+    /// the energy of this much smaller system.
+    ///
+    /// Residues keep the atoms selected from them; a residue with none is dropped.
+    pub fn subsystem(&self, atoms: &[usize]) -> crate::Result<Self> {
+        let system = &self.system;
+        if atoms.windows(2).any(|pair| pair[0] >= pair[1])
+            || atoms.last().is_some_and(|&last| last >= system.atoms.len())
+        {
+            return Err(crate::BuildError::InvalidPdb(
+                "subsystem atoms must be strictly increasing and inside the system".into(),
+            ));
+        }
+        let mut renumbered = vec![usize::MAX; system.atoms.len()];
+        for (new, &old) in atoms.iter().enumerate() {
+            renumbered[old] = new;
+        }
+        let within = |members: &[usize]| members.iter().all(|&atom| renumbered[atom] != usize::MAX);
+        let mapped = |members: &[usize]| {
+            members
+                .iter()
+                .map(|&atom| renumbered[atom])
+                .collect::<Vec<_>>()
+        };
+
+        let mut residue_of_old = vec![usize::MAX; system.residues.len()];
+        let mut residues: Vec<Residue> = Vec::new();
+        let mut new_atoms = Vec::with_capacity(atoms.len());
+        for (new, &old) in atoms.iter().enumerate() {
+            let mut atom = system.atoms[old].clone();
+            let old_residue = atom.residue;
+            if residue_of_old[old_residue] == usize::MAX {
+                residue_of_old[old_residue] = residues.len();
+                let mut residue = system.residues[old_residue].clone();
+                residue.first_atom = new;
+                residue.atom_count = 0;
+                residues.push(residue);
+            }
+            let index = residue_of_old[old_residue];
+            residues[index].atom_count += 1;
+            atom.residue = index;
+            new_atoms.push(atom);
+        }
+        let exclusions = atoms
+            .iter()
+            .map(|&old| {
+                system.exclusions[old]
+                    .iter()
+                    .filter(|&&other| renumbered[other] != usize::MAX)
+                    .map(|&other| renumbered[other])
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect();
+        let sub = System {
+            atoms: new_atoms,
+            residues,
+            bonds: system
+                .bonds
+                .iter()
+                .filter(|bond| within(&bond.atoms))
+                .map(|bond| Bond {
+                    atoms: mapped(&bond.atoms).try_into().unwrap(),
+                    ..*bond
+                })
+                .collect(),
+            angles: system
+                .angles
+                .iter()
+                .filter(|angle| within(&angle.atoms))
+                .map(|angle| Angle {
+                    atoms: mapped(&angle.atoms).try_into().unwrap(),
+                    ..*angle
+                })
+                .collect(),
+            dihedrals: system
+                .dihedrals
+                .iter()
+                .filter(|dihedral| within(&dihedral.atoms))
+                .map(|dihedral| Dihedral {
+                    atoms: mapped(&dihedral.atoms).try_into().unwrap(),
+                    ..*dihedral
+                })
+                .collect(),
+            exclusions,
+            box_angstrom: [0.0; 3],
+            component_count: 1,
+            solute_atom_count: atoms.len(),
+            water_residue_count: 0,
+            sodium_count: 0,
+            chloride_count: 0,
+        };
+        let mut report = self.report.clone();
+        report.options.add_water = false;
+        report.options.add_ions = false;
+        report.output_sha256.clear();
+        report.total_atoms = atoms.len();
+        report.residues = sub.residues.len();
+        report.waters = 0;
+        report.sodium_ions = 0;
+        report.chloride_ions = 0;
+        report.solute_charge = sub.atoms.iter().map(|atom| atom.charge).sum();
+        report.total_charge = report.solute_charge;
+        report.box_angstrom = [0.0; 3];
+        Ok(Self {
+            system: sub,
+            report,
+            metadata: self.metadata.clone(),
+        })
+    }
+
     /// Return the current Cartesian coordinates in Å.
     pub fn coordinates(&self) -> Vec<Vec3> {
         self.system.atoms.iter().map(|atom| atom.position).collect()
