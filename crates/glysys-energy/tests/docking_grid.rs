@@ -540,9 +540,8 @@ fn metal_coordination_is_a_consistent_local_well() {
         })
         .collect();
     assert!(
-        (plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9
-            || with.energy(&far) != plain.energy(&far)
-    assert!((plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9, "no bonus away from the ion");
+        (plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9,
+        "no bonus away from the ion"
     );
     // Gradient against finite differences, at the deposited pose and slightly displaced.
     for shift in [0.0, 0.15] {

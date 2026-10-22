@@ -123,9 +123,6 @@ const MIN_PAIR_CHARGE: f64 = 0.05;
 #[derive(Debug, Clone)]
 struct Ion {
     position: [f64; 3],
-    charge: f64,
-    radius: f64,
-    epsilon: f64,
 }
 
 /// A ligand oxygen that can coordinate an ion.
@@ -133,9 +130,6 @@ struct Ion {
 struct OxygenProbe {
     /// Position in the ligand atom list.
     index: usize,
-    charge: f64,
-    radius: f64,
-    epsilon: f64,
 }
 
 /// A receptor hydroxyl hydrogen carried as discrete rotamers.
@@ -478,9 +472,6 @@ impl DockingGrid {
                     let c = coordinates[j];
                     Ion {
                         position: [c.x, c.y, c.z],
-                        charge: atoms[j].charge(),
-                        radius: atoms[j].lennard_jones_radius(),
-                        epsilon: atoms[j].lennard_jones_epsilon(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -488,12 +479,7 @@ impl DockingGrid {
                 .iter()
                 .enumerate()
                 .filter(|&(_, &i)| atoms[i].element() == 8)
-                .map(|(index, &i)| OxygenProbe {
-                    index,
-                    charge: atoms[i].charge(),
-                    radius: atoms[i].lennard_jones_radius(),
-                    epsilon: atoms[i].lennard_jones_epsilon(),
-                })
+                .map(|(index, _)| OxygenProbe { index })
                 .collect::<Vec<_>>();
             (ions, oxygens)
         } else {
