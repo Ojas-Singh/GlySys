@@ -475,3 +475,112 @@ fn screened_internal_energy_matches_the_exact_evaluator_for_constant_screening()
         }
     }
 }
+
+const CALCIUM_POCKET: &str = include_str!("../../../tests/fixtures/ctype_ca_pocket9.pdb");
+
+#[test]
+fn metal_coordination_is_a_consistent_local_well() {
+    use glysys_energy::grid::{GridOptions, MetalCoordination};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let plain =
+        DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, base).unwrap();
+    let well = MetalCoordination {
+        distance: 2.45,
+        depth: 8.0,
+    };
+    let with = DockingGrid::build_with(
+        &system,
+        &coords,
+        &receptor,
+        &ligand,
+        center,
+        12.0,
+        GridOptions {
+            metal_coordination: Some(well),
+            ..base
+        },
+    )
+    .unwrap();
+    assert_eq!(plain.coordinating_ions(), 0);
+    assert!(with.coordinating_ions() >= 1, "the pocket holds a calcium");
+    let (plain_energy, well_energy) = (plain.energy(&positions), with.energy(&positions));
+    eprintln!(
+        "deposited pose: generic {plain_energy:.2}, with the coordination well {well_energy:.2} kcal/mol"
+    );
+    // The deposited glycan coordinates the calcium, so the well lowers its energy.
+    assert!(well_energy < plain_energy);
+    // Far from the ion the two grids agree exactly.
+    let far: Vec<Vec3> = positions
+        .iter()
+        .map(|p| Vec3 {
+            x: p.x + 9.0,
+            y: p.y,
+            z: p.z,
+        })
+        .collect();
+    assert!(
+        (plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9
+            || with.energy(&far) != plain.energy(&far)
+    assert!((plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9, "no bonus away from the ion");
+    );
+    // Gradient against finite differences, at the deposited pose and slightly displaced.
+    for shift in [0.0, 0.15] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|p| Vec3 {
+                x: p.x + shift,
+                y: p.y - 0.5 * shift,
+                z: p.z,
+            })
+            .collect();
+        let mut gradient = vec![
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0
+            };
+            moved.len()
+        ];
+        with.energy_gradient(&moved, Some(&mut gradient));
+        let h = 1.0e-4;
+        for atom in 0..moved.len() {
+            for axis in 0..3 {
+                let (mut up, mut down) = (moved.clone(), moved.clone());
+                let bump = |p: &mut Vec3, d: f64| match axis {
+                    0 => p.x += d,
+                    1 => p.y += d,
+                    _ => p.z += d,
+                };
+                bump(&mut up[atom], h);
+                bump(&mut down[atom], -h);
+                let numeric = (with.energy(&up) - with.energy(&down)) / (2.0 * h);
+                let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+                assert!(
+                    (numeric - analytic).abs() < 3.0e-3 * (1.0 + analytic.abs()),
+                    "atom {atom} axis {axis}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
+}

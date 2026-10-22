@@ -72,7 +72,31 @@ pub struct GridOptions {
     pub flexible_hydroxyls: bool,
     /// kT in kcal/mol for the rotamer average.
     pub temperature: f64,
+    /// Replace the generic ion-oxygen interaction near a metal with a coordination well.
+    pub metal_coordination: Option<MetalCoordination>,
 }
+
+/// An empirical bonus for a ligand oxygen coordinating a receptor metal ion.
+///
+/// A metal-bound sugar sits in the field of the ion's first shell: the ion
+/// repels the neighbouring sugar carbons and hydroxyl hydrogens, and under the
+/// distance-dependent screening used for the rest of the receptor those
+/// repulsions cancel the attraction of the coordinating oxygens, so a pose held
+/// by a calcium in the crystal drifts away from it. This adds a Gaussian of
+/// the given `depth` (kcal/mol, a reward) and width `COORD_WIDTH` around
+/// `distance` for every (ion, ligand oxygen) pair, on top of the generic terms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalCoordination {
+    pub distance: f64,
+    pub depth: f64,
+}
+
+/// Width (standard deviation) of the coordination bonus, angstrom.
+const COORD_WIDTH: f64 = 0.3;
+/// Pairs beyond this distance get no bonus.
+const COORD_FAR: f64 = 4.4;
+/// Elements treated as metal ions.
+const METALS: [u8; 10] = [3, 11, 12, 19, 20, 25, 26, 27, 28, 29];
 
 impl GridOptions {
     pub fn new(spacing: f64, screening: Screening) -> Self {
@@ -81,6 +105,7 @@ impl GridOptions {
             screening,
             flexible_hydroxyls: false,
             temperature: 0.6,
+            metal_coordination: None,
         }
     }
 }
@@ -93,6 +118,25 @@ const FLEX_RANGE: f64 = 10.0;
 const PAIR_STEP: f64 = 0.01;
 /// Ligand atoms with a smaller partial charge are not paired with flexible hydrogens.
 const MIN_PAIR_CHARGE: f64 = 0.05;
+
+/// A receptor metal ion.
+#[derive(Debug, Clone)]
+struct Ion {
+    position: [f64; 3],
+    charge: f64,
+    radius: f64,
+    epsilon: f64,
+}
+
+/// A ligand oxygen that can coordinate an ion.
+#[derive(Debug, Clone)]
+struct OxygenProbe {
+    /// Position in the ligand atom list.
+    index: usize,
+    charge: f64,
+    radius: f64,
+    epsilon: f64,
+}
 
 /// A receptor hydroxyl hydrogen carried as discrete rotamers.
 #[derive(Debug, Clone)]
@@ -120,6 +164,9 @@ pub struct DockingGrid {
     screening: Screening,
     flexible: Vec<FlexibleHydrogen>,
     temperature: f64,
+    coordination: Option<MetalCoordination>,
+    ions: Vec<Ion>,
+    oxygens: Vec<OxygenProbe>,
     /// `1 / (eps(r) r)` every `PAIR_STEP` angstrom up to `FLEX_RANGE`, for the flexible hydrogens.
     pair_table: Vec<f64>,
 }
@@ -190,6 +237,7 @@ impl DockingGrid {
             screening,
             flexible_hydroxyls,
             temperature,
+            metal_coordination,
         } = options;
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
             return Err(EnergyError::InvalidConfiguration(
@@ -422,6 +470,35 @@ impl DockingGrid {
                     < half_width + FLEX_RANGE
             })
             .collect();
+        let (ions, oxygens) = if metal_coordination.is_some() {
+            let ions = receptor
+                .iter()
+                .filter(|&&j| METALS.contains(&atoms[j].element()))
+                .map(|&j| {
+                    let c = coordinates[j];
+                    Ion {
+                        position: [c.x, c.y, c.z],
+                        charge: atoms[j].charge(),
+                        radius: atoms[j].lennard_jones_radius(),
+                        epsilon: atoms[j].lennard_jones_epsilon(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let oxygens = ligand
+                .iter()
+                .enumerate()
+                .filter(|&(_, &i)| atoms[i].element() == 8)
+                .map(|(index, &i)| OxygenProbe {
+                    index,
+                    charge: atoms[i].charge(),
+                    radius: atoms[i].lennard_jones_radius(),
+                    epsilon: atoms[i].lennard_jones_epsilon(),
+                })
+                .collect::<Vec<_>>();
+            (ions, oxygens)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Self {
             origin,
             spacing,
@@ -434,6 +511,9 @@ impl DockingGrid {
             screening,
             flexible,
             temperature,
+            coordination: metal_coordination,
+            ions,
+            oxygens,
             pair_table: (0..=((FLEX_RANGE / PAIR_STEP) as usize + 2))
                 .map(|i| {
                     let r = (i as f64 * PAIR_STEP).max(0.5);
@@ -506,7 +586,52 @@ impl DockingGrid {
                 gradient[a].z += well_gradient[2] + charge * phi_gradient[2] + penalty_gradient[2];
             }
         }
-        total + self.flexible_term(positions, gradient)
+        let flexible = self.flexible_term(positions, gradient.as_deref_mut());
+        total + flexible + self.coordination_term(positions, gradient)
+    }
+
+    /// Number of metal ions treated with a coordination well.
+    pub fn coordinating_ions(&self) -> usize {
+        if self.coordination.is_some() {
+            self.ions.len()
+        } else {
+            0
+        }
+    }
+
+    /// The coordination bonus summed over every (ion, ligand oxygen) pair within `COORD_FAR`.
+    fn coordination_term(&self, positions: &[Vec3], mut gradient: Option<&mut [Vec3]>) -> f64 {
+        let Some(model) = self.coordination else {
+            return 0.0;
+        };
+        let mut total = 0.0;
+        for ion in &self.ions {
+            for oxygen in &self.oxygens {
+                let q = &positions[oxygen.index];
+                let delta = [
+                    q.x - ion.position[0],
+                    q.y - ion.position[1],
+                    q.z - ion.position[2],
+                ];
+                let d = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                if d >= COORD_FAR {
+                    continue;
+                }
+                let offset = (d - model.distance) / COORD_WIDTH;
+                let bonus = -model.depth * (-0.5 * offset * offset).exp();
+                total += bonus;
+                if let Some(gradient) = gradient.as_deref_mut()
+                    && d > 1.0e-6
+                {
+                    // d bonus / d d = -bonus * offset / width
+                    let slope = -bonus * offset / COORD_WIDTH;
+                    gradient[oxygen.index].x += slope * delta[0] / d;
+                    gradient[oxygen.index].y += slope * delta[1] / d;
+                    gradient[oxygen.index].z += slope * delta[2] / d;
+                }
+            }
+        }
+        total
     }
 
     /// Number of receptor hydroxyl hydrogens carried as rotamers.

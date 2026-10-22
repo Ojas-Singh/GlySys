@@ -40,6 +40,11 @@ Output changes:
   glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry. On 40 development
   lectin sites it did not improve redocking over letting the glycan's own hydroxyl rotations vary (17 vs 19 sites with
   the deposited pose within 2 A; an oracle placement of the receptor hydroxyls gave 20), so it is opt-in.
+- `GridOptions::metal_coordination`: a Gaussian reward for ligand oxygens at coordination distance of a receptor
+  metal ion, added to the generic terms. Under the distance-dependent screening a metal-bound sugar is held by
+  the attraction of its oxygens but pushed off by the ion's repulsion of the neighbouring carbons and hydroxyl hydrogens,
+  and the deposited pose of calcium-dependent lectin sites drifts 3-4 A when relaxed; the depth is an empirical,
+  tunable parameter.
 - `ScreenedInternal` and `ParameterizedSystem::without_charges`: the electrostatic energy among the atoms of one
   molecule with the same distance-dependent screening a `DockingGrid` uses for its receptor interaction (non-excluded
   pairs, 1-4 pairs scaled by `scee`). With a constant screening it reproduces the exact evaluator. A docked glycan then
