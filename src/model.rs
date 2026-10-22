@@ -252,6 +252,16 @@ impl ParameterizedSystem {
         }
     }
 
+    /// The same system with every partial charge set to zero: its energy has
+    /// no electrostatic term, for callers that add a screened one of their own.
+    pub fn without_charges(&self) -> Self {
+        let mut neutral = self.clone();
+        for atom in &mut neutral.system.atoms {
+            atom.charge = 0.0;
+        }
+        neutral
+    }
+
     /// A system made of only the listed atoms, with every bond, angle,
     /// torsion and exclusion among them, renumbered in the order given
     /// (strictly increasing). The energy of the pieces of one molecule inside

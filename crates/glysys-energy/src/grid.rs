@@ -659,6 +659,96 @@ impl DockingGrid {
     }
 }
 
+/// The electrostatic energy among the atoms of one molecule with the same
+/// distance-dependent screening a [`DockingGrid`] uses for the molecule's
+/// interaction with its receptor.
+///
+/// With one screening function for both, a glycan's internal hydrogen bonds
+/// cost the same as the ones it makes with the protein; a constant dielectric
+/// for the inside and a sigmoidal one for the outside would favour folding
+/// hydroxyls back onto the sugar. Pairs are those the force field does not
+/// exclude, with the 1-4 pairs scaled by their `scee`. Pair this with
+/// `ParameterizedSystem::without_charges` for the bonded and van der Waals terms.
+#[derive(Debug, Clone)]
+pub struct ScreenedInternal {
+    /// (first, second, 332 q q' / scee)
+    pairs: Vec<(usize, usize, f64)>,
+    table: Vec<f64>,
+}
+
+/// Table spacing and reach of [`ScreenedInternal`], angstrom.
+const INTERNAL_STEP: f64 = 0.01;
+const INTERNAL_REACH: f64 = 80.0;
+
+impl ScreenedInternal {
+    /// `system` is the molecule's own (sub)system.
+    pub fn new(system: &ParameterizedSystem, screening: Screening) -> Self {
+        let atoms = system.atoms();
+        let one_four: std::collections::HashMap<(usize, usize), f64> = system
+            .one_four_pairs()
+            .into_iter()
+            .map(|(pair, scee, _)| ((pair[0].min(pair[1]), pair[0].max(pair[1])), scee))
+            .collect();
+        let exclusions = system.exclusions();
+        let mut pairs = Vec::new();
+        for i in 0..atoms.len() {
+            for j in i + 1..atoms.len() {
+                let scale = one_four.get(&(i, j)).copied();
+                if exclusions[i].contains(&j) && scale.is_none() {
+                    continue;
+                }
+                let coefficient =
+                    COULOMB * atoms[i].charge() * atoms[j].charge() / scale.unwrap_or(1.0);
+                if coefficient != 0.0 {
+                    pairs.push((i, j, coefficient));
+                }
+            }
+        }
+        let table = (0..=((INTERNAL_REACH / INTERNAL_STEP) as usize + 2))
+            .map(|k| {
+                let r = (k as f64 * INTERNAL_STEP).max(0.5);
+                1.0 / (screening.permittivity(r) * r)
+            })
+            .collect();
+        Self { pairs, table }
+    }
+
+    /// The energy of the molecule with its atoms at `positions`; the gradient
+    /// with respect to each position is added to `gradient` when it is given.
+    pub fn energy_gradient(&self, positions: &[Vec3], mut gradient: Option<&mut [Vec3]>) -> f64 {
+        let mut total = 0.0;
+        for &(i, j, coefficient) in &self.pairs {
+            let delta = [
+                positions[j].x - positions[i].x,
+                positions[j].y - positions[i].y,
+                positions[j].z - positions[i].z,
+            ];
+            let r = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            let at = r.max(0.5) / INTERNAL_STEP;
+            let k = (at as usize).min(self.table.len() - 2);
+            let f = at - k as f64;
+            total += coefficient * (self.table[k] * (1.0 - f) + self.table[k + 1] * f);
+            if let Some(gradient) = gradient.as_deref_mut()
+                && r > 0.5
+            {
+                let slope = coefficient * (self.table[k + 1] - self.table[k]) / INTERNAL_STEP;
+                let scale = slope / r;
+                gradient[j].x += scale * delta[0];
+                gradient[j].y += scale * delta[1];
+                gradient[j].z += scale * delta[2];
+                gradient[i].x -= scale * delta[0];
+                gradient[i].y -= scale * delta[1];
+                gradient[i].z -= scale * delta[2];
+            }
+        }
+        total
+    }
+
+    pub fn energy(&self, positions: &[Vec3]) -> f64 {
+        self.energy_gradient(positions, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

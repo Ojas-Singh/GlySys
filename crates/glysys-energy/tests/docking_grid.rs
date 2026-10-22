@@ -404,3 +404,74 @@ fn flexible_hydroxyl_energy_has_a_consistent_gradient_and_lowers_the_energy() {
         }
     }
 }
+
+#[test]
+fn screened_internal_energy_matches_the_exact_evaluator_for_constant_screening() {
+    use glysys_energy::grid::ScreenedInternal;
+    let pocket = pocket();
+    let coords = pocket.system.coordinates();
+    let mut atoms = pocket.ligand.clone();
+    atoms.sort_unstable();
+    let sub = pocket.system.subsystem(&atoms).unwrap();
+    let positions: Vec<Vec3> = atoms.iter().map(|&i| coords[i]).collect();
+    let dielectric = 4.0;
+    let options = |dielectric: f64| EnergyOptions {
+        cutoff: None,
+        dielectric,
+        obc2: None,
+        ..EnergyOptions::default()
+    };
+    let exact = EnergyEvaluator::new(&sub, options(dielectric))
+        .unwrap()
+        .components(&positions)
+        .unwrap()
+        .total();
+    // Neutral system for everything but electrostatics, plus the screened Coulomb sum.
+    let neutral = sub.without_charges();
+    let rest = EnergyEvaluator::new(&neutral, options(1.0))
+        .unwrap()
+        .components(&positions)
+        .unwrap()
+        .total();
+    let screened = ScreenedInternal::new(&sub, Screening::Constant { dielectric });
+    let electrostatics = screened.energy(&positions);
+    eprintln!(
+        "exact {exact:.4}, neutral {rest:.4} + screened {electrostatics:.4} = {:.4}",
+        rest + electrostatics
+    );
+    assert!(
+        (exact - (rest + electrostatics)).abs() < 1.0e-3 * (1.0 + exact.abs()),
+        "{exact} vs {}",
+        rest + electrostatics
+    );
+    // Gradient against finite differences, with the sigmoidal screening.
+    let sigmoid = ScreenedInternal::new(&sub, Screening::MehlerSolmajer);
+    let mut gradient = vec![
+        Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0
+        };
+        positions.len()
+    ];
+    sigmoid.energy_gradient(&positions, Some(&mut gradient));
+    let h = 1.0e-4;
+    for atom in [0, 5, positions.len() - 1] {
+        for axis in 0..3 {
+            let (mut up, mut down) = (positions.clone(), positions.clone());
+            let bump = |p: &mut Vec3, d: f64| match axis {
+                0 => p.x += d,
+                1 => p.y += d,
+                _ => p.z += d,
+            };
+            bump(&mut up[atom], h);
+            bump(&mut down[atom], -h);
+            let numeric = (sigmoid.energy(&up) - sigmoid.energy(&down)) / (2.0 * h);
+            let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+            assert!(
+                (numeric - analytic).abs() < 2.0e-3 * (1.0 + analytic.abs()),
+                "atom {atom} axis {axis}: {numeric} vs {analytic}"
+            );
+        }
+    }
+}

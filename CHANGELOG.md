@@ -40,6 +40,11 @@ Output changes:
   glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry. On 40 development
   lectin sites it did not improve redocking over letting the glycan's own hydroxyl rotations vary (17 vs 19 sites with
   the deposited pose within 2 A; an oracle placement of the receptor hydroxyls gave 20), so it is opt-in.
+- `ScreenedInternal` and `ParameterizedSystem::without_charges`: the electrostatic energy among the atoms of one
+  molecule with the same distance-dependent screening a `DockingGrid` uses for its receptor interaction (non-excluded
+  pairs, 1-4 pairs scaled by `scee`). With a constant screening it reproduces the exact evaluator. A docked glycan then
+  pays the same for a hydrogen bond to itself as to the protein; a constant dielectric inside and a sigmoidal one outside
+  rewards folding hydroxyls back onto the sugar.
 - `ParameterizedSystem::subsystem`: a system of chosen atoms with the terms among
   them, so a docked glycan's internal energy is that of its own small system.
 - `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
