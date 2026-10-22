@@ -37,7 +37,9 @@ Output changes:
   about their C-O axis, left out of the tabulated potential, and enter the docking energy as a
   Boltzmann-weighted minimum over the rotamers. GlySys places hydroxyl hydrogens where they are
   farthest from their neighbours, which turns a donor away from its acceptor: in prepared deposited
-  glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry.
+  glycan complexes only half of the close donor-acceptor pairs keep a hydrogen-bonding geometry. On 40 development
+  lectin sites it did not improve redocking over letting the glycan's own hydroxyl rotations vary (17 vs 19 sites with
+  the deposited pose within 2 A; an oracle placement of the receptor hydroxyls gave 20), so it is opt-in.
 - `ParameterizedSystem::subsystem`: a system of chosen atoms with the terms among
   them, so a docked glycan's internal energy is that of its own small system.
 - `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
