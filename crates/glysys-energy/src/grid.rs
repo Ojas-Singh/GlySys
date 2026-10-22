@@ -89,6 +89,8 @@ impl GridOptions {
 const ROTAMERS: usize = 12;
 /// Ligand atoms farther than this from a flexible hydrogen are not paired with it.
 const FLEX_RANGE: f64 = 10.0;
+/// Spacing of the tabulated screened Coulomb kernel used for flexible hydrogens.
+const PAIR_STEP: f64 = 0.01;
 
 /// A receptor hydroxyl hydrogen carried as discrete rotamers.
 #[derive(Debug, Clone)]
@@ -116,6 +118,8 @@ pub struct DockingGrid {
     screening: Screening,
     flexible: Vec<FlexibleHydrogen>,
     temperature: f64,
+    /// `1 / (eps(r) r)` every `PAIR_STEP` angstrom up to `FLEX_RANGE`, for the flexible hydrogens.
+    pair_table: Vec<f64>,
 }
 
 /// A trilinear interpolant's value and gradient (per angstrom).
@@ -413,7 +417,7 @@ impl DockingGrid {
                     f.positions[0][2] - center.z,
                 ];
                 (to_center[0].powi(2) + to_center[1].powi(2) + to_center[2].powi(2)).sqrt()
-                    < half_width + FLEX_RANGE + 6.0
+                    < half_width + FLEX_RANGE
             })
             .collect();
         Ok(Self {
@@ -428,6 +432,12 @@ impl DockingGrid {
             screening,
             flexible,
             temperature,
+            pair_table: (0..=((FLEX_RANGE / PAIR_STEP) as usize + 2))
+                .map(|i| {
+                    let r = (i as f64 * PAIR_STEP).max(0.5);
+                    1.0 / (screening.permittivity(r) * r)
+                })
+                .collect(),
         })
     }
 
@@ -521,9 +531,7 @@ impl DockingGrid {
                     if d2 > range2 {
                         continue;
                     }
-                    let r = d2.sqrt().max(0.5);
-                    e += COULOMB * hydrogen.charge * self.ligand_charge[a]
-                        / (self.screening.permittivity(r) * r);
+                    e += COULOMB * hydrogen.charge * self.ligand_charge[a] * self.kernel(d2.sqrt());
                 }
                 energies[k] = e;
             }
@@ -558,12 +566,10 @@ impl DockingGrid {
                             continue;
                         }
                         let r = d2.sqrt().max(0.5);
-                        let pair = |r: f64| {
-                            COULOMB * hydrogen.charge * self.ligand_charge[a]
-                                / (self.screening.permittivity(r) * r)
-                        };
-                        let h = 1.0e-4;
-                        let slope = (pair(r + h) - pair(r - h)) / (2.0 * h);
+                        let slope = COULOMB
+                            * hydrogen.charge
+                            * self.ligand_charge[a]
+                            * self.kernel_slope(d2.sqrt());
                         gradient[a].x += weight * slope * delta[0] / r;
                         gradient[a].y += weight * slope * delta[1] / r;
                         gradient[a].z += weight * slope * delta[2] / r;
@@ -572,6 +578,23 @@ impl DockingGrid {
             }
         }
         total
+    }
+
+    /// `1 / (eps(r) r)` from the table, linearly interpolated (`r` up to `FLEX_RANGE`).
+    fn kernel(&self, r: f64) -> f64 {
+        let at = r.max(0.5) / PAIR_STEP;
+        let i = at as usize;
+        let f = at - i as f64;
+        self.pair_table[i] * (1.0 - f) + self.pair_table[i + 1] * f
+    }
+
+    /// The derivative of [`Self::kernel`] with respect to `r`.
+    fn kernel_slope(&self, r: f64) -> f64 {
+        if r < 0.5 {
+            return 0.0;
+        }
+        let i = (r / PAIR_STEP) as usize;
+        (self.pair_table[i + 1] - self.pair_table[i]) / PAIR_STEP
     }
 
     pub fn energy(&self, positions: &[Vec3]) -> f64 {
