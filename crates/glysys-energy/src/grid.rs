@@ -91,6 +91,25 @@ pub struct GridOptions {
     /// A reward (kcal/mol per glycan C-H carbon) for CH-pi stacking over the aromatic rings of Phe, Tyr, Trp and His
     /// (see [`ch_pi_weight`]); `None` switches it off.
     pub ch_pi_depth: Option<f64>,
+    /// Weights of the tabulated van der Waals and electrostatic terms in the energy (1 and 1 by default), for scoring
+    /// functions whose weights are fitted.
+    pub term_weights: [f64; 2],
+}
+
+/// The interaction terms of a pose at unit weight (see [`DockingGrid::terms`]): the energy is
+/// `w_vdw * vdw + w_elec * elec + polar_depth * polar + ch_pi_depth * ch_pi + coordination_depth * coordination + outside`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct GridTerms {
+    pub vdw: f64,
+    pub elec: f64,
+    /// Minus the polar reward field summed over the ligand O and N atoms (0 when the field was not built).
+    pub polar: f64,
+    /// Minus the CH-pi field summed over the ligand C-H carbons.
+    pub ch_pi: f64,
+    /// Minus the metal coordination Gaussians summed over (ion, ligand oxygen) pairs.
+    pub coordination: f64,
+    /// The quadratic penalty for atoms outside the grid.
+    pub outside: f64,
 }
 
 /// Geometric weight (0 to 1) of a CH-pi contact for a carbon at `offset` from an aromatic ring centre with unit normal
@@ -272,6 +291,7 @@ impl GridOptions {
             coulomb_floor: None,
             metal_oxygen_contact: false,
             ch_pi_depth: None,
+            term_weights: [1.0, 1.0],
         }
     }
 }
@@ -332,6 +352,8 @@ pub struct DockingGrid {
     polar: Option<PolarField>,
     /// The CH-pi reward's field (the ring weights summed) and its ligand atoms (carbons that carry a hydrogen).
     ch_pi: Option<PolarField>,
+    /// Weights of the van der Waals and electrostatic terms.
+    term_weights: [f64; 2],
 }
 
 /// The polar reward's grid: the sum of Gaussians around the receptor N and O atoms, and which ligand atoms are O or N.
@@ -415,6 +437,7 @@ impl DockingGrid {
             coulomb_floor,
             metal_oxygen_contact,
             ch_pi_depth,
+            term_weights,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -807,6 +830,7 @@ impl DockingGrid {
                 .collect(),
             polar,
             ch_pi,
+            term_weights,
         })
     }
 
@@ -883,24 +907,82 @@ impl DockingGrid {
                     reward_gradient[k] -= ch_pi.reward.depth * slope[k];
                 }
             }
-            total += well + charge * phi + penalty + reward;
+            let [wv, we] = self.term_weights;
+            total += wv * well + we * charge * phi + penalty + reward;
             if let Some(gradient) = gradient.as_deref_mut() {
-                gradient[a].x += well_gradient[0]
-                    + charge * phi_gradient[0]
+                gradient[a].x += wv * well_gradient[0]
+                    + we * charge * phi_gradient[0]
                     + penalty_gradient[0]
                     + reward_gradient[0];
-                gradient[a].y += well_gradient[1]
-                    + charge * phi_gradient[1]
+                gradient[a].y += wv * well_gradient[1]
+                    + we * charge * phi_gradient[1]
                     + penalty_gradient[1]
                     + reward_gradient[1];
-                gradient[a].z += well_gradient[2]
-                    + charge * phi_gradient[2]
+                gradient[a].z += wv * well_gradient[2]
+                    + we * charge * phi_gradient[2]
                     + penalty_gradient[2]
                     + reward_gradient[2];
             }
         }
         let flexible = self.flexible_term(positions, gradient.as_deref_mut());
         total + flexible + self.coordination_term(positions, gradient)
+    }
+
+    /// The interaction terms of the pose at unit weight, for fitting the weights of the score; the energy of
+    /// [`Self::energy`] is their weighted sum plus the flexible-hydrogen term (not included here).
+    pub fn terms(&self, positions: &[Vec3]) -> GridTerms {
+        const OUTSIDE: f64 = 10.0;
+        let mut t = GridTerms::default();
+        for (a, position) in positions.iter().enumerate() {
+            let p = [position.x, position.y, position.z];
+            let mut cell = [0usize; 3];
+            let mut f = [0.0; 3];
+            for k in 0..3 {
+                let top = (self.dims[k] - 1) as f64 * self.spacing;
+                let local = p[k] - self.origin[k];
+                let clamped = local.clamp(0.0, top);
+                t.outside += OUTSIDE * (local - clamped).powi(2);
+                let scaled = clamped / self.spacing;
+                cell[k] = (scaled.floor() as usize).min(self.dims[k] - 2);
+                f[k] = scaled - cell[k] as f64;
+            }
+            let (compressed, _) = trilinear(
+                &self.vdw[self.ligand_class[a]],
+                self.dims,
+                self.spacing,
+                f,
+                cell,
+            );
+            t.vdw += VDW_SCALE * compressed.sinh();
+            let (phi, _) = trilinear(&self.potential, self.dims, self.spacing, f, cell);
+            t.elec += self.ligand_charge[a] * phi;
+            if let Some(polar) = &self.polar
+                && polar.ligand[a]
+            {
+                t.polar -= trilinear(&polar.field, self.dims, self.spacing, f, cell).0;
+            }
+            if let Some(ch_pi) = &self.ch_pi
+                && ch_pi.ligand[a]
+            {
+                t.ch_pi -= trilinear(&ch_pi.field, self.dims, self.spacing, f, cell).0;
+            }
+        }
+        if let Some(model) = self.coordination {
+            for ion in &self.ions {
+                for oxygen in &self.oxygens {
+                    let q = &positions[oxygen.index];
+                    let d = ((q.x - ion.position[0]).powi(2)
+                        + (q.y - ion.position[1]).powi(2)
+                        + (q.z - ion.position[2]).powi(2))
+                    .sqrt();
+                    if d < COORD_FAR {
+                        let offset = (d - model.distance) / COORD_WIDTH;
+                        t.coordination -= (-0.5 * offset * offset).exp();
+                    }
+                }
+            }
+        }
+        t
     }
 
     /// The tabulated van der Waals and electrostatic energy of each ligand atom at `positions` (kcal/mol), without

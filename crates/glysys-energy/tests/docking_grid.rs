@@ -1026,3 +1026,76 @@ fn ch_pi_reward_holds_the_galactose_over_the_tryptophan_with_a_consistent_gradie
         }
     }
 }
+
+#[test]
+fn energy_is_the_weighted_sum_of_the_recorded_terms() {
+    use glysys_energy::grid::{GridOptions, MetalCoordination, PolarReward};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let (wv, we, polar, ch_pi, coordination) = (0.7, 1.3, 0.4, 0.6, 2.0);
+    let grid = DockingGrid::build_with(
+        &system,
+        &coords,
+        &receptor,
+        &ligand,
+        center,
+        12.0,
+        GridOptions {
+            term_weights: [wv, we],
+            polar_reward: Some(PolarReward {
+                depth: polar,
+                distance: 2.85,
+                width: 0.35,
+            }),
+            ch_pi_depth: Some(ch_pi),
+            metal_coordination: Some(MetalCoordination {
+                distance: 2.45,
+                depth: coordination,
+            }),
+            lj_cap: Some(3.0),
+            ..GridOptions::new(0.4, Screening::MehlerSolmajer)
+        },
+    )
+    .unwrap();
+    for shift in [0.0, 0.6, 13.0] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|q| Vec3 {
+                x: q.x + shift,
+                y: q.y - 0.3 * shift,
+                z: q.z,
+            })
+            .collect();
+        let t = grid.terms(&moved);
+        let sum = wv * t.vdw
+            + we * t.elec
+            + polar * t.polar
+            + ch_pi * t.ch_pi
+            + coordination * t.coordination
+            + t.outside;
+        let energy = grid.energy(&moved);
+        assert!(
+            (energy - sum).abs() < 1.0e-6 * (1.0 + energy.abs()),
+            "shift {shift}: energy {energy} vs terms {sum} ({t:?})"
+        );
+    }
+}
