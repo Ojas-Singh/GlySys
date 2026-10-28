@@ -854,3 +854,76 @@ fn coulomb_floor_removes_fusion_wells_under_the_soft_wall() {
         "with the floor the fused pose is no longer favoured"
     );
 }
+
+#[test]
+fn metal_oxygen_contact_holds_a_coordinating_oxygen_at_the_crystal_distance() {
+    use glysys_energy::grid::{GridOptions, metal_oxygen_distance};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let build = |options: GridOptions| {
+        DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, options)
+            .unwrap()
+    };
+    let generic = build(base);
+    let contact = build(GridOptions {
+        metal_oxygen_contact: true,
+        ..base
+    });
+    let atoms = system.atoms();
+    let calcium = coords[*receptor
+        .iter()
+        .find(|&&j| atoms[j].element() == 20)
+        .expect("a calcium")];
+    let dist =
+        |a: Vec3, b: Vec3| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt();
+    let (oxygen, d) = ligand
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| atoms[**i].element() == 8)
+        .map(|(k, &i)| (k, dist(coords[i], calcium)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    let (before, after) = (
+        generic.atom_terms(&positions)[oxygen][0],
+        contact.atom_terms(&positions)[oxygen][0],
+    );
+    eprintln!(
+        "coordinating oxygen at {d:.2} A: van der Waals {before:.2} with the force-field radii, {after:.2} at the crystal contact"
+    );
+    assert!(d < 2.7, "the fixture's glycan coordinates its calcium");
+    assert!(
+        after < before - 1.0 && after < 1.0,
+        "the contact distance lifts the coordinating oxygen off the wall"
+    );
+    // Only oxygen-metal pairs change: a ligand carbon sees the same field.
+    let carbon = ligand
+        .iter()
+        .position(|&i| atoms[i].element() == 6)
+        .unwrap();
+    assert!(
+        (generic.atom_terms(&positions)[carbon][0] - contact.atom_terms(&positions)[carbon][0])
+            .abs()
+            < 1.0e-9
+    );
+    assert_eq!(metal_oxygen_distance(20), Some(2.38));
+}

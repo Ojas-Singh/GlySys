@@ -83,6 +83,25 @@ pub struct GridOptions {
     pub extra_sources: &'static [ExtraSource],
     /// Soft-core electrostatics: floors on the distance in the Coulomb term (see [`CoulombFloor`]).
     pub coulomb_floor: Option<CoulombFloor>,
+    /// Place the Lennard-Jones minimum of every (receptor metal ion, ligand oxygen) pair at the metal-oxygen distance
+    /// observed in protein crystal structures ([`metal_oxygen_distance`]) instead of the combined radii of the force
+    /// field: the 12-6 ion radii are fitted to hydration free energies and put a coordinating oxygen several kcal/mol up
+    /// the repulsive wall at a crystal Ca-O distance.
+    pub metal_oxygen_contact: bool,
+}
+
+/// Mean metal-oxygen distance (angstrom) in protein metal sites (Harding, Acta Cryst. D 62, 678 (2006): Ca 2.36-2.39,
+/// Mg 2.07, Mn 2.19, Zn 2.09, Na 2.41, K 2.84), for the ions it lists; `None` for other elements.
+pub fn metal_oxygen_distance(element: u8) -> Option<f64> {
+    match element {
+        11 => Some(2.41),
+        12 => Some(2.07),
+        19 => Some(2.84),
+        20 => Some(2.38),
+        25 => Some(2.19),
+        30 => Some(2.09),
+        _ => None,
+    }
 }
 
 /// Floors on the distance at which the receptor's Coulomb potential is evaluated, so that inside them the potential is
@@ -156,6 +175,7 @@ impl GridOptions {
             polar_reward: None,
             extra_sources: &[],
             coulomb_floor: None,
+            metal_oxygen_contact: false,
         }
     }
 }
@@ -295,6 +315,7 @@ impl DockingGrid {
             polar_reward,
             extra_sources,
             coulomb_floor,
+            metal_oxygen_contact,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -320,6 +341,11 @@ impl DockingGrid {
                     classes.len() - 1
                 });
             ligand_class.push(class);
+        }
+        // Classes made of oxygen atoms (the GLYCAM and Amber oxygen types have their own Lennard-Jones parameters).
+        let mut class_oxygen = vec![true; classes.len()];
+        for (&i, &class) in ligand.iter().zip(&ligand_class) {
+            class_oxygen[class] &= atoms[i].element() == 8;
         }
         let n = (2.0 * half_width / spacing).ceil() as usize + 1;
         let dims = [n, n, n];
@@ -438,7 +464,10 @@ impl DockingGrid {
         for (k, class) in classes.iter().enumerate() {
             for (j, source) in sources.iter().enumerate() {
                 well_depth[k * source_count + j] = (class.1 * source.3).sqrt();
-                sigma6[k * source_count + j] = (class.0 + source.2).powi(6);
+                let contact = (metal_oxygen_contact && class_oxygen[k] && j < receptor.len())
+                    .then(|| metal_oxygen_distance(atoms[receptor[j]].element()))
+                    .flatten();
+                sigma6[k * source_count + j] = contact.unwrap_or(class.0 + source.2).powi(6);
             }
         }
         // 1 / (eps(r) r) on a fine table; the sigmoid is too costly per pair.
