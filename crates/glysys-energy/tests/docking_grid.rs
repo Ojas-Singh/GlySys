@@ -764,3 +764,93 @@ fn an_extra_source_acts_where_it_is_and_nowhere_else() {
     let far = build(at(positions[0], 60.0));
     assert!((far.energy(&positions) - plain.energy(&positions)).abs() < 1.0e-6);
 }
+
+#[test]
+fn coulomb_floor_removes_fusion_wells_under_the_soft_wall() {
+    use glysys_energy::grid::{CoulombFloor, GridOptions};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" {
+            &mut ligand
+        } else {
+            &mut receptor
+        }
+        .extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let build = |options: GridOptions| {
+        DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, options)
+            .unwrap()
+    };
+    let capped = build(GridOptions {
+        lj_cap: Some(3.0),
+        ..base
+    });
+    let floored = build(GridOptions {
+        lj_cap: Some(3.0),
+        coulomb_floor: Some(CoulombFloor {
+            general: 1.5,
+            metal: 2.2,
+        }),
+        ..base
+    });
+    // The deposited glycan keeps every contact outside the floors, so its energy barely moves.
+    let (deposited_capped, deposited_floored) =
+        (capped.energy(&positions), floored.energy(&positions));
+    assert!(
+        (deposited_capped - deposited_floored).abs() < 2.0,
+        "deposited pose: {deposited_capped:.2} without the floor, {deposited_floored:.2} with it"
+    );
+    // Fuse the ligand oxygen nearest to the calcium onto it.
+    let atoms = system.atoms();
+    let calcium = coords[*receptor
+        .iter()
+        .find(|&&j| atoms[j].element() == 20)
+        .expect("a calcium")];
+    let dist =
+        |a: Vec3, b: Vec3| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt();
+    let (oxygen, _) = ligand
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| atoms[**i].element() == 8)
+        .map(|(k, &i)| (k, dist(coords[i], calcium)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    let shift = Vec3 {
+        x: calcium.x - positions[oxygen].x + 0.1,
+        y: calcium.y - positions[oxygen].y,
+        z: calcium.z - positions[oxygen].z,
+    };
+    let fused: Vec<Vec3> = positions
+        .iter()
+        .map(|p| Vec3 {
+            x: p.x + shift.x,
+            y: p.y + shift.y,
+            z: p.z + shift.z,
+        })
+        .collect();
+    let (fused_capped, fused_floored) = (capped.energy(&fused), floored.energy(&fused));
+    eprintln!(
+        "deposited: capped {deposited_capped:.2}, floored {deposited_floored:.2}; fused: capped {fused_capped:.2}, floored {fused_floored:.2}"
+    );
+    assert!(
+        fused_capped < deposited_capped - 50.0,
+        "the soft wall alone rewards the fused pose"
+    );
+    assert!(
+        fused_floored > deposited_floored,
+        "with the floor the fused pose is no longer favoured"
+    );
+}

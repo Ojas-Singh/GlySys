@@ -81,6 +81,22 @@ pub struct GridOptions {
     pub polar_reward: Option<PolarReward>,
     /// Point sources that are not atoms of the system (for example crystal waters the structure fixer removed).
     pub extra_sources: &'static [ExtraSource],
+    /// Soft-core electrostatics: floors on the distance in the Coulomb term (see [`CoulombFloor`]).
+    pub coulomb_floor: Option<CoulombFloor>,
+}
+
+/// Floors on the distance at which the receptor's Coulomb potential is evaluated, so that inside them the potential is
+/// flat: the electrostatic counterpart of the soft wall. With the van der Waals energy capped (`lj_cap`), a charged
+/// ligand atom can otherwise fuse with a receptor atom of opposite charge (a hydroxyl oxygen onto a Ca2+, a hydroxyl
+/// hydrogen onto a carboxylate oxygen) for the price of the cap while gaining hundreds of kcal/mol. The floors lie
+/// below every legitimate contact distance (a hydrogen-bond H...O is at least about 1.6 A, a metal-oxygen bond about
+/// 2.0-2.6 A), so poses that respect the van der Waals radii are scored as before.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoulombFloor {
+    /// Floor (angstrom) for every receptor source that is not a metal ion.
+    pub general: f64,
+    /// Floor (angstrom) for receptor metal ions (the elements of `METALS`).
+    pub metal: f64,
 }
 
 /// An extra receptor point source: a Lennard-Jones sphere with an optional charge, and whether it counts as a polar
@@ -139,6 +155,7 @@ impl GridOptions {
             lj_cap: None,
             polar_reward: None,
             extra_sources: &[],
+            coulomb_floor: None,
         }
     }
 }
@@ -277,6 +294,7 @@ impl DockingGrid {
             lj_cap,
             polar_reward,
             extra_sources,
+            coulomb_floor,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -399,6 +417,17 @@ impl DockingGrid {
                 .map(|e| (e.position, e.charge, e.radius, e.epsilon)),
         );
         let source_count = sources.len();
+        // Per source, the distance below which its Coulomb potential stays flat (MIN_DISTANCE without a floor).
+        let floors: Vec<f64> = (0..source_count)
+            .map(|j| match coulomb_floor {
+                None => MIN_DISTANCE,
+                Some(floor) => {
+                    let metal =
+                        j < receptor.len() && METALS.contains(&atoms[receptor[j]].element());
+                    (if metal { floor.metal } else { floor.general }).max(MIN_DISTANCE)
+                }
+            })
+            .collect();
         let positions: Vec<[f64; 3]> = sources.iter().map(|s| s.0).collect();
         // Charge per source with the Coulomb constant folded in.
         let charges: Vec<f64> = sources.iter().map(|s| COULOMB * s.1).collect();
@@ -455,7 +484,7 @@ impl DockingGrid {
                                 + (p[1] - q[1]).powi(2)
                                 + (p[2] - q[2]).powi(2);
                             let r = d2.sqrt().max(MIN_DISTANCE);
-                            let at = r / TABLE_STEP;
+                            let at = r.max(floors[j]) / TABLE_STEP;
                             let (i, f) = (at as usize, at - (at as usize) as f64);
                             phi += charges[j] * (screened[i] * (1.0 - f) + screened[i + 1] * f);
                             if d2 < cutoff2 {
@@ -687,6 +716,36 @@ impl DockingGrid {
         }
         let flexible = self.flexible_term(positions, gradient.as_deref_mut());
         total + flexible + self.coordination_term(positions, gradient)
+    }
+
+    /// The tabulated van der Waals and electrostatic energy of each ligand atom at `positions` (kcal/mol), without
+    /// the outside penalty, the polar reward, the flexible hydrogens or the coordination term: a diagnostic of which
+    /// atoms carry the interaction energy.
+    pub fn atom_terms(&self, positions: &[Vec3]) -> Vec<[f64; 2]> {
+        positions
+            .iter()
+            .enumerate()
+            .map(|(a, position)| {
+                let p = [position.x, position.y, position.z];
+                let mut cell = [0usize; 3];
+                let mut f = [0.0; 3];
+                for k in 0..3 {
+                    let top = (self.dims[k] - 1) as f64 * self.spacing;
+                    let scaled = (p[k] - self.origin[k]).clamp(0.0, top) / self.spacing;
+                    cell[k] = (scaled.floor() as usize).min(self.dims[k] - 2);
+                    f[k] = scaled - cell[k] as f64;
+                }
+                let (compressed, _) = trilinear(
+                    &self.vdw[self.ligand_class[a]],
+                    self.dims,
+                    self.spacing,
+                    f,
+                    cell,
+                );
+                let (phi, _) = trilinear(&self.potential, self.dims, self.spacing, f, cell);
+                [VDW_SCALE * compressed.sinh(), self.ligand_charge[a] * phi]
+            })
+            .collect()
     }
 
     /// Number of metal ions treated with a coordination well.
