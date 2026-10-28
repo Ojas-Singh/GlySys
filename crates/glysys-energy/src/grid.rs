@@ -94,6 +94,58 @@ pub struct GridOptions {
     /// Weights of the tabulated van der Waals and electrostatic terms in the energy (1 and 1 by default), for scoring
     /// functions whose weights are fitted.
     pub term_weights: [f64; 2],
+    /// Depths (kcal/mol per unit field) of the contact terms of [`CONTACT_KINDS`]; `None` builds none of their fields,
+    /// zeros build them without effect on the energy (to record them for a fit).
+    pub contact_depths: Option<[f64; 4]>,
+}
+
+/// The contact terms, in the order of `contact_depths` and [`GridTerms::contacts`]: each is a sum of Gaussians
+/// `exp(-(d - distance)^2 / (2 width^2))` over a set of receptor atoms, felt by a set of ligand atoms.
+/// - `hydrophobic`: receptor carbons bonded to no N or O, felt by ligand carbons (4.0 A, width 0.5);
+/// - `cation`: Lys NZ and Arg NE/NH1/NH2, felt by ligand oxygens (3.0 A, width 0.35);
+/// - `carboxylate`: Asp OD1/OD2 and Glu OE1/OE2, felt by ligand oxygens (2.7 A, width 0.3);
+/// - `oxygen_burial`: every receptor heavy atom that is not a metal, felt by ligand oxygens (4.0 A, width 0.6), a
+///   burial count of the glycan's oxygens (a desolvation proxy, whose weight may come out negative).
+pub const CONTACT_KINDS: [&str; 4] = ["hydrophobic", "cation", "carboxylate", "oxygen_burial"];
+const CONTACT_SHAPES: [(f64, f64); 4] = [(4.0, 0.5), (3.0, 0.35), (2.7, 0.3), (4.0, 0.6)];
+
+/// A sum of Gaussians around `sources` on the grid (zero beyond `distance + 4 width`).
+fn gaussian_field(
+    sources: &[[f64; 3]],
+    distance: f64,
+    width: f64,
+    origin: [f64; 3],
+    spacing: f64,
+    n: usize,
+) -> Vec<f32> {
+    let reach = distance + 4.0 * width;
+    let reach2 = reach * reach;
+    let mut field = vec![0.0f32; n * n * n];
+    field
+        .par_chunks_mut(n * n)
+        .enumerate()
+        .for_each(|(x, chunk)| {
+            for y in 0..n {
+                for z in 0..n {
+                    let p = [
+                        origin[0] + x as f64 * spacing,
+                        origin[1] + y as f64 * spacing,
+                        origin[2] + z as f64 * spacing,
+                    ];
+                    let mut sum = 0.0;
+                    for q in sources {
+                        let d2 =
+                            (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                        if d2 < reach2 {
+                            let u = (d2.sqrt() - distance) / width;
+                            sum += (-0.5 * u * u).exp();
+                        }
+                    }
+                    chunk[y * n + z] = sum as f32;
+                }
+            }
+        });
+    field
 }
 
 /// The interaction terms of a pose at unit weight (see [`DockingGrid::terms`]): the energy is
@@ -110,6 +162,8 @@ pub struct GridTerms {
     pub coordination: f64,
     /// The quadratic penalty for atoms outside the grid.
     pub outside: f64,
+    /// Minus each contact field (see [`CONTACT_KINDS`]) summed over its ligand atoms (0 when not built).
+    pub contacts: [f64; 4],
 }
 
 /// Geometric weight (0 to 1) of a CH-pi contact for a carbon at `offset` from an aromatic ring centre with unit normal
@@ -292,6 +346,7 @@ impl GridOptions {
             metal_oxygen_contact: false,
             ch_pi_depth: None,
             term_weights: [1.0, 1.0],
+            contact_depths: None,
         }
     }
 }
@@ -354,6 +409,8 @@ pub struct DockingGrid {
     ch_pi: Option<PolarField>,
     /// Weights of the van der Waals and electrostatic terms.
     term_weights: [f64; 2],
+    /// The contact terms' fields and ligand masks, with their depths in `reward.depth`.
+    contacts: Vec<PolarField>,
 }
 
 /// The polar reward's grid: the sum of Gaussians around the receptor N and O atoms, and which ligand atoms are O or N.
@@ -438,6 +495,7 @@ impl DockingGrid {
             metal_oxygen_contact,
             ch_pi_depth,
             term_weights,
+            contact_depths,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -786,6 +844,80 @@ impl DockingGrid {
                     .collect(),
             }
         });
+        let contacts: Vec<PolarField> = match contact_depths {
+            None => Vec::new(),
+            Some(depths) => {
+                let mut bonded_polar = vec![false; atoms.len()];
+                for bond in system.bonds() {
+                    let [a, b] = bond.atoms();
+                    if matches!(atoms[b].element(), 7 | 8) {
+                        bonded_polar[a] = true;
+                    }
+                    if matches!(atoms[a].element(), 7 | 8) {
+                        bonded_polar[b] = true;
+                    }
+                }
+                let mut residue_name = vec![""; atoms.len()];
+                for residue in system.residues() {
+                    for i in residue.atom_range() {
+                        residue_name[i] = residue.name();
+                    }
+                }
+                let pick = |keep: &dyn Fn(usize) -> bool| -> Vec<[f64; 3]> {
+                    receptor
+                        .iter()
+                        .copied()
+                        .filter(|&j| keep(j))
+                        .map(|j| [coordinates[j].x, coordinates[j].y, coordinates[j].z])
+                        .collect()
+                };
+                let cationic = |j: usize| {
+                    let r = residue_name[j];
+                    let n = atoms[j].name();
+                    (r.ends_with("LYS") || r.ends_with("LYN")) && n == "NZ"
+                        || r.ends_with("ARG") && matches!(n, "NE" | "NH1" | "NH2")
+                };
+                let carboxylate = |j: usize| {
+                    let r = residue_name[j];
+                    let n = atoms[j].name();
+                    (r.ends_with("ASP") || r.ends_with("ASH")) && matches!(n, "OD1" | "OD2")
+                        || (r.ends_with("GLU") || r.ends_with("GLH")) && matches!(n, "OE1" | "OE2")
+                };
+                let sources = [
+                    pick(&|j| atoms[j].element() == 6 && !bonded_polar[j]),
+                    pick(&cationic),
+                    pick(&carboxylate),
+                    pick(&|j| atoms[j].element() != 1 && !METALS.contains(&atoms[j].element())),
+                ];
+                (0..4)
+                    .map(|k| PolarField {
+                        reward: PolarReward {
+                            depth: depths[k],
+                            distance: CONTACT_SHAPES[k].0,
+                            width: CONTACT_SHAPES[k].1,
+                        },
+                        field: gaussian_field(
+                            &sources[k],
+                            CONTACT_SHAPES[k].0,
+                            CONTACT_SHAPES[k].1,
+                            origin,
+                            spacing,
+                            n,
+                        ),
+                        ligand: ligand
+                            .iter()
+                            .map(|&i| {
+                                if k == 0 {
+                                    atoms[i].element() == 6
+                                } else {
+                                    atoms[i].element() == 8
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }
+        };
         let (ions, oxygens) = if metal_coordination.is_some() {
             let ions = receptor
                 .iter()
@@ -831,6 +963,7 @@ impl DockingGrid {
             polar,
             ch_pi,
             term_weights,
+            contacts,
         })
     }
 
@@ -907,6 +1040,16 @@ impl DockingGrid {
                     reward_gradient[k] -= ch_pi.reward.depth * slope[k];
                 }
             }
+            for contact in &self.contacts {
+                if contact.ligand[a] && contact.reward.depth != 0.0 {
+                    let (value, slope) =
+                        trilinear(&contact.field, self.dims, self.spacing, f, cell);
+                    reward -= contact.reward.depth * value;
+                    for k in 0..3 {
+                        reward_gradient[k] -= contact.reward.depth * slope[k];
+                    }
+                }
+            }
             let [wv, we] = self.term_weights;
             total += wv * well + we * charge * phi + penalty + reward;
             if let Some(gradient) = gradient.as_deref_mut() {
@@ -965,6 +1108,11 @@ impl DockingGrid {
                 && ch_pi.ligand[a]
             {
                 t.ch_pi -= trilinear(&ch_pi.field, self.dims, self.spacing, f, cell).0;
+            }
+            for (k, contact) in self.contacts.iter().enumerate() {
+                if contact.ligand[a] {
+                    t.contacts[k] -= trilinear(&contact.field, self.dims, self.spacing, f, cell).0;
+                }
             }
         }
         if let Some(model) = self.coordination {

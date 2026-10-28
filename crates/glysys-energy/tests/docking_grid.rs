@@ -1052,6 +1052,7 @@ fn energy_is_the_weighted_sum_of_the_recorded_terms() {
     let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
     let center = centroid(&positions);
     let (wv, we, polar, ch_pi, coordination) = (0.7, 1.3, 0.4, 0.6, 2.0);
+    let contacts = [0.3, 0.4, 0.5, -0.2];
     let grid = DockingGrid::build_with(
         &system,
         &coords,
@@ -1072,6 +1073,7 @@ fn energy_is_the_weighted_sum_of_the_recorded_terms() {
                 depth: coordination,
             }),
             lj_cap: Some(3.0),
+            contact_depths: Some(contacts),
             ..GridOptions::new(0.4, Screening::MehlerSolmajer)
         },
     )
@@ -1091,7 +1093,15 @@ fn energy_is_the_weighted_sum_of_the_recorded_terms() {
             + polar * t.polar
             + ch_pi * t.ch_pi
             + coordination * t.coordination
-            + t.outside;
+            + t.outside
+            + (0..4).map(|k| contacts[k] * t.contacts[k]).sum::<f64>();
+        if shift == 0.0 {
+            assert!(
+                t.contacts.iter().all(|&c| c < 0.0),
+                "every contact field is felt in the pocket: {:?}",
+                t.contacts
+            );
+        }
         let energy = grid.energy(&moved);
         assert!(
             (energy - sum).abs() < 1.0e-6 * (1.0 + energy.abs()),
