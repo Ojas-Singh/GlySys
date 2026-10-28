@@ -911,8 +911,9 @@ fn metal_oxygen_contact_holds_a_coordinating_oxygen_at_the_crystal_distance() {
         "coordinating oxygen at {d:.2} A: van der Waals {before:.2} with the force-field radii, {after:.2} at the crystal contact"
     );
     assert!(d < 2.7, "the fixture's glycan coordinates its calcium");
+    // The calcium's share of the repulsion goes; what is left comes from the hydrogen-bonded protein oxygens.
     assert!(
-        after < before - 1.0 && after < 1.0,
+        after < before - 3.0,
         "the contact distance lifts the coordinating oxygen off the wall"
     );
     // Only oxygen-metal pairs change: a ligand carbon sees the same field.
