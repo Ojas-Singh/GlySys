@@ -928,3 +928,101 @@ fn metal_oxygen_contact_holds_a_coordinating_oxygen_at_the_crystal_distance() {
     );
     assert_eq!(metal_oxygen_distance(20), Some(2.38));
 }
+
+#[test]
+fn ch_pi_weight_follows_the_stacking_geometry() {
+    use glysys_energy::grid::ch_pi_weight;
+    let normal = [0.0, 0.0, 1.0];
+    assert_eq!(ch_pi_weight([0.0, 0.0, 3.8], normal), 1.0);
+    assert_eq!(
+        ch_pi_weight([0.0, 0.0, -3.8], normal),
+        1.0,
+        "either face of the ring"
+    );
+    assert_eq!(
+        ch_pi_weight([3.8, 0.0, 0.0], normal),
+        0.0,
+        "in the ring plane"
+    );
+    assert_eq!(ch_pi_weight([0.0, 0.0, 5.0], normal), 0.0, "too far");
+    assert_eq!(ch_pi_weight([0.0, 0.0, 2.9], normal), 0.0, "too close");
+    let tilted = 35.0f64.to_radians();
+    let w = ch_pi_weight([3.8 * tilted.sin(), 0.0, 3.8 * tilted.cos()], normal);
+    assert!(
+        (w - 0.5).abs() < 1.0e-9,
+        "half way through the angular taper: {w}"
+    );
+}
+
+#[test]
+fn ch_pi_reward_holds_the_galactose_over_the_tryptophan_with_a_consistent_gradient() {
+    use glysys_energy::grid::GridOptions;
+    let p = pocket();
+    let coords = p.system.coordinates();
+    let positions: Vec<Vec3> = p.ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let build = |options: GridOptions| {
+        DockingGrid::build_with(
+            &p.system,
+            &coords,
+            &p.receptor,
+            &p.ligand,
+            center,
+            12.0,
+            options,
+        )
+        .unwrap()
+    };
+    let plain = build(base);
+    let stacked = build(GridOptions {
+        ch_pi_depth: Some(1.0),
+        ..base
+    });
+    let gain = plain.energy(&positions) - stacked.energy(&positions);
+    eprintln!("CH-pi reward of the deposited lactose: {gain:.2} kcal/mol at depth 1");
+    assert!(
+        gain > 1.0,
+        "the galactose of a galectin stacks on its tryptophan"
+    );
+    // Gradient against finite differences, at the deposited pose and slightly shifted.
+    for shift in [0.0, 0.2] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|q| Vec3 {
+                x: q.x + shift,
+                y: q.y,
+                z: q.z - 0.5 * shift,
+            })
+            .collect();
+        let mut gradient = vec![
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0
+            };
+            moved.len()
+        ];
+        stacked.energy_gradient(&moved, Some(&mut gradient));
+        let h = 1.0e-4;
+        for atom in [0, moved.len() / 2, moved.len() - 1] {
+            for axis in 0..3 {
+                let mut plus = moved.clone();
+                let mut minus = moved.clone();
+                let bump = |v: &mut Vec3, d: f64| match axis {
+                    0 => v.x += d,
+                    1 => v.y += d,
+                    _ => v.z += d,
+                };
+                bump(&mut plus[atom], h);
+                bump(&mut minus[atom], -h);
+                let numeric = (stacked.energy(&plus) - stacked.energy(&minus)) / (2.0 * h);
+                let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+                assert!(
+                    (numeric - analytic).abs() < 1.0e-3 * (1.0 + numeric.abs()),
+                    "atom {atom} axis {axis}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
+}

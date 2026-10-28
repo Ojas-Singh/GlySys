@@ -88,6 +88,101 @@ pub struct GridOptions {
     /// field: the 12-6 ion radii are fitted to hydration free energies and put a coordinating oxygen several kcal/mol up
     /// the repulsive wall at a crystal Ca-O distance.
     pub metal_oxygen_contact: bool,
+    /// A reward (kcal/mol per glycan C-H carbon) for CH-pi stacking over the aromatic rings of Phe, Tyr, Trp and His
+    /// (see [`ch_pi_weight`]); `None` switches it off.
+    pub ch_pi_depth: Option<f64>,
+}
+
+/// Geometric weight (0 to 1) of a CH-pi contact for a carbon at `offset` from an aromatic ring centre with unit normal
+/// `normal`: 1 when the carbon lies 3.4-4.3 A from the centre within 25 degrees of the normal, tapering smoothly
+/// (cosine) to 0 at 3.0 and 4.8 A and at 45 degrees; the usual geometry of a sugar C-H stacked on an aromatic side chain.
+pub fn ch_pi_weight(offset: [f64; 3], normal: [f64; 3]) -> f64 {
+    let d = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+    if !(3.0..4.8).contains(&d) {
+        return 0.0;
+    }
+    // 1 at `full`, 0 at `zero`, a half cosine in between (only called between the two)
+    let taper = |x: f64, full: f64, zero: f64| {
+        0.5 * (1.0 + (std::f64::consts::PI * (x - full) / (zero - full)).cos())
+    };
+    let radial = if d < 3.4 {
+        taper(d, 3.4, 3.0)
+    } else if d > 4.3 {
+        taper(d, 4.3, 4.8)
+    } else {
+        1.0
+    };
+    let cos = ((offset[0] * normal[0] + offset[1] * normal[1] + offset[2] * normal[2]) / d)
+        .abs()
+        .min(1.0);
+    let angle = cos.acos().to_degrees();
+    let angular = if angle <= 25.0 {
+        1.0
+    } else if angle >= 45.0 {
+        0.0
+    } else {
+        taper(angle, 25.0, 45.0)
+    };
+    radial * angular
+}
+
+/// Aromatic rings of the receptor (Phe, Tyr, Trp, His in their Amber names): centre and unit normal.
+fn aromatic_rings(
+    system: &ParameterizedSystem,
+    coordinates: &[Vec3],
+    receptor: &[usize],
+) -> Vec<([f64; 3], [f64; 3])> {
+    const SIX: [&str; 6] = ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"];
+    const TRP6: [&str; 6] = ["CD2", "CE2", "CE3", "CZ2", "CZ3", "CH2"];
+    const TRP5: [&str; 5] = ["CG", "CD1", "NE1", "CE2", "CD2"];
+    const HIS5: [&str; 5] = ["CG", "ND1", "CD2", "CE1", "NE2"];
+    let in_receptor: std::collections::BTreeSet<usize> = receptor.iter().copied().collect();
+    let atoms = system.atoms();
+    let mut rings = Vec::new();
+    for residue in system.residues() {
+        let range = residue.atom_range();
+        if !in_receptor.contains(&range.start) {
+            continue;
+        }
+        let name = residue.name();
+        let sets: Vec<&[&str]> = match name {
+            "PHE" | "TYR" | "NPHE" | "CPHE" | "NTYR" | "CTYR" => vec![&SIX],
+            "TRP" | "NTRP" | "CTRP" => vec![&TRP6, &TRP5],
+            "HIS" | "HID" | "HIE" | "HIP" | "NHID" | "NHIE" | "NHIP" | "CHID" | "CHIE" | "CHIP" => {
+                vec![&HIS5]
+            }
+            _ => continue,
+        };
+        for set in sets {
+            let points: Vec<[f64; 3]> = set
+                .iter()
+                .filter_map(|n| range.clone().find(|&i| atoms[i].name() == *n))
+                .map(|i| [coordinates[i].x, coordinates[i].y, coordinates[i].z])
+                .collect();
+            if points.len() != set.len() {
+                continue;
+            }
+            let k = points.len() as f64;
+            let c = [0, 1, 2].map(|d| points.iter().map(|p| p[d]).sum::<f64>() / k);
+            // normal: the cross product of two chords across the ring
+            let a = [0, 1, 2].map(|d| points[0][d] - c[d]);
+            let b = [0, 1, 2].map(|d| points[points.len() / 2][d] - c[d]);
+            let e = [0, 1, 2].map(|d| points[1][d] - c[d]);
+            let f = [0, 1, 2].map(|d| points[points.len() / 2 + 1][d] - c[d]);
+            let u = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            let v = [e[0] - f[0], e[1] - f[1], e[2] - f[2]];
+            let nrm = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+            if len > 1.0e-9 {
+                rings.push((c, [nrm[0] / len, nrm[1] / len, nrm[2] / len]));
+            }
+        }
+    }
+    rings
 }
 
 /// Mean metal-oxygen distance (angstrom) in protein metal sites (Harding, Acta Cryst. D 62, 678 (2006): Ca 2.36-2.39,
@@ -176,6 +271,7 @@ impl GridOptions {
             extra_sources: &[],
             coulomb_floor: None,
             metal_oxygen_contact: false,
+            ch_pi_depth: None,
         }
     }
 }
@@ -234,6 +330,8 @@ pub struct DockingGrid {
     /// `1 / (eps(r) r)` every `PAIR_STEP` angstrom up to `FLEX_RANGE`, for the flexible hydrogens.
     pair_table: Vec<f64>,
     polar: Option<PolarField>,
+    /// The CH-pi reward's field (the ring weights summed) and its ligand atoms (carbons that carry a hydrogen).
+    ch_pi: Option<PolarField>,
 }
 
 /// The polar reward's grid: the sum of Gaussians around the receptor N and O atoms, and which ligand atoms are O or N.
@@ -316,6 +414,7 @@ impl DockingGrid {
             extra_sources,
             coulomb_floor,
             metal_oxygen_contact,
+            ch_pi_depth,
         } = options;
         let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
@@ -617,6 +716,53 @@ impl DockingGrid {
                     .collect(),
             }
         });
+        let ch_pi = ch_pi_depth.map(|depth| {
+            let rings = aromatic_rings(system, coordinates, receptor);
+            let mut field = vec![0.0f32; total];
+            field
+                .par_chunks_mut(slab)
+                .enumerate()
+                .for_each(|(x, chunk)| {
+                    for y in 0..n {
+                        for z in 0..n {
+                            let p = [
+                                origin[0] + x as f64 * spacing,
+                                origin[1] + y as f64 * spacing,
+                                origin[2] + z as f64 * spacing,
+                            ];
+                            let sum: f64 = rings
+                                .iter()
+                                .map(|(c, normal)| {
+                                    ch_pi_weight([p[0] - c[0], p[1] - c[1], p[2] - c[2]], *normal)
+                                })
+                                .sum();
+                            chunk[y * n + z] = sum as f32;
+                        }
+                    }
+                });
+            let mut has_hydrogen = vec![false; atoms.len()];
+            for bond in system.bonds() {
+                let [a, b] = bond.atoms();
+                if atoms[a].element() == 1 {
+                    has_hydrogen[b] = true;
+                }
+                if atoms[b].element() == 1 {
+                    has_hydrogen[a] = true;
+                }
+            }
+            PolarField {
+                reward: PolarReward {
+                    depth,
+                    distance: 0.0,
+                    width: 1.0,
+                },
+                field,
+                ligand: ligand
+                    .iter()
+                    .map(|&i| atoms[i].element() == 6 && has_hydrogen[i])
+                    .collect(),
+            }
+        });
         let (ions, oxygens) = if metal_coordination.is_some() {
             let ions = receptor
                 .iter()
@@ -660,6 +806,7 @@ impl DockingGrid {
                 })
                 .collect(),
             polar,
+            ch_pi,
         })
     }
 
@@ -726,6 +873,15 @@ impl DockingGrid {
                 let (value, slope) = trilinear(&polar.field, self.dims, self.spacing, f, cell);
                 reward = -polar.reward.depth * value;
                 reward_gradient = slope.map(|g| -polar.reward.depth * g);
+            }
+            if let Some(ch_pi) = &self.ch_pi
+                && ch_pi.ligand[a]
+            {
+                let (value, slope) = trilinear(&ch_pi.field, self.dims, self.spacing, f, cell);
+                reward -= ch_pi.reward.depth * value;
+                for k in 0..3 {
+                    reward_gradient[k] -= ch_pi.reward.depth * slope[k];
+                }
             }
             total += well + charge * phi + penalty + reward;
             if let Some(gradient) = gradient.as_deref_mut() {
