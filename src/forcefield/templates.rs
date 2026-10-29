@@ -75,6 +75,9 @@ impl TemplateSet {
         let web = parse_off(amber_data::GLYCAM_GMML2_LIB)?;
         let glycam_web = web.keys().cloned().collect();
         glycans.extend(web);
+        // GLYCAM-Web builds galactofuranose with C5 inverted (L-altro): put
+        // the centres the library gets wrong right (carbohydrate.rs).
+        crate::carbohydrate::correct_library_stereochemistry(&mut glycans);
         let ions = parse_off(amber_data::ATOMIC_IONS)?;
         let mut nucleic = parse_off(amber_data::DNA_OL15)?;
         nucleic.extend(parse_off(amber_data::RNA_OL3)?);

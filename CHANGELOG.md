@@ -23,6 +23,17 @@ Output changes:
   which moved hydrogens built from template geometry.
 - A free reducing end without O1 gets it back as `ROH`, for the anomer the
   residue name gives.
+- GLYCAM-Web's galactofuranose templates (`xLU`, `xLD`) are corrected when
+  they are loaded: as shipped they are beta/alpha-L-altrofuranose (C5
+  inverted, and C1 anomeric relative to that wrong C5, so both centres differ
+  from the residue named; crabWURCS reads `LAltf`). After the correction
+  crabWURCS reads `0LU` as `DGalfb` and `0LD` as `DGalfa`, and a deposited
+  D-galactofuranose gets the anomer its coordinates have. An input built by
+  GLYCAM-Web (beta/alpha-L-altrofuranose under a Galf name) is refused with
+  the reason, also when its name is a GLYCAM template: preparing it by name
+  would simulate the wrong sugar. It cannot be inverted in place (C1 needs the
+  residue rebuilt about its glycosidic bond); rebuild it with corrected
+  templates.
 
 ### Changes
 

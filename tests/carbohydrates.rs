@@ -89,25 +89,100 @@ fn a_reducing_end_deposited_without_o1_gets_it_back_from_the_name() {
 }
 
 #[test]
-fn glycam_web_galactofuranose_prepares_and_its_c5_is_reported() {
+fn glycam_web_galactofuranose_is_refused_as_l_altrofuranose() {
     // DGalfb1-2LArafb1-2LArafb1-OH assembled from GLYCAM-Web's library
-    // coordinates (ROH 2aU 2aU 0LU).  0LU is not in GLYCAM06j-1; its library
-    // coordinates put C5 in the L-altro configuration, which is reported.
-    let report = inspect(include_str!(
-        "fixtures/carbohydrates/glycam_web_galf_araf_araf.pdb"
-    ));
-    assert_integral(&report, 0.0);
+    // coordinates (ROH 2aU 2aU 0LU): its "beta-D-Galf" is beta-L-altrofuranose
+    // (C1 and C5 inverted; crabWURCS reads LAltf).  GlySys has corrected the
+    // templates and refuses this input with the reason, also though 0LU names
+    // a GLYCAM template: preparing it by name would keep the wrong sugar.
+    let pdb = include_str!("fixtures/carbohydrates/glycam_web_galf_araf_araf.pdb");
+    assert!(crabwurcs_galf(pdb).starts_with("LAltfb1-2"));
+    let report = inspect(pdb);
+    assert_eq!(
+        report.unsupported_residues.len(),
+        1,
+        "{:?}",
+        report.warnings
+    );
     assert!(report.warnings.iter().any(|warning| matches!(
         warning,
-        BuildWarning::GlycanStereochemistry(message)
-            if message.contains("0LU") && message.contains("altrofuranose")
+        BuildWarning::UnsupportedResidue(message)
+            if message.contains("beta-L-altrofuranose") && message.contains("GLYCAM-Web")
     )));
+    assert!(
+        SystemBuilder::new(BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..BuildOptions::default()
+        })
+        .unwrap()
+        .prepare_pdb_str(pdb)
+        .is_err()
+    );
+}
+
+/// The prepared structure of `pdb`: its PDB text and the chiral volume at
+/// C5 of the galactofuranose (C4, C6, O5 around C5).
+fn prepared_galf_any(pdb: &str, suffix: &str) -> (String, f64) {
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(pdb)
+    .unwrap();
+    let text = system.pdb_string();
+    let atom = |name: &str| {
+        text.lines()
+            .find(|line| {
+                { line.starts_with("ATOM") || line.starts_with("HETATM") }
+                    .then_some(line)
+                    .filter(|line| {
+                        line.get(17..20).is_some_and(|r| r.ends_with(suffix))
+                            && line.get(12..16).map(str::trim) == Some(name)
+                    })
+                    .is_some()
+            })
+            .map(|line| {
+                [30..38, 38..46, 46..54].map(|range| line[range].trim().parse::<f64>().unwrap())
+            })
+            .unwrap_or_else(|| panic!("no {name} in the galactofuranose"))
+    };
+    let (c5, c4, c6, o5) = (atom("C5"), atom("C4"), atom("C6"), atom("O5"));
+    let d = |p: [f64; 3]| [p[0] - c5[0], p[1] - c5[1], p[2] - c5[2]];
+    let (u, v, w) = (d(c4), d(c6), d(o5));
+    let volume = u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0])
+        + u[2] * (v[0] * w[1] - v[1] * w[0]);
+    (text, volume)
+}
+
+/// The furanose GLYCAM names crabWURCS reads from a prepared structure.
+fn crabwurcs_galf(text: &str) -> String {
+    let glycans = crabwurcs::pdb::extract_glycans_from_str(text, false).unwrap();
+    glycans
+        .iter()
+        .filter_map(|glycan| {
+            crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Glycam).ok()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
-fn d_galactofuranose_with_the_right_c5_is_not_reported() {
-    // The same trisaccharide with C5 of the Galf inverted to D-galacto by
-    // swapping its O5 (and HO5) with H5.
+fn a_galactofuranose_with_c5_inverted_alone_is_alpha_d_galactofuranose() {
+    // Inverting only C5 of GLYCAM-Web's "beta" Galf gives alpha-D-Galf: the
+    // anomer is defined relative to C5, and GLYCAM-Web built C1 relative to
+    // its wrong C5.  GlySys reads the coordinates, so it prepares the alpha
+    // template (renaming the input's 0LU), and crabWURCS agrees.
+    let (text, _) = prepared_galf_any(&d_galactofuranose_input(), "LD");
+    let names = crabwurcs_galf(&text);
+    assert!(names.starts_with("DGalfa1-2"), "crabWURCS reads {names}");
+}
+
+/// The GLYCAM-Web trisaccharide with C5 of the Galf inverted to D-galacto by
+/// swapping its O5 (and HO5) with H5.
+fn d_galactofuranose_input() -> String {
     let pdb = include_str!("fixtures/carbohydrates/glycam_web_galf_araf_araf.pdb");
     let atom = |name: &str| {
         pdb.lines()
@@ -130,8 +205,7 @@ fn d_galactofuranose_with_the_right_c5_is_not_reported() {
     let new_o5 = place(to_h, 1.43);
     let new_h5 = place(to_o, 1.10);
     let shift = [0, 1, 2].map(|k| new_o5[k] - o5[k]);
-    let edited = pdb
-        .lines()
+    pdb.lines()
         .map(|line| {
             let name = line.get(12..16).map(str::trim).unwrap_or("");
             if line.get(17..20) != Some("0LU") || !matches!(name, "O5" | "H5" | "H5O") {
@@ -154,14 +228,24 @@ fn d_galactofuranose_with_the_right_c5_is_not_reported() {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    let report = inspect(&edited);
+        .join("\n")
+}
+
+#[test]
+fn d_galactofuranose_prepares_without_a_stereochemistry_warning() {
+    // The GLYCAM-Web trisaccharide with C5 of the Galf inverted (alpha-D-Galf).
+    let report = inspect(&d_galactofuranose_input());
     assert_integral(&report, 0.0);
     assert!(
         !report
             .warnings
             .iter()
             .any(|warning| matches!(warning, BuildWarning::GlycanStereochemistry(_))),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        resolved(&report).iter().any(|name| name.ends_with("LD")),
         "{:?}",
         report.warnings
     );

@@ -122,7 +122,7 @@ impl SystemBuilder {
                 || self.templates.glycan(name).is_some()
                 || self.components.get(name).is_some();
             if let Some(reason) = carbohydrate_errors.get(&residue_key(residue))
-                && !covered
+                && (!covered || reason.contains(crate::carbohydrate::LIBRARY_REFUSAL))
             {
                 warnings.push(BuildWarning::UnsupportedResidue(format!(
                     "{}: {reason}",
@@ -479,6 +479,15 @@ impl SystemBuilder {
                 Ok(self.templates.nucleic(name, five, three))
             } else if is_ion {
                 Ok(self.templates.ion(&name.to_ascii_uppercase()))
+            } else if let Some(reason) = carbohydrate_errors
+                .get(&residue_key(residue))
+                .filter(|reason| reason.contains(crate::carbohydrate::LIBRARY_REFUSAL))
+            {
+                // GLYCAM-Web's inverted galactofuranose: never prepared by name.
+                Err(BuildError::UnsupportedResidue {
+                    residue: residue.reference.to_string(),
+                    reason: reason.clone(),
+                })
             } else if let Some(template) = self.templates.glycan(name) {
                 if glycam_fits(template) || self.components.get(name).is_none() {
                     Ok(Some(template))

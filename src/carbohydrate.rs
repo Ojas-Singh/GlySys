@@ -15,23 +15,11 @@ use crate::model::Vec3;
 use crate::pdb::PdbResidue;
 
 /// Stereocentres where the GLYCAM library's own coordinates contradict the
-/// residue they name, found by reading every template with crabWURCS:
-/// GLYCAM-Web's galactofuranose forms (`xLU`, `xLD`) are built with C5
-/// inverted, the L-altro configuration.  The centre does not decide the
-/// residue (GLYCAM has no altrofuranose and the charges are the Galf ones);
-/// an input that follows the library there is reported.
-/// (residue suffix, atom, what an input with the library's configuration is)
+/// residue they name, found by reading every template with crabWURCS, and
+/// left as they are: an input with the library's configuration there is
+/// reported.  (residue suffix, atom, what an input with the library's
+/// configuration is)
 const LIBRARY_STEREO_ERRORS: &[(&str, &str, &str)] = &[
-    (
-        "LU",
-        "C5",
-        "beta-L-altrofuranose, the C5 epimer of beta-D-galactofuranose",
-    ),
-    (
-        "LD",
-        "C5",
-        "alpha-L-altrofuranose, the C5 epimer of alpha-D-galactofuranose",
-    ),
     // Named beta-D-GlcpN and charged differently from YN (alpha), but built alpha.
     (
         "Yn",
@@ -39,6 +27,127 @@ const LIBRARY_STEREO_ERRORS: &[(&str, &str, &str)] = &[
         "alpha-D-glucosamine, while this GLYCAM residue is the beta anomer",
     ),
 ];
+
+/// Stereocentres the GLYCAM library builds inverted and GlySys corrects.
+/// GLYCAM-Web's galactofuranose forms (`xLU` beta, `xLD` alpha) have C5 in the
+/// L-altro configuration and C1 anomeric relative to that wrong C5, so the
+/// residue it builds for beta-D-Galf is beta-L-altrofuranose: relative to the
+/// residue named, C1 and C5 are both inverted (crabWURCS reads the library
+/// coordinates as LAltf).  The templates are corrected when they are loaded
+/// ([`correct_library_stereochemistry`]); an input with the library's
+/// configuration (anything GLYCAM-Web built) is refused with the reason, as
+/// it cannot be inverted in place without rebuilding the residue.
+/// (residue suffix, centre, the two neighbours kept in place)
+pub(crate) const CORRECTED_CENTRES: &[(&str, &str, [&str; 2])] = &[
+    ("LU", "C5", ["C4", "C6"]),
+    ("LU", "C1", ["O4", "C2"]),
+    ("LD", "C5", ["C4", "C6"]),
+    ("LD", "C1", ["O4", "C2"]),
+];
+
+/// The phrase that marks a refusal of an input that follows GLYCAM-Web's
+/// library at a corrected centre: such a residue is refused even when its
+/// name is a GLYCAM template (preparing it by name would keep the wrong sugar).
+pub(crate) const LIBRARY_REFUSAL: &str = "as GLYCAM-Web builds it";
+
+/// What an input that follows the library at a corrected centre is.
+const CORRECTED_MEANING: &[(&str, &str)] = &[
+    (
+        "LU",
+        "beta-L-altrofuranose, which is what GLYCAM-Web builds for beta-D-galactofuranose (C1 and C5 inverted)",
+    ),
+    (
+        "LD",
+        "alpha-L-altrofuranose, which is what GLYCAM-Web builds for alpha-D-galactofuranose (C1 and C5 inverted)",
+    ),
+];
+
+/// Invert the stereocentre `centre` in place: the substituents other than
+/// `keep` (with every atom bonded beyond them, the centre excluded) are
+/// reflected through the plane of the centre and the two kept neighbours, so
+/// every bond length and angle stays as it was.  `neighbours` is the bond
+/// graph.  Returns false (and changes nothing) when a moved atom would be one
+/// of `keep` (the centre is in a ring through them) or the plane is
+/// degenerate.
+pub(crate) fn invert_centre(
+    positions: &mut [Vec3],
+    neighbours: &[Vec<usize>],
+    centre: usize,
+    keep: [usize; 2],
+) -> bool {
+    let p = positions[centre];
+    let (a, b) = (positions[keep[0]], positions[keep[1]]);
+    let Some(normal) = normalized(cross(
+        [a.x - p.x, a.y - p.y, a.z - p.z],
+        [b.x - p.x, b.y - p.y, b.z - p.z],
+    )) else {
+        return false;
+    };
+    let mut moved = vec![false; positions.len()];
+    let mut stack: Vec<usize> = neighbours[centre]
+        .iter()
+        .copied()
+        .filter(|n| !keep.contains(n))
+        .collect();
+    while let Some(atom) = stack.pop() {
+        if atom == centre || moved[atom] {
+            continue;
+        }
+        if keep.contains(&atom) {
+            return false;
+        }
+        moved[atom] = true;
+        stack.extend(neighbours[atom].iter().copied());
+    }
+    for (atom, position) in positions.iter_mut().enumerate() {
+        if moved[atom] {
+            let d = (position.x - p.x) * normal[0]
+                + (position.y - p.y) * normal[1]
+                + (position.z - p.z) * normal[2];
+            position.x -= 2.0 * d * normal[0];
+            position.y -= 2.0 * d * normal[1];
+            position.z -= 2.0 * d * normal[2];
+        }
+    }
+    true
+}
+
+/// Correct the library coordinates of [`CORRECTED_CENTRES`] in every
+/// carbohydrate template that has them; returns the corrected template names.
+pub(crate) fn correct_library_stereochemistry(
+    glycans: &mut HashMap<String, Template>,
+) -> Vec<String> {
+    let mut corrected = Vec::new();
+    for (name, template) in glycans.iter_mut() {
+        let Some(suffix) = name.get(1..) else {
+            continue;
+        };
+        let mut neighbours = vec![Vec::new(); template.atoms.len()];
+        for &[i, j] in &template.bonds {
+            neighbours[i].push(j);
+            neighbours[j].push(i);
+        }
+        let mut positions: Vec<Vec3> = template.atoms.iter().map(|a| a.position).collect();
+        let mut changed = false;
+        for (residue, centre, keep) in CORRECTED_CENTRES {
+            if suffix != *residue {
+                continue;
+            }
+            let index = |atom: &str| template.atoms.iter().position(|a| a.name == atom);
+            if let (Some(c), Some(k0), Some(k1)) = (index(centre), index(keep[0]), index(keep[1])) {
+                changed |= invert_centre(&mut positions, &neighbours, c, [k0, k1]);
+            }
+        }
+        if changed {
+            for (atom, position) in template.atoms.iter_mut().zip(positions) {
+                atom.position = position;
+            }
+            corrected.push(name.clone());
+        }
+    }
+    corrected.sort();
+    corrected
+}
 
 /// The residue a wwPDB chemical component names, as a GLYCAM residue code
 /// without its linkage letter.  Only used when the coordinates cannot decide
@@ -184,6 +293,9 @@ struct Centre {
     sign: f64,
     /// The library's sign here is wrong: what an input with it is.
     library_error: Option<&'static str>,
+    /// The library's sign here was wrong and is corrected: what an input
+    /// with the library's sign is.
+    corrected: Option<&'static str>,
 }
 
 impl CarbohydrateLibrary {
@@ -487,11 +599,22 @@ impl Core {
                 .iter()
                 .find(|(residue, centre, _)| *residue == suffix && *centre == atom.name)
                 .map(|(_, _, meaning)| *meaning);
+            let corrected = CORRECTED_CENTRES
+                .iter()
+                .any(|(residue, centre, _)| *residue == suffix && *centre == atom.name)
+                .then(|| {
+                    CORRECTED_MEANING
+                        .iter()
+                        .find(|(residue, _)| *residue == suffix)
+                        .map(|(_, m)| *m)
+                })
+                .flatten();
             centres.push(Centre {
                 atom: index,
                 references,
                 sign: sign.signum(),
                 library_error,
+                corrected,
             });
         }
         let mut elements = BTreeMap::new();
@@ -792,6 +915,15 @@ impl Core {
             let volume = chiral_volume(input.positions[mapping[centre.atom]], a, b, c);
             if volume.abs() < MIN_CHIRAL_VOLUME {
                 undetermined = true; // too distorted to read
+                continue;
+            }
+            if let Some(meaning) = centre.corrected {
+                if volume.signum() != centre.sign {
+                    return Err(format!(
+                        "{} configuration differs: the coordinates are {meaning}, {LIBRARY_REFUSAL}; rebuild the glycan with corrected templates",
+                        self.atoms[centre.atom].name
+                    ));
+                }
                 continue;
             }
             match centre.library_error {
@@ -1325,6 +1457,79 @@ mod tests {
             atoms,
         };
         (residue, outside)
+    }
+
+    /// PDB text of a carbohydrate template with an ROH oxygen on its open
+    /// anomeric carbon (placed opposite the carbon's other bonds).
+    fn template_with_roh(template: &Template) -> String {
+        let index = |name: &str| template.atoms.iter().position(|a| a.name == name).unwrap();
+        let c1 = index("C1");
+        let p = template.atoms[c1].position;
+        let mut direction = [0.0; 3];
+        for &[i, j] in &template.bonds {
+            let other = if i == c1 {
+                j
+            } else if j == c1 {
+                i
+            } else {
+                continue;
+            };
+            let q = template.atoms[other].position;
+            let d = [q.x - p.x, q.y - p.y, q.z - p.z];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            for k in 0..3 {
+                direction[k] -= d[k] / n;
+            }
+        }
+        let n = (direction[0].powi(2) + direction[1].powi(2) + direction[2].powi(2)).sqrt();
+        let o1 = [0, 1, 2].map(|k| [p.x, p.y, p.z][k] + 1.42 * direction[k] / n);
+        let symbol = |element: u8| match element {
+            1 => "H",
+            6 => "C",
+            7 => "N",
+            8 => "O",
+            16 => "S",
+            _ => "X",
+        };
+        let mut lines = vec![format!(
+            "HETATM{:5} {:<4} ROH A   1    {:8.3}{:8.3}{:8.3}  1.00  0.00           O",
+            1, " O1", o1[0], o1[1], o1[2]
+        )];
+        for (k, atom) in template.atoms.iter().enumerate() {
+            lines.push(format!(
+                "HETATM{:5} {:<4} {:>3} A   2    {:8.3}{:8.3}{:8.3}  1.00  0.00          {:>2}",
+                k + 2,
+                if atom.name.len() < 4 {
+                    format!(" {}", atom.name)
+                } else {
+                    atom.name.clone()
+                },
+                template.name,
+                atom.position.x,
+                atom.position.y,
+                atom.position.z,
+                symbol(atom.element)
+            ));
+        }
+        lines.join("\n") + "\nEND\n"
+    }
+
+    #[test]
+    fn corrected_galactofuranose_templates_read_as_d_galactofuranose() {
+        // GLYCAM-Web's 0LU/0LD are beta/alpha-L-altrofuranose as shipped;
+        // after the load-time correction crabWURCS, which reads the
+        // configuration from the coordinates alone, must name them D-Galf
+        // with the anomer the residue code gives.
+        let templates = TemplateSet::load().unwrap();
+        for (name, expected) in [("0LU", "DGalfb1-OH"), ("0LD", "DGalfa1-OH")] {
+            let pdb = template_with_roh(templates.glycan(name).unwrap());
+            let glycans = crabwurcs::pdb::extract_glycans_from_str(&pdb, false).unwrap();
+            let read = glycans
+                .iter()
+                .filter_map(|g| crabwurcs::write_notation(&g.graph, crabwurcs::Format::Glycam).ok())
+                .collect::<Vec<_>>();
+            assert_eq!(read, vec![expected.to_string()], "{name}");
+        }
     }
 
     #[test]
