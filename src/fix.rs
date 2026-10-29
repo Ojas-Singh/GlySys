@@ -201,6 +201,7 @@ pub struct FixedStructure {
 pub struct StructureFixer {
     options: FixOptions,
     templates: TemplateSet,
+    carbohydrates: crate::carbohydrate::CarbohydrateLibrary,
     components: ComponentLibrary,
 }
 
@@ -220,9 +221,15 @@ impl SystemBuilder {
 impl StructureFixer {
     pub fn new(options: FixOptions) -> Result<Self> {
         options.validate()?;
+        let mut templates = TemplateSet::load()?;
+        let parameters = crate::forcefield::ParameterSet::load()?;
+        // The same carbohydrate residues `prepare` can choose.
+        templates.retain_parameterized_glycans(|template| parameters.covers(template));
+        let carbohydrates = crate::carbohydrate::CarbohydrateLibrary::new(&templates);
         Ok(Self {
             options,
-            templates: TemplateSet::load()?,
+            templates,
+            carbohydrates,
             components: ComponentLibrary::new(),
         })
     }
@@ -880,6 +887,7 @@ impl StructureFixer {
             let neighbors = nearby_residues(work, index, &environment_residues);
             match glycam_hydrogens(
                 &self.templates,
+                &self.carbohydrates,
                 &work.residues[index],
                 &declared,
                 &neighbors,
@@ -1140,31 +1148,11 @@ fn declared_bonds(work: &Work) -> Vec<crate::prepare::DeclaredAtomBond> {
             let ra = &work.residues[*index_of.get(a)?];
             let rb = &work.residues[*index_of.get(b)?];
             Some((
-                (
-                    ra.chain.clone(),
-                    ra.number,
-                    normalize_glycan_atom(&ra.input_name, atom_a),
-                ),
-                (
-                    rb.chain.clone(),
-                    rb.number,
-                    normalize_glycan_atom(&rb.input_name, atom_b),
-                ),
+                (ra.chain.clone(), ra.number, atom_a.clone()),
+                (rb.chain.clone(), rb.number, atom_b.clone()),
             ))
         })
         .collect()
-}
-
-fn normalize_glycan_atom(residue: &str, atom: &str) -> String {
-    if matches!(residue, "NAG" | "NDG") {
-        match atom {
-            "C7" => return "C2N".into(),
-            "O7" => return "O2N".into(),
-            "C8" => return "CME".into(),
-            _ => {}
-        }
-    }
-    atom.to_string()
 }
 
 /// Residues (as PDB views) with any heavy atom within 10 Å of `index`.
@@ -1189,50 +1177,89 @@ fn nearby_residues(work: &Work, index: usize, all: &[PdbResidue]) -> Vec<PdbResi
         .collect()
 }
 
-/// GLYCAM06j-1 hydrogens for a carbohydrate residue.
+/// GLYCAM hydrogens for a carbohydrate residue whose heavy atoms are exactly
+/// one GLYCAM residue, read from its atoms as `prepare` reads it (see
+/// [`crate::carbohydrate`]).  A residue that also carries an aglycone or a
+/// substituent returns `None` and takes its hydrogens from the CCD.  The
+/// residue keeps its input atom names; the hydrogens get GLYCAM names.
 fn glycam_hydrogens(
     templates: &TemplateSet,
+    library: &crate::carbohydrate::CarbohydrateLibrary,
     residue: &WResidue,
     declared: &[crate::prepare::DeclaredAtomBond],
     neighbors: &[PdbResidue],
 ) -> Option<(String, Vec<work::WAtom>, HashSet<String>)> {
-    let mut view = pdb_residue(residue, true);
-    for atom in &mut view.atoms {
-        atom.name = normalize_glycan_atom(&residue.input_name, &atom.name);
-    }
-    let name =
-        crate::prepare::infer_glycam_template_name(&view, neighbors, declared, templates).ok()?;
-    let template = templates.glycan(&name)?;
-    let heavy_known = view
+    use crate::carbohydrate::{atomic_number, inter_residue_bond_limit};
+    let view = pdb_residue(residue, true);
+    // Atoms of other residues bonded to this one, from coordinates and records.
+    let outside = view
         .atoms
         .iter()
-        .filter(|atom| !matches!(atom.element.as_str(), "H" | "D"))
-        .all(|atom| template.atom(&atom.name).is_some());
-    if !heavy_known {
+        .map(|atom| {
+            let element = atomic_number(&atom.element);
+            let mut bonded = Vec::new();
+            if element <= 1 {
+                return bonded;
+            }
+            for other in neighbors
+                .iter()
+                .filter(|other| other.reference != view.reference)
+            {
+                for candidate in &other.atoms {
+                    let other_element = atomic_number(&candidate.element);
+                    if other_element <= 1 || matches!(other_element, 12 | 20 | 25..=30 | 48 | 80) {
+                        continue;
+                    }
+                    let limit = inter_residue_bond_limit(element, other_element);
+                    let declared_bond = declared.iter().any(|(a, b)| {
+                        let this = |x: &crate::prepare::AtomLocator| {
+                            x.0 == view.reference.chain
+                                && x.1 == view.reference.number
+                                && x.2 == atom.name
+                        };
+                        let that = |x: &crate::prepare::AtomLocator| {
+                            x.0 == other.reference.chain
+                                && x.1 == other.reference.number
+                                && x.2 == candidate.name
+                        };
+                        (this(a) && that(b)) || (this(b) && that(a))
+                    });
+                    if declared_bond || atom.position.distance2(candidate.position) < limit * limit
+                    {
+                        bonded.push(candidate.position);
+                    }
+                }
+            }
+            bonded
+        })
+        .collect::<Vec<_>>();
+    let identified = library.identify(&view, &outside).ok()?;
+    if !identified.fragments.is_empty() {
         return None;
+    }
+    let template = templates.glycan(&identified.template)?;
+    let renamed = identified
+        .atoms
+        .iter()
+        .map(|(index, name)| (view.atoms[*index].name.clone(), name.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut glycam_view = view.clone();
+    glycam_view
+        .atoms
+        .retain(|atom| !matches!(atom.element.as_str(), "H" | "D"));
+    for atom in &mut glycam_view.atoms {
+        atom.name = renamed.get(&atom.name)?.clone();
     }
     let mut environment = neighbors.to_vec();
     if let Some(own) = environment
         .iter_mut()
         .find(|candidate| candidate.reference == view.reference)
     {
-        *own = view.clone();
+        *own = glycam_view.clone();
     }
-    let positions = crate::prepare::glycan_hydrogen_positions(template, &view, &environment);
-    let present = residue
-        .atoms
-        .iter()
-        .map(|atom| atom.name.as_str())
-        .collect::<HashSet<_>>();
-    let keep = template
-        .atoms
-        .iter()
-        .filter(|atom| atom.element == 1 && present.contains(atom.name.as_str()))
-        .map(|atom| atom.name.clone())
-        .collect::<HashSet<_>>();
+    let positions = crate::prepare::glycan_hydrogen_positions(template, &glycam_view, &environment);
     let mut atoms = positions
         .into_iter()
-        .filter(|(index, _)| !present.contains(template.atoms[*index].name.as_str()))
         .map(|(index, position)| {
             (
                 index,
@@ -1250,9 +1277,9 @@ fn glycam_hydrogens(
         .collect::<Vec<_>>();
     atoms.sort_by_key(|(index, _)| *index);
     Some((
-        name,
+        identified.template,
         atoms.into_iter().map(|(_, atom)| atom).collect(),
-        keep,
+        HashSet::new(),
     ))
 }
 

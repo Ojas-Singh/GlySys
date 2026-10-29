@@ -116,6 +116,16 @@ struct PrepareArgs {
     /// NaCl concentration in mol/L (ion counts by the SLTCAP rule).
     #[arg(long)]
     salt: Option<f64>,
+    /// CaCl2 concentration in mol/L, added to the NaCl (Ca2+ with two Cl-).
+    #[arg(long)]
+    cacl2: Option<f64>,
+    /// MgCl2 concentration in mol/L, added to the NaCl (Mg2+ with two Cl-).
+    #[arg(long)]
+    mgcl2: Option<f64>,
+    /// Electronic continuum correction: prosECCo75 scaled-charge ions and
+    /// carbohydrate charged groups at 0.75 of their charge.
+    #[arg(long)]
+    ecc: bool,
     /// Write an unsolvated, non-periodic system without water or ions.
     #[arg(long)]
     no_water: bool,
@@ -257,6 +267,15 @@ fn options(input: &InputArgs, prepare: Option<&PrepareArgs>) -> anyhow::Result<B
     if let Some(prepare) = prepare {
         if let Some(padding) = prepare.padding {
             options.padding_angstrom = padding;
+        }
+        if let Some(cacl2) = prepare.cacl2 {
+            options.cacl2_molar = cacl2;
+        }
+        if let Some(mgcl2) = prepare.mgcl2 {
+            options.mgcl2_molar = mgcl2;
+        }
+        if prepare.ecc {
+            options.ecc = true;
         }
         if let Some(salt) = prepare.salt {
             options.salt_molar = salt;

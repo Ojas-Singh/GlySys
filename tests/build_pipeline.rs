@@ -529,7 +529,7 @@ fn normalizes_wwpdb_nag_atom_names_for_glycam() {
     assert!(system.report().warnings.iter().any(|warning| matches!(
         warning,
         BuildWarning::GlycanNameNormalized(message)
-            if message.contains("atom C7 -> C2N")
+            if message.contains("as GLYCAM 0YB") && message.contains("C7 -> C2N")
     )));
 }
 

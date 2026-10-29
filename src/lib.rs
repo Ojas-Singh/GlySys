@@ -4,6 +4,8 @@
 //! other external program.  Amber and GROMACS files are written directly.
 
 mod amber_data;
+mod carbohydrate;
+mod ecc;
 mod error;
 mod fix;
 mod forcefield;

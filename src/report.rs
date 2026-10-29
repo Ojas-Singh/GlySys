@@ -50,6 +50,10 @@ pub struct BuildReport {
     pub waters: usize,
     pub sodium_ions: usize,
     pub chloride_ions: usize,
+    #[serde(default)]
+    pub calcium_ions: usize,
+    #[serde(default)]
+    pub magnesium_ions: usize,
     pub solute_charge: f64,
     pub total_charge: f64,
     pub box_angstrom: [f64; 3],
@@ -59,7 +63,10 @@ pub(crate) fn force_field_versions() -> BTreeMap<String, String> {
     [
         ("source", "AmberTools 23.6"),
         ("protein", "Amber ff14SB"),
-        ("carbohydrate", "GLYCAM06j-1"),
+        (
+            "carbohydrate",
+            "GLYCAM06j-1 + GLYCAM-Web GLYCAM_06k_gmml2 additions",
+        ),
         ("water", "Amber TIP3P"),
         ("ions", "Joung-Chetham Na+/Cl- for TIP3P"),
         ("nucleic_acids", "Amber OL15 DNA, OL3 RNA"),

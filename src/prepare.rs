@@ -3,6 +3,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::carbohydrate::CarbohydrateLibrary;
 use crate::fix::ComponentLibrary;
 use crate::forcefield::{ParameterSet, Template, TemplateSet};
 use crate::ligand::{ExplicitTerms, canonical};
@@ -17,6 +18,8 @@ pub struct SystemBuilder {
     options: BuildOptions,
     templates: TemplateSet,
     parameters: ParameterSet,
+    /// GLYCAM residue types indexed by atom graph and stereochemistry.
+    carbohydrates: CarbohydrateLibrary,
     /// Chemical Component Dictionary definitions for small molecules.
     components: ComponentLibrary,
     small_molecules: std::sync::OnceLock<std::result::Result<ForceField, String>>,
@@ -35,10 +38,18 @@ impl std::fmt::Debug for SystemBuilder {
 impl SystemBuilder {
     pub fn new(options: BuildOptions) -> Result<Self> {
         options.validate()?;
+        let mut templates = TemplateSet::load()?;
+        let parameters = ParameterSet::load()?;
+        // GLYCAM-Web's library holds entries that need parameters GlySys does
+        // not ship (ring conformers typed CG/OS/OH, ammonium N3 angles); they
+        // are never chosen.
+        templates.retain_parameterized_glycans(|template| parameters.covers(template));
+        let carbohydrates = CarbohydrateLibrary::new(&templates);
         Ok(Self {
             options,
-            templates: TemplateSet::load()?,
-            parameters: ParameterSet::load()?,
+            templates,
+            parameters,
+            carbohydrates,
             components: ComponentLibrary::new(),
             small_molecules: std::sync::OnceLock::new(),
         })
@@ -97,36 +108,29 @@ impl SystemBuilder {
         let parsed = pdb::parse(contents, &self.options)?;
         let mut warnings = parsed.warnings.clone();
         let protonation_decisions = self.protonation_decisions(&parsed, &mut warnings);
-        let unsupported_residues = parsed
-            .residues
-            .iter()
-            .filter(|residue| {
-                let name = residue.reference.name.as_str();
-                !PROTEIN_RESIDUES.contains(&name)
-                    && !pdb::is_water(name)
-                    && !pdb::is_free_ion(name)
-                    && self.templates.glycan(name).is_none()
-                    && self.components.get(name).is_none()
-                    && !matches!(
-                        name,
-                        "NAG"
-                            | "NDG"
-                            | "MAN"
-                            | "BMA"
-                            | "GLC"
-                            | "BGC"
-                            | "GAL"
-                            | "GLA"
-                            | "FUC"
-                            | "FUL"
-                            | "XYS"
-                            | "XYP"
-                            | "SIA"
-                            | "SLB"
-                    )
-            })
-            .map(|residue| residue.reference.clone())
-            .collect::<Vec<_>>();
+        // A residue is unsupported when no template, chemical component or
+        // carbohydrate reading covers it; the carbohydrate reading says why.
+        let carbohydrate_errors = self.carbohydrate_diagnostics(&parsed);
+        let mut unsupported_residues = Vec::new();
+        for residue in &parsed.residues {
+            let name = residue.reference.name.as_str();
+            let covered = PROTEIN_RESIDUES.contains(&name)
+                || pdb::NUCLEIC_RESIDUES.contains(&name)
+                || pdb::is_water(name)
+                || pdb::is_free_ion(name)
+                || pdb::is_metal_ion(name)
+                || self.templates.glycan(name).is_some()
+                || self.components.get(name).is_some();
+            if let Some(reason) = carbohydrate_errors.get(&residue_key(residue))
+                && (!covered || reason.contains(crate::carbohydrate::LIBRARY_REFUSAL))
+            {
+                warnings.push(BuildWarning::UnsupportedResidue(format!(
+                    "{}: {reason}",
+                    residue.reference
+                )));
+                unsupported_residues.push(residue.reference.clone());
+            }
+        }
         let mut missing_heavy_atoms = Vec::new();
         let mut solute_atoms = 0;
         let mut solute_charge = 0.0;
@@ -160,6 +164,8 @@ impl SystemBuilder {
             waters: 0,
             sodium_ions: 0,
             chloride_ions: 0,
+            calcium_ions: 0,
+            magnesium_ions: 0,
             solute_charge,
             total_charge: solute_charge,
             box_angstrom: [0.0; 3],
@@ -230,16 +236,10 @@ impl SystemBuilder {
         let mut system = self.parameterize(parsed, &protonation_decisions, &mut warnings)?;
         let solute_charge = system.charge();
         let rounded_charge = solute_charge.round();
-        // GLYCAM sulfated-GAG templates retain small RESP charge residuals.
-        // A short heparin fragment can therefore sum to e.g. -8.124 despite
-        // having an unambiguous formal -8 charge. Keep the normal strict
-        // check for every other system, while accepting that documented
-        // GLYCAM residual only when a sulfated GAG residue is present.
-        let has_sulfated_gag = parsed.residues.iter().any(|residue| {
-            let name = residue.reference.name.as_bytes();
-            name.len() == 3 && matches!(name[1], b'Y' | b'y') && matches!(name[2], b'S' | b's')
-        });
-        let charge_tolerance = if has_sulfated_gag { 0.15 } else { 1.0e-3 };
+        // GLYCAM charges sum to an integer once each O-substituent's
+        // correction is applied (`apply_substituent_charges`); a fractional
+        // total means a residue was given the wrong linkage form.
+        let charge_tolerance = 1.0e-3;
         if (solute_charge - rounded_charge).abs() > charge_tolerance {
             // Name the residues whose charge is fractional (usually a glycan
             // template chosen without one of its linkages).
@@ -278,6 +278,19 @@ impl SystemBuilder {
                 &self.options,
             )?;
         }
+        if self.options.ecc {
+            let scaled = crate::ecc::apply(
+                &mut system,
+                |name| PROTEIN_RESIDUES.contains(&name),
+                &mut warnings,
+            );
+            warnings.push(BuildWarning::ChargeScaling(format!(
+                "electronic continuum correction (prosECCo75 conventions, ions v20221028): {} ion(s) with scaled-charge models, {} charged carbohydrate block(s) at {} of their charge; water is TIP3P",
+                scaled.ions,
+                scaled.groups,
+                crate::ecc::SCALE
+            )));
+        }
         let report = BuildReport {
             input_sha256,
             force_field_versions: crate::report::force_field_versions(),
@@ -296,6 +309,8 @@ impl SystemBuilder {
             waters: system.water_residue_count,
             sodium_ions: system.sodium_count,
             chloride_ions: system.chloride_count,
+            calcium_ions: system.calcium_count,
+            magnesium_ions: system.magnesium_count,
             solute_charge,
             total_charge: system.charge(),
             box_angstrom: system.box_angstrom,
@@ -305,6 +320,31 @@ impl SystemBuilder {
             report,
             metadata: structure.metadata().clone(),
         })
+    }
+
+    /// Why each residue that is not a GLYCAM carbohydrate could not be read
+    /// as one (see `resolve_carbohydrates`).
+    fn carbohydrate_diagnostics(&self, parsed: &ParsedPdb) -> HashMap<pdb::ResidueKey, String> {
+        let mut kept = parsed
+            .residues
+            .iter()
+            .filter(|residue| {
+                !pdb::is_water(&residue.reference.name)
+                    && !pdb::is_free_ion(&residue.reference.name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut declared = declared_atom_bonds(parsed);
+        let mut inferred = inferred_glycosylation_links(&kept, &declared);
+        let mut links = parsed.links.clone();
+        resolve_carbohydrates(
+            &mut kept,
+            &mut declared,
+            &mut links,
+            &mut inferred,
+            &self.carbohydrates,
+            &mut Vec::new(),
+        )
     }
 
     fn protonation_decisions(
@@ -382,11 +422,13 @@ impl SystemBuilder {
             .collect::<Vec<_>>();
         let mut declared_bonds = declared_atom_bonds(parsed);
         let mut inferred_links = inferred_glycosylation_links(&kept, &declared_bonds);
-        split_reducing_hydroxyls(
+        let mut links = parsed.links.clone();
+        let carbohydrate_errors = resolve_carbohydrates(
             &mut kept,
-            &declared_bonds,
+            &mut declared_bonds,
+            &mut links,
             &mut inferred_links,
-            &self.templates,
+            &self.carbohydrates,
             warnings,
         );
         for link in &inferred_links {
@@ -454,6 +496,15 @@ impl SystemBuilder {
                 Ok(self.templates.nucleic(name, five, three))
             } else if is_ion {
                 Ok(self.templates.ion(&name.to_ascii_uppercase()))
+            } else if let Some(reason) = carbohydrate_errors
+                .get(&residue_key(residue))
+                .filter(|reason| reason.contains(crate::carbohydrate::LIBRARY_REFUSAL))
+            {
+                // GLYCAM-Web's inverted galactofuranose: never prepared by name.
+                Err(BuildError::UnsupportedResidue {
+                    residue: residue.reference.to_string(),
+                    reason: reason.clone(),
+                })
             } else if let Some(template) = self.templates.glycan(name) {
                 if glycam_fits(template) || self.components.get(name).is_none() {
                     Ok(Some(template))
@@ -464,16 +515,16 @@ impl SystemBuilder {
                     })
                 }
             } else {
-                match infer_glycam_template_name(residue, &kept, &declared_bonds, &self.templates) {
-                    Ok(glycam_name) => {
-                        warnings.push(BuildWarning::GlycanNameNormalized(format!(
-                            "{} -> {glycam_name}",
-                            residue.reference
-                        )));
-                        Ok(self.templates.glycan(&glycam_name))
-                    }
-                    Err(error) => Err(error),
-                }
+                Err(BuildError::UnsupportedResidue {
+                    residue: residue.reference.to_string(),
+                    reason: carbohydrate_errors
+                        .get(&residue_key(residue))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            "no ff14SB or GLYCAM06j-1 residue template, and not a carbohydrate"
+                                .into()
+                        }),
+                })
             };
             let template = match chosen {
                 Ok(template) => template,
@@ -692,7 +743,7 @@ impl SystemBuilder {
                 bonds.push([first, second]);
             }
         }
-        for link in parsed.links.iter().chain(&inferred_links) {
+        for link in links.iter().chain(&inferred_links) {
             let first_residue = find_residue_index(&kept, &link.first);
             let second_residue = find_residue_index(&kept, &link.second);
             if let (Some(first_residue), Some(second_residue)) = (first_residue, second_residue)
@@ -733,6 +784,7 @@ impl SystemBuilder {
         }
         bonds.sort_unstable();
         bonds.dedup();
+        apply_substituent_charges(&mut atoms, &residues, &bonds, &self.templates);
 
         let (component_count, component_by_residue) =
             molecular_components(kept.len(), &bonds, &atoms);
@@ -753,6 +805,8 @@ impl SystemBuilder {
             water_residue_count: 0,
             sodium_count: 0,
             chloride_count: 0,
+            calcium_count: 0,
+            magnesium_count: 0,
         })
     }
 }
@@ -909,28 +963,6 @@ fn normalize_special_residues(
             )));
             residue.reference.name = renamed.into();
         }
-        // wwPDB carbohydrate records use the conventional NAG/NDG atom
-        // names C7/O7/C8 for the acetamide carbonyl and methyl group.  The
-        // GLYCAM templates call the same atoms C2N/O2N/CME.  Normalize this
-        // representation before template inference while retaining the
-        // original residue name and serials in the input Structure.
-        if matches!(residue.reference.name.as_str(), "NAG" | "NDG") {
-            for atom in &mut residue.atoms {
-                let normalized = match atom.name.as_str() {
-                    "C7" => Some("C2N"),
-                    "O7" => Some("O2N"),
-                    "C8" => Some("CME"),
-                    _ => None,
-                };
-                if let Some(normalized) = normalized {
-                    warnings.push(BuildWarning::GlycanNameNormalized(format!(
-                        "{} atom {} -> {normalized}",
-                        residue.reference, atom.name,
-                    )));
-                    atom.name = normalized.into();
-                }
-            }
-        }
     }
 }
 
@@ -1022,103 +1054,469 @@ fn protein_terminal_flags(residues: &[PdbResidue]) -> HashMap<usize, (bool, bool
     result
 }
 
-/// A free reducing sugar (O1 not bonded to another residue) is a GLYCAM
-/// residue plus an ROH aglycone: move O1 and its hydrogen into ROH.
-fn split_reducing_hydroxyls(
+fn residue_key(residue: &PdbResidue) -> pdb::ResidueKey {
+    pdb::ResidueKey {
+        chain: residue.reference.chain.clone(),
+        number: residue.reference.number,
+        insertion_code: residue.reference.insertion_code,
+    }
+}
+
+/// Read every carbohydrate residue from its atoms (see [`crate::carbohydrate`]):
+/// rename it and its atoms to the GLYCAM residue its graph, stereocentres and
+/// linkages fit, and split off an aglycone (ROH, OME) or O-substituents
+/// (SO3, MEX, ACX) into their own GLYCAM residues.  Links and declared bonds
+/// are carried over to the new names, and bonds to other residues found from
+/// the coordinates are added as links.  Returns, for residues that could not
+/// be read, why.
+fn resolve_carbohydrates(
     residues: &mut Vec<PdbResidue>,
-    declared: &[DeclaredAtomBond],
-    links: &mut Vec<pdb::DeclaredLink>,
-    templates: &TemplateSet,
+    declared: &mut [DeclaredAtomBond],
+    links: &mut [pdb::DeclaredLink],
+    inferred: &mut Vec<pdb::DeclaredLink>,
+    library: &CarbohydrateLibrary,
     warnings: &mut Vec<BuildWarning>,
-) {
-    let mut index = 0;
-    while index < residues.len() {
-        let residue = &residues[index];
+) -> HashMap<pdb::ResidueKey, String> {
+    use crate::carbohydrate::{atomic_number, inter_residue_bond_limit};
+
+    let candidate = |residue: &PdbResidue| {
         let name = residue.reference.name.as_str();
-        let sugar = !PROTEIN_RESIDUES.contains(&name)
+        !PROTEIN_RESIDUES.contains(&name)
             && !pdb::NUCLEIC_RESIDUES.contains(&name)
-            && name != "ROH"
-            && residue.atoms.iter().any(|atom| atom.name == "C1")
-            && residue.atoms.iter().any(|atom| atom.name == "O5")
-            && (templates.glycan(name).is_some()
-                || matches!(
-                    name,
-                    "NAG"
-                        | "NDG"
-                        | "MAN"
-                        | "BMA"
-                        | "GLC"
-                        | "BGC"
-                        | "GAL"
-                        | "GLA"
-                        | "FUC"
-                        | "FUL"
-                        | "XYS"
-                        | "XYP"
-                ));
-        let o1_bonded = declared.iter().any(|(a, b)| {
-            let this = |x: &AtomLocator| {
-                x.0 == residue.reference.chain && x.1 == residue.reference.number && x.2 == "O1"
-            };
-            (this(a) && (b.0 != a.0 || b.1 != a.1)) || (this(b) && (a.0 != b.0 || a.1 != b.1))
-        });
-        let Some(o1) = residue.atoms.iter().find(|atom| atom.name == "O1").cloned() else {
-            index += 1;
-            continue;
-        };
-        if !sugar || o1_bonded {
-            index += 1;
+            && !pdb::is_water(name)
+            && !pdb::is_free_ion(name)
+            && !pdb::is_metal_ion(name)
+            && !matches!(name, "ROH" | "OME" | "SO3" | "MEX" | "ACX" | "TBT")
+    };
+    let bonding = |residue: &PdbResidue| {
+        let name = residue.reference.name.as_str();
+        !pdb::is_water(name) && !pdb::is_free_ion(name) && !pdb::is_metal_ion(name)
+    };
+    // Heavy atoms of every residue that can bond, on a 2.5 A grid.
+    let cell = |position: Vec3| {
+        (
+            (position.x / 2.5).floor() as i64,
+            (position.y / 2.5).floor() as i64,
+            (position.z / 2.5).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<(usize, usize)>> = HashMap::new();
+    for (residue_index, residue) in residues.iter().enumerate() {
+        if !bonding(residue) {
             continue;
         }
-        let mut cap = PdbResidue {
+        for (atom_index, atom) in residue.atoms.iter().enumerate() {
+            let element = atomic_number(&atom.element);
+            if element > 1 && !is_metal_element(element) {
+                grid.entry(cell(atom.position))
+                    .or_default()
+                    .push((residue_index, atom_index));
+            }
+        }
+    }
+    let locate = |residues: &[PdbResidue], key: (&str, i32, &str)| {
+        residues
+            .iter()
+            .enumerate()
+            .find_map(|(residue_index, residue)| {
+                (residue.reference.chain == key.0 && residue.reference.number == key.1)
+                    .then(|| {
+                        residue
+                            .atoms
+                            .iter()
+                            .position(|atom| atom.name == key.2)
+                            .map(|atom_index| (residue_index, atom_index))
+                    })
+                    .flatten()
+            })
+    };
+
+    // Bonds between residues: (residue, atom) pairs, from coordinates and records.
+    let mut cross = BTreeSet::<((usize, usize), (usize, usize))>::new();
+    for (residue_index, residue) in residues.iter().enumerate() {
+        if !candidate(residue) {
+            continue;
+        }
+        for (atom_index, atom) in residue.atoms.iter().enumerate() {
+            let element = atomic_number(&atom.element);
+            if element <= 1 || is_metal_element(element) {
+                continue;
+            }
+            let (cx, cy, cz) = cell(atom.position);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &(other_residue, other_atom) in
+                            grid.get(&(cx + dx, cy + dy, cz + dz)).into_iter().flatten()
+                        {
+                            if other_residue == residue_index {
+                                continue;
+                            }
+                            let other = &residues[other_residue].atoms[other_atom];
+                            let limit =
+                                inter_residue_bond_limit(element, atomic_number(&other.element));
+                            if atom.position.distance2(other.position) < limit * limit {
+                                let pair =
+                                    ((residue_index, atom_index), (other_residue, other_atom));
+                                cross.insert(if pair.0 < pair.1 {
+                                    pair
+                                } else {
+                                    (pair.1, pair.0)
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (first, second) in declared.iter() {
+        if first.0 == second.0 && first.1 == second.1 {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (
+            locate(residues, (&first.0, first.1, &first.2)),
+            locate(residues, (&second.0, second.1, &second.2)),
+        ) && (candidate(&residues[a.0]) || candidate(&residues[b.0]))
+        {
+            cross.insert(if a < b { (a, b) } else { (b, a) });
+        }
+    }
+    // GLYCAM-Web builds galactofuranose as L-altrofuranose: rebuild those
+    // residues from the corrected templates before they are read.
+    crate::carbohydrate::rebuild_glycam_web_galactofuranoses(residues, &cross, library, warnings);
+    let mut outside: HashMap<usize, Vec<Vec<Vec3>>> = HashMap::new();
+    for &((ra, aa), (rb, ab)) in &cross {
+        for (own, own_atom, other, other_atom) in [(ra, aa, rb, ab), (rb, ab, ra, aa)] {
+            let position = residues[other].atoms[other_atom].position;
+            let slots = outside
+                .entry(own)
+                .or_insert_with(|| vec![Vec::new(); residues[own].atoms.len()]);
+            if slots[own_atom]
+                .iter()
+                .all(|known| known.distance2(position) > 1.0e-8)
+            {
+                slots[own_atom].push(position);
+            }
+        }
+    }
+
+    // Identify, then rebuild the residue list.
+    let mut errors = HashMap::new();
+    let mut located: HashMap<(usize, usize), (pdb::ResidueKey, String)> = HashMap::new();
+    let mut rebuilt = Vec::with_capacity(residues.len());
+    let mut changed = false;
+    for (residue_index, residue) in residues.iter().enumerate() {
+        let original_key = residue_key(residue);
+        let keep =
+            |rebuilt: &mut Vec<PdbResidue>,
+             located: &mut HashMap<(usize, usize), (pdb::ResidueKey, String)>| {
+                for (atom_index, atom) in residue.atoms.iter().enumerate() {
+                    located.insert(
+                        (residue_index, atom_index),
+                        (original_key.clone(), atom.name.clone()),
+                    );
+                }
+                rebuilt.push(residue.clone());
+            };
+        if !candidate(residue) {
+            keep(&mut rebuilt, &mut located);
+            continue;
+        }
+        let empty = vec![Vec::new(); residue.atoms.len()];
+        let bonded = outside.get(&residue_index).unwrap_or(&empty);
+        let identified = match library.identify(residue, bonded) {
+            Ok(identified) => identified,
+            Err(reason) => {
+                errors.insert(original_key.clone(), reason);
+                keep(&mut rebuilt, &mut located);
+                continue;
+            }
+        };
+        for note in &identified.stereo_notes {
+            warnings.push(BuildWarning::GlycanStereochemistry(format!(
+                "{} ({}): {note}",
+                residue.reference, identified.template
+            )));
+        }
+        let name = residue.reference.name.as_str();
+        let renamed = identified
+            .atoms
+            .iter()
+            .any(|(atom_index, new)| residue.atoms[*atom_index].name != *new);
+        if identified.template == name && !renamed && identified.fragments.is_empty() {
+            keep(&mut rebuilt, &mut located);
+            continue;
+        }
+        changed = true;
+        // Hydrogens are kept only when the input already used this GLYCAM
+        // residue's naming; otherwise they are rebuilt from the template.
+        let same_naming = !renamed && identified.template.get(1..) == name.get(1..);
+        let mut sugar = PdbResidue {
             reference: crate::report::ResidueRef {
-                chain: residue.reference.chain.clone(),
-                name: "ROH".into(),
-                number: residue.reference.number,
-                insertion_code: Some('R'),
+                name: identified.template.clone(),
+                ..residue.reference.clone()
             },
             atoms: Vec::new(),
         };
-        let sugar_key = pdb::ResidueKey {
-            chain: residue.reference.chain.clone(),
-            number: residue.reference.number,
-            insertion_code: residue.reference.insertion_code,
-        };
-        let residue = &mut residues[index];
-        residue.atoms.retain(|atom| {
-            let hydroxyl_h = matches!(atom.element.as_str(), "H" | "D")
-                && atom.position.distance2(o1.position) < 1.2 * 1.2;
-            if atom.name == "O1" || hydroxyl_h {
-                let mut moved = atom.clone();
-                moved.name = if atom.name == "O1" {
-                    "O1".into()
-                } else {
-                    "HO1".into()
-                };
-                moved.residue_name = "ROH".into();
-                moved.insertion_code = Some('R');
-                cap.atoms.push(moved);
-                false
-            } else {
-                true
+        for (atom_index, new) in &identified.atoms {
+            let mut atom = residue.atoms[*atom_index].clone();
+            atom.name = new.clone();
+            atom.residue_name = identified.template.clone();
+            located.insert(
+                (residue_index, *atom_index),
+                (original_key.clone(), new.clone()),
+            );
+            sugar.atoms.push(atom);
+        }
+        if same_naming {
+            for (atom_index, atom) in residue.atoms.iter().enumerate() {
+                if matches!(atom.element.trim(), "H" | "D") {
+                    let mut atom = atom.clone();
+                    atom.residue_name = identified.template.clone();
+                    located.insert(
+                        (residue_index, atom_index),
+                        (original_key.clone(), atom.name.clone()),
+                    );
+                    sugar.atoms.push(atom);
+                }
             }
+        }
+        let mut used_codes = residues
+            .iter()
+            .filter(|other| {
+                other.reference.chain == residue.reference.chain
+                    && other.reference.number == residue.reference.number
+            })
+            .filter_map(|other| other.reference.insertion_code)
+            .collect::<HashSet<_>>();
+        let mut parts = Vec::new();
+        for fragment in &identified.fragments {
+            let code = ['R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
+                .into_iter()
+                .find(|code| !used_codes.contains(code))
+                .unwrap_or('Z');
+            used_codes.insert(code);
+            let key = pdb::ResidueKey {
+                chain: residue.reference.chain.clone(),
+                number: residue.reference.number,
+                insertion_code: Some(code),
+            };
+            let mut part = PdbResidue {
+                reference: crate::report::ResidueRef {
+                    chain: key.chain.clone(),
+                    name: fragment.residue.into(),
+                    number: key.number,
+                    insertion_code: Some(code),
+                },
+                atoms: Vec::new(),
+            };
+            for (atom_index, new) in &fragment.atoms {
+                let mut atom = residue.atoms[*atom_index].clone();
+                atom.name = new.clone();
+                atom.residue_name = fragment.residue.into();
+                atom.insertion_code = Some(code);
+                located.insert((residue_index, *atom_index), (key.clone(), new.clone()));
+                part.atoms.push(atom);
+            }
+            for (new, position) in &fragment.built {
+                let template = residue.atoms.first().cloned();
+                if let Some(mut atom) = template {
+                    atom.serial = 0;
+                    atom.name = new.clone();
+                    atom.element = "O".into();
+                    atom.residue_name = fragment.residue.into();
+                    atom.insertion_code = Some(code);
+                    atom.position = *position;
+                    part.atoms.push(atom);
+                }
+            }
+            inferred.push(pdb::DeclaredLink {
+                first: original_key.clone(),
+                first_atom: fragment.bond.0.clone(),
+                second: key,
+                second_atom: fragment.bond.1.clone(),
+            });
+            parts.push(part);
+        }
+        let mut note = format!(
+            "{}: read from its atoms as GLYCAM {}",
+            residue.reference, identified.template
+        );
+        if !identified.fragments.is_empty() {
+            note.push_str(&format!(
+                " + {}",
+                identified
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.residue)
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            ));
+        }
+        let renames = identified
+            .atoms
+            .iter()
+            .filter(|(atom_index, new)| residue.atoms[*atom_index].name != **new)
+            .map(|(atom_index, new)| format!("{} -> {new}", residue.atoms[*atom_index].name))
+            .collect::<Vec<_>>();
+        if !renames.is_empty() {
+            note.push_str(&format!("; atoms {}", renames.join(", ")));
+        }
+        if identified.rebuilt_anomeric_oxygen {
+            note.push_str(&format!(
+                "; nothing was bonded to the anomeric carbon: its oxygen was rebuilt as ROH for the anomer {}",
+                if identified.anomer_from_name {
+                    "the residue name gives"
+                } else {
+                    "the coordinates give"
+                }
+            ));
+        } else if identified.anomer_from_name {
+            note.push_str("; a centre was too distorted to read, so the residue name decided");
+        }
+        warnings.push(BuildWarning::GlycanNameNormalized(note));
+        // Aglycones precede their residue, as GLYCAM-Web writes ROH.
+        let (before, after): (Vec<_>, Vec<_>) = parts
+            .into_iter()
+            .partition(|part| matches!(part.reference.name.as_str(), "ROH" | "OME"));
+        rebuilt.extend(before);
+        rebuilt.push(sugar);
+        rebuilt.extend(after);
+    }
+    if !changed && cross.is_empty() {
+        return errors;
+    }
+
+    // Carry records over to the new names, and add the bonds read from the
+    // coordinates for carbohydrate residues.
+    let translate = |key: &pdb::ResidueKey, atom: &str| {
+        residues
+            .iter()
+            .enumerate()
+            .find(|(_, residue)| residue_key(residue) == *key)
+            .and_then(|(residue_index, residue)| {
+                let atom_index = residue.atoms.iter().position(|item| item.name == atom)?;
+                located.get(&(residue_index, atom_index)).cloned()
+            })
+    };
+    for link in links.iter_mut().chain(inferred.iter_mut()) {
+        if let Some((key, atom)) = translate(&link.first, &link.first_atom) {
+            link.first = key;
+            link.first_atom = atom;
+        }
+        if let Some((key, atom)) = translate(&link.second, &link.second_atom) {
+            link.second = key;
+            link.second_atom = atom;
+        }
+    }
+    for (first, second) in declared.iter_mut() {
+        for end in [first, second] {
+            if let Some((residue_index, atom_index)) = locate(residues, (&end.0, end.1, &end.2))
+                && let Some((key, atom)) = located.get(&(residue_index, atom_index))
+            {
+                end.0 = key.chain.clone();
+                end.1 = key.number;
+                end.2 = atom.clone();
+            }
+        }
+    }
+    let known = links
+        .iter()
+        .chain(inferred.iter())
+        .map(|link| {
+            let a = (link.first.clone(), link.first_atom.clone());
+            let b = (link.second.clone(), link.second_atom.clone());
+            if (
+                a.0.chain.as_str(),
+                a.0.number,
+                a.0.insertion_code,
+                a.1.as_str(),
+            ) <= (
+                b.0.chain.as_str(),
+                b.0.number,
+                b.0.insertion_code,
+                b.1.as_str(),
+            ) {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        })
+        .collect::<HashSet<_>>();
+    for ((ra, aa), (rb, ab)) in cross {
+        if !candidate(&residues[ra]) && !candidate(&residues[rb]) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (located.get(&(ra, aa)), located.get(&(rb, ab))) else {
+            continue;
+        };
+        let (a, b) = if (
+            a.0.chain.as_str(),
+            a.0.number,
+            a.0.insertion_code,
+            a.1.as_str(),
+        ) <= (
+            b.0.chain.as_str(),
+            b.0.number,
+            b.0.insertion_code,
+            b.1.as_str(),
+        ) {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        if !known.contains(&(a.clone(), b.clone())) {
+            inferred.push(pdb::DeclaredLink {
+                first: a.0,
+                first_atom: a.1,
+                second: b.0,
+                second_atom: b.1,
+            });
+        }
+    }
+    *residues = rebuilt;
+    errors
+}
+
+/// GLYCAM's charge rule for O-substituents.  A linked oxygen carries the
+/// -0.194 that balances the +0.194 of a glycosyl residue; SO3 (-0.837), MEX
+/// (+0.233) and ACX (+0.186) differ from that, so the oxygen they replace the
+/// hydrogen of absorbs the difference (+0.031, -0.039, +0.008) and the pair
+/// carries the group's formal charge.
+fn apply_substituent_charges(
+    atoms: &mut [Atom],
+    residues: &[Residue],
+    bonds: &[[usize; 2]],
+    templates: &TemplateSet,
+) {
+    for (index, residue) in residues.iter().enumerate() {
+        let formal = match residue.name.as_str() {
+            "SO3" => -1.0,
+            "MEX" | "ACX" => 0.0,
+            _ => continue,
+        };
+        let Some(template) = templates.glycan(&residue.name) else {
+            continue;
+        };
+        let group: f64 = template.atoms.iter().map(|atom| atom.charge).sum();
+        let correction = formal - group + 0.194;
+        let range = residue.atom_range();
+        let oxygen = bonds.iter().find_map(|&[first, second]| {
+            let (own, other) = if range.contains(&first) {
+                (first, second)
+            } else if range.contains(&second) {
+                (second, first)
+            } else {
+                return None;
+            };
+            let _ = own;
+            (!range.contains(&other) && atoms[other].element == 8 && atoms[other].residue != index)
+                .then_some(other)
         });
-        warnings.push(BuildWarning::GlycanNameNormalized(format!(
-            "{}: reducing-end O1 represented by a GLYCAM ROH residue",
-            residue.reference
-        )));
-        links.push(pdb::DeclaredLink {
-            first: sugar_key,
-            first_atom: "C1".into(),
-            second: pdb::ResidueKey {
-                chain: cap.reference.chain.clone(),
-                number: cap.reference.number,
-                insertion_code: Some('R'),
-            },
-            second_atom: "O1".into(),
-        });
-        residues.insert(index, cap);
-        index += 2;
+        if let Some(oxygen) = oxygen {
+            atoms[oxygen].charge += correction;
+        }
     }
 }
 
@@ -1252,97 +1650,6 @@ fn inferred_glycosylation_links(
         }
     }
     links
-}
-
-pub(crate) fn infer_glycam_template_name(
-    residue: &PdbResidue,
-    all: &[PdbResidue],
-    bonds: &[DeclaredAtomBond],
-    templates: &TemplateSet,
-) -> Result<String> {
-    let suffixes: &[&str] = match residue.reference.name.as_str() {
-        "NAG" => &["YB"],
-        "NDG" => &["YA"],
-        "MAN" => &["MA"],
-        "BMA" => &["MB"],
-        "GLC" => &["GA"],
-        "BGC" => &["GB"],
-        "GAL" => &["LA", "LB"],
-        "GLA" => &["LA"],
-        "FUC" => &["fA"],
-        "FUL" => &["fB"],
-        "XYS" | "XYP" => &["XB"],
-        "SIA" | "SLB" => &["SA", "SB"],
-        other if other.len() == 3 && templates.glycan(other).is_some() => return Ok(other.into()),
-        _ => &[],
-    };
-    if suffixes.is_empty() {
-        return Err(BuildError::UnsupportedResidue {
-            residue: residue.reference.to_string(),
-            reason: "carbohydrate component has no GLYCAM06j-1 mapping".into(),
-        });
-    }
-    let actual_names = residue
-        .atoms
-        .iter()
-        .filter(|atom| atom.element != "H" && atom.element != "D")
-        .map(|atom| atom.name.as_str())
-        .collect::<HashSet<_>>();
-    let linked_positions = bonds
-        .iter()
-        .filter_map(|(first, second)| {
-            let endpoint = if first.0 == residue.reference.chain
-                && first.1 == residue.reference.number
-                && first.2.starts_with('O')
-                && (second.0 != residue.reference.chain || second.1 != residue.reference.number)
-            {
-                Some(first)
-            } else if second.0 == residue.reference.chain
-                && second.1 == residue.reference.number
-                && second.2.starts_with('O')
-                && (first.0 != residue.reference.chain || first.1 != residue.reference.number)
-            {
-                Some(second)
-            } else {
-                None
-            }?;
-            endpoint.2[1..].parse::<u8>().ok()
-        })
-        .collect::<BTreeSet<_>>();
-    let _ = all;
-    let mut candidates = templates
-        .glycan_names()
-        .filter(|name| suffixes.iter().any(|suffix| name.ends_with(suffix)))
-        .filter_map(|name| {
-            let template = templates.glycan(name)?;
-            let template_heavy = template
-                .atoms
-                .iter()
-                .filter(|atom| atom.element != 1)
-                .map(|atom| atom.name.as_str())
-                .collect::<HashSet<_>>();
-            if !actual_names.is_subset(&template_heavy) {
-                return None;
-            }
-            let substituted = template
-                .atoms
-                .iter()
-                .filter(|atom| atom.atom_type == "Os")
-                .filter_map(|atom| atom.name.strip_prefix('O')?.parse::<u8>().ok())
-                .filter(|position| *position != 5)
-                .collect::<BTreeSet<_>>();
-            let mismatch = substituted.symmetric_difference(&linked_positions).count();
-            Some((mismatch, name.to_string()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates
-        .first()
-        .map(|(_, name)| name.clone())
-        .ok_or_else(|| BuildError::UnsupportedResidue {
-            residue: residue.reference.to_string(),
-            reason: "no GLYCAM template matches its heavy-atom names and linkages".into(),
-        })
 }
 
 #[derive(Clone, Copy)]

@@ -58,6 +58,17 @@ counter-ions. The ions replace waters chosen in a pseudo-random order set by
 `--seed`, at least 5 Å from the solute and from each other, so they start
 spread through the solvent.
 
+`--cacl2` and `--mgcl2` add CaCl2 and MgCl2 (mol/L) on top of the NaCl: each
+Ca2+ or Mg2+ (Li/Merz 12-6 compromise set for TIP3P) comes with two Cl-, the
+number counted from the water like the NaCl pairs, so the divalent salt adds
+no charge and the NaCl still neutralizes the solute. `--ecc` applies the
+electronic continuum correction with the conventions of prosECCo75 (Nencini et
+al., J. Chem. Theory Comput. 2024): the ions become prosECCo75's scaled-charge
+models (Na_s, K_s, Cl_s, Ca_s, Mg_ss), and every charged carbohydrate group
+(carboxylate, sulfate, phosphate, ammonium) carries 0.75 of its charge, its
+terminal atoms scaled and its central atom taking the rest. Water stays TIP3P
+(prosECCo75 uses the CHARMM TIP3P), and protein residues are not scaled.
+
 `glysys-md` is the native session adapter; it does not require WASM or a
 browser. `--threads` is per process, so a Slurm replica should receive only
 the CPUs in its allocation. The default GPU policy is adaptive and queries
@@ -260,6 +271,33 @@ listed in the JSON report.
 [`benchmarks/fixer`](benchmarks/fixer) compares `fix` with OpenMM PDBFixer on 30
 PDB entries covering alternate locations, NMR models, modified residues,
 ligands, metals, nucleic acids, glycoproteins and a 58,000-atom assembly.
+
+## Carbohydrates are read from their atoms
+
+A carbohydrate residue is identified from its coordinates, not its name. Its
+heavy-atom graph and the configuration of every stereocentre select the GLYCAM
+residue, the bonds it makes to other residues select the linkage form, and its
+atoms are renamed to GLYCAM's. Atoms that are not part of the GLYCAM residue
+become the GLYCAM residue for an aglycone (`ROH`, `OME`) or an O-substituent
+(`SO3`, `MEX`, `ACX`), and the oxygen a substituent replaces the hydrogen of
+takes GLYCAM's charge correction (+0.031 for SO3, -0.039 for MEX, +0.008 for
+ACX), so every system sums to an integer charge. wwPDB (CCD), GLYCAM and
+CHARMM names all work, and a name that contradicts the coordinates loses.
+
+The residue name decides only what the coordinates cannot: the anomer of a
+reducing end deposited without its O1 (the oxygen is rebuilt as `ROH`) and a
+centre too distorted to read. Forms with the same atoms and configuration
+(protonation states, duplicate library entries) are chosen by the input's
+hydrogens, else the pH 7 ionization.
+
+The templates are GLYCAM06j-1 (AmberTools) plus the residues GLYCAM-Web adds
+(`GLYCAM_06k_gmml2.lib`: galactofuranose, KDN, Kdo, ...), restricted to those
+GLYCAM_06j.dat parameterizes completely. Where GLYCAM's library coordinates
+contradict a residue's name (its galactofuranoses are built with C5 inverted,
+L-altro), a structure that follows the library is parameterized and reported
+(`glycan_stereochemistry`). On the 2,542 reference lectin-glycan sites of
+SugarGLIDER, 91.8% prepare with GLYCAM alone (48.0% with 0.1.2) and 99.3% with
+`--fix` and the generic force field below.
 
 ## Generic force field for everything else (`prepare`)
 

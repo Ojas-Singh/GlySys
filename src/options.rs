@@ -30,6 +30,16 @@ pub struct BuildOptions {
     /// (ion counts by the SLTCAP rule; for a neutral solute, the concentration
     /// in its water).
     pub salt_molar: f64,
+    /// CaCl2 concentration in mol/L, added to the NaCl: each Ca2+ (Li/Merz 12-6)
+    /// comes with two Cl-, counted from the water like the NaCl.
+    pub cacl2_molar: f64,
+    /// MgCl2 concentration in mol/L, as `cacl2_molar`.
+    pub mgcl2_molar: f64,
+    /// Electronic continuum correction (prosECCo75 conventions): the bath ions
+    /// get the prosECCo75 scaled-charge ions (Na_s, Cl_s, Ca_s, Mg_ss) and every
+    /// charged carbohydrate group carries 0.75 of its charge. Proteins are not
+    /// scaled.
+    pub ecc: bool,
     /// Add a periodic TIP3P water box.
     pub add_water: bool,
     /// Add ions: neutral overall, at the requested salt concentration.
@@ -50,6 +60,9 @@ impl Default for BuildOptions {
             profile: ForceFieldProfile::default(),
             padding_angstrom: 12.0,
             salt_molar: 0.15,
+            cacl2_molar: 0.0,
+            mgcl2_molar: 0.0,
+            ecc: false,
             add_water: true,
             add_ions: true,
             seed: 0,
@@ -97,6 +110,13 @@ impl BuildOptions {
             return Err(BuildError::InvalidOption(
                 "padding must be a positive finite value".into(),
             ));
+        }
+        for (name, molar) in [("CaCl2", self.cacl2_molar), ("MgCl2", self.mgcl2_molar)] {
+            if !molar.is_finite() || molar < 0.0 {
+                return Err(BuildError::InvalidOption(format!(
+                    "{name} concentration must be non-negative and finite"
+                )));
+            }
         }
         if !self.salt_molar.is_finite() || self.salt_molar < 0.0 {
             return Err(BuildError::InvalidOption(

@@ -39,6 +39,8 @@ pub(crate) struct TemplateSet {
     n_terminal: HashMap<String, Template>,
     c_terminal: HashMap<String, Template>,
     glycans: HashMap<String, Template>,
+    /// Carbohydrate templates taken from GLYCAM-Web's library.
+    glycam_web: std::collections::HashSet<String>,
     ions: HashMap<String, Template>,
     nucleic: HashMap<String, Template>,
     tip3p_box: Template,
@@ -68,6 +70,14 @@ impl TemplateSet {
                 glycans.insert(name, template.clone());
             }
         }
+        // GLYCAM-Web's current library: add what 06j-1 lacks and take its
+        // corrections (the extraction script lists them).
+        let web = parse_off(amber_data::GLYCAM_GMML2_LIB)?;
+        let glycam_web = web.keys().cloned().collect();
+        glycans.extend(web);
+        // GLYCAM-Web builds galactofuranose with C5 inverted (L-altro): put
+        // the centres the library gets wrong right (carbohydrate.rs).
+        crate::carbohydrate::correct_library_stereochemistry(&mut glycans);
         let ions = parse_off(amber_data::ATOMIC_IONS)?;
         let mut nucleic = parse_off(amber_data::DNA_OL15)?;
         nucleic.extend(parse_off(amber_data::RNA_OL3)?);
@@ -82,6 +92,7 @@ impl TemplateSet {
             n_terminal,
             c_terminal,
             glycans,
+            glycam_web,
             ions,
             nucleic,
             tip3p_box,
@@ -115,8 +126,31 @@ impl TemplateSet {
         self.glycans.get(name)
     }
 
-    pub(crate) fn glycan_names(&self) -> impl Iterator<Item = &str> {
-        self.glycans.keys().map(String::as_str)
+    pub(crate) fn is_glycam_web(&self, name: &str) -> bool {
+        self.glycam_web.contains(name)
+    }
+
+    pub(crate) fn glycans(&self) -> impl Iterator<Item = &Template> {
+        self.glycans.values()
+    }
+
+    /// Drop carbohydrate templates the parameter set cannot cover, so they
+    /// are never chosen; returns the dropped names.
+    pub(crate) fn retain_parameterized_glycans(
+        &mut self,
+        covered: impl Fn(&Template) -> bool,
+    ) -> Vec<String> {
+        let mut dropped = self
+            .glycans
+            .iter()
+            .filter(|(_, template)| !covered(template))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        dropped.sort();
+        for name in &dropped {
+            self.glycans.remove(name);
+        }
+        dropped
     }
 
     /// Amber OL15 DNA / OL3 RNA residue, e.g. `DA` with 5'/3' terminal forms.
@@ -472,9 +506,11 @@ fn place_internal(
             u[0] * v[1] - u[1] * v[0],
         ]
     };
+    // Frame: `ba` along b->a, `normal` to the plane c-b-a, `binormal` in that
+    // plane on c's side, so a torsion of 0 puts the new atom cis to c.
     let ba = unit([a.x - b.x, a.y - b.y, a.z - b.z]);
     let cb = unit([b.x - c.x, b.y - c.y, b.z - c.z]);
-    let normal = unit(cross(ba, cb));
+    let normal = unit(cross(cb, ba));
     let binormal = cross(normal, ba);
     let theta = angle_deg.to_radians();
     let phi = torsion_deg.to_radians();
@@ -547,5 +583,36 @@ mod tests {
         assert!(templates.glycan("VYS").is_some());
         assert!(templates.ion("Na+").is_some());
         assert!(!templates.tip3p_box().atoms.is_empty());
+    }
+
+    /// PREP internal coordinates must rebuild real molecules: every bond,
+    /// ring closures included, at a covalent length.
+    #[test]
+    fn prep_internal_coordinates_give_covalent_bond_lengths() {
+        let templates = TemplateSet::load().unwrap();
+        let mut bad = Vec::new();
+        for template in templates.glycans() {
+            for &[first, second] in &template.bonds {
+                let (a, b) = (&template.atoms[first], &template.atoms[second]);
+                let length = a.position.distance2(b.position).sqrt();
+                let limit = if a.element == 1 || b.element == 1 {
+                    1.2
+                } else {
+                    1.9
+                };
+                if !(0.9..=limit).contains(&length) {
+                    bad.push(format!(
+                        "{} {}-{} {length:.2}",
+                        template.name, a.name, b.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} bad bonds, e.g. {:?}",
+            bad.len(),
+            &bad[..bad.len().min(8)]
+        );
     }
 }

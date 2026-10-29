@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+Carbohydrates are read from their atoms, and GLYCAM-Web's residues are added.
+On the 2,542 reference lectin-glycan sites of SugarGLIDER, `inspect` now
+parameterizes 91.8% with GLYCAM (0.1.2: 48.0%), 99.3% with `prepare --fix`.
+
+Output changes:
+
+- Carbohydrate residues get the GLYCAM residue their coordinates fit, with
+  GLYCAM atom names, whatever they were called. A GLYCAM name that
+  contradicts the coordinates is corrected (a beta GlcNAc named `0YA` becomes
+  `0YB`); 0.1.2 picked the alpha template for `GAL` on a tie and the beta one
+  for `XYS` (alpha in the CCD).
+- Methyl glycosides split into the sugar and `OME`, sulfate, methyl and
+  acetyl groups into `SO3`, `MEX` and `ACX`, with GLYCAM's charge correction on
+  the oxygen they replace the hydrogen of. Sulfated GAGs now sum to an
+  integer charge (a heparin fragment was -8.124), and the 0.15 e tolerance
+  for them is gone.
+- PREP templates are rebuilt with correct torsions: every internal coordinate
+  was placed 180 degrees off its torsion (ring-closing bonds up to 4.9 A),
+  which moved hydrogens built from template geometry.
+- A free reducing end without O1 gets it back as `ROH`, for the anomer the
+  residue name gives.
+- GLYCAM-Web's galactofuranose templates (`xLU`, `xLD`) are corrected when
+  they are loaded: as shipped they are beta/alpha-L-altrofuranose (C5
+  inverted, and C1 anomeric relative to that wrong C5, so both centres differ
+  from the residue named; crabWURCS reads `LAltf`). After the correction
+  crabWURCS reads `0LU` as `DGalfb` and `0LD` as `DGalfa`, and a deposited
+  D-galactofuranose gets the anomer its coordinates have. An input built by
+  GLYCAM-Web (beta/alpha-L-altrofuranose under a GLYCAM Galf name, which is
+  every galactofuranose GLYCAM-Web builds) is rebuilt from the corrected
+  template: superposed on its anomeric carbon and the atom it is bonded to (so
+  the glycosidic bond is kept) and on its ring, with the residues bonded to it
+  moved rigidly with the atom they hang on; a warning says so.
+- Divalent salts: `cacl2_molar` / `--cacl2` and `mgcl2_molar` / `--mgcl2` add
+  Ca2+ and Mg2+ (Li/Merz 12-6, TIP3P) with two Cl- each, counted from the
+  water like the NaCl, on top of the NaCl that neutralizes the solute. The
+  report gives `calcium_ions` and `magnesium_ions`.
+- Electronic continuum correction: `ecc` / `--ecc` with the conventions of
+  prosECCo75 (Nencini et al. 2024; ions v20221028): Na+, K+, Cl-, Ca2+ and Mg2+
+  become the scaled-charge models Na_s, K_s, Cl_s, Ca_s and Mg_ss (charges 0.75
+  and 1.5 e, their own Lennard-Jones parameters), and every charged
+  carbohydrate block carries 0.75 of its charge: the terminal oxygens of a
+  carboxylate, sulfate or phosphate (or the hydrogens of an ammonium) are
+  scaled by 0.75 and the central atom takes the rest, removing a quarter of
+  the residue's integer charge (GLYCAM's sulfation correction still cancels in
+  the sugar-SO3 pair; heparin 1HPN, -24, goes to -18 exactly). Water stays
+  TIP3P; protein residues are not scaled (a `charge_scaling` warning lists
+  them).
+
+### Changes
+
+- `src/carbohydrate.rs`: carbohydrate identification by induced subgraph
+  match, stereocentre configuration, linkage form and aglycone/substituent
+  split. It replaces the 12-name CCD table in `prepare` and in the fixer.
+- GLYCAM-Web's residues missing from GLYCAM06j-1 (538, from GMML's
+  `GLYCAM_06k_gmml2.lib`), and its corrections of `3dR`, `4AE` and `WdR`; see
+  `data/amber/PROVENANCE.md`. Templates GLYCAM_06j.dat cannot parameterize
+  completely are never chosen.
+- Fructose of sucrose and raffinose (`2CU`, the residue holds its own
+  glycosidic oxygen) and the other closed anomeric forms.
+- New warnings: `glycan_stereochemistry` (an input follows a GLYCAM library
+  coordinate error, e.g. GLYCAM-Web galactofuranose with C5 inverted) and
+  `unsupported_residue` (why `inspect` lists a residue).
+- `inspect` decides support with the same carbohydrate reading as `prepare`.
+- Removed: the reducing-O1 splitter that moved any atom named O1 (a ketose's
+  C1 hydroxyl) into `ROH`.
+
 ## 0.1.2 - 2026-10-15
 
 Everything since 0.1.1 (2026-09-24). The main additions are a

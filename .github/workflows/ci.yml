@@ -26,7 +26,8 @@ jobs:
       - run: cd data/amber && sha256sum -c CHECKSUMS.sha256
 
   consumers:
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 (ubuntu-latest since 2026-10) ships a gromacs package with unmet dependencies
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
