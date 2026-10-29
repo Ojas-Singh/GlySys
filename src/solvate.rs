@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::forcefield::{ParameterSet, TemplateSet};
 use crate::model::{Angle, Atom, Bond, Residue, System, Vec3};
-use crate::{BuildError, BuildOptions, Result};
+use crate::{BuildError, BuildOptions, Counterion, Result};
 
 const TIP3P_CELL_ANGSTROM: f64 = 18.774_349;
 /// Molarity of pure water at 25 °C (997.05 g/L, 18.015 g/mol).
@@ -141,8 +141,14 @@ pub(crate) fn solvate_and_ionize(
         .map(|atom| atom.charge)
         .sum::<f64>()
         .round() as i64;
+    let (counter_cation, divalent_counterions) = if options.add_ions {
+        divalent_neutralization(solute_charge, options.counterion)
+    } else {
+        (Ion::Sodium, 0)
+    };
+    let residual_charge = solute_charge + 2 * divalent_counterions as i64;
     let (sodium, chloride) = if options.add_ions {
-        ion_counts(waters.len(), solute_charge, options.salt_molar)
+        ion_counts(waters.len(), residual_charge, options.salt_molar)
     } else {
         (0, 0)
     };
@@ -154,7 +160,7 @@ pub(crate) fn solvate_and_ionize(
     } else {
         (0, 0)
     };
-    let requested = sodium + chloride + 3 * (calcium + magnesium);
+    let requested = divalent_counterions + sodium + chloride + 3 * (calcium + magnesium);
     if requested > waters.len() {
         return Err(BuildError::InsufficientSolvent {
             requested,
@@ -164,7 +170,15 @@ pub(crate) fn solvate_and_ionize(
     let selected = place_ions(
         &waters,
         box_lengths,
-        &ion_schedule(sodium, chloride, solute_charge, calcium, magnesium),
+        &std::iter::repeat_n(counter_cation, divalent_counterions)
+            .chain(ion_schedule(
+                sodium,
+                chloride,
+                residual_charge,
+                calcium,
+                magnesium,
+            ))
+            .collect::<Vec<_>>(),
     );
     let replaced = selected
         .iter()
@@ -304,6 +318,19 @@ impl Ion {
             Ion::Calcium => "CA",
             Ion::Magnesium => "MG",
         }
+    }
+}
+
+/// The divalent cations that neutralize a solute of charge `solute_charge`
+/// when `counterion` asks for them: one per two negative charges (an odd
+/// charge is left for one Na+ of the NaCl); none for a positive or neutral
+/// solute, or with sodium counterions.
+fn divalent_neutralization(solute_charge: i64, counterion: Counterion) -> (Ion, usize) {
+    let pairs = usize::try_from((-solute_charge).max(0) / 2).unwrap_or(0);
+    match counterion {
+        Counterion::Sodium => (Ion::Sodium, 0),
+        Counterion::Calcium => (Ion::Calcium, pairs),
+        Counterion::Magnesium => (Ion::Magnesium, pairs),
     }
 }
 
@@ -474,6 +501,22 @@ mod tests {
         use Ion::{Chloride as Cl, Sodium as Na};
         assert_eq!(ion_schedule(4, 2, -2, 0, 0), vec![Na, Na, Na, Cl, Na, Cl]);
         assert_eq!(ion_schedule(1, 3, 2, 0, 0), vec![Cl, Cl, Na, Cl]);
+    }
+
+    #[test]
+    fn divalent_counterions_take_two_charges_each() {
+        assert_eq!(
+            divalent_neutralization(-6, Counterion::Calcium),
+            (Ion::Calcium, 3)
+        );
+        assert_eq!(
+            divalent_neutralization(-5, Counterion::Magnesium),
+            (Ion::Magnesium, 2)
+        );
+        assert_eq!(divalent_neutralization(-6, Counterion::Sodium).1, 0);
+        assert_eq!(divalent_neutralization(3, Counterion::Calcium).1, 0);
+        // the odd charge left is neutralized by one Na+ of the NaCl
+        assert_eq!(ion_counts(2000, -5 + 2 * 2, 0.0), (1, 0));
     }
 
     #[test]

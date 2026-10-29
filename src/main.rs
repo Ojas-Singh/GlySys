@@ -122,6 +122,10 @@ struct PrepareArgs {
     /// MgCl2 concentration in mol/L, added to the NaCl (Mg2+ with two Cl-).
     #[arg(long)]
     mgcl2: Option<f64>,
+    /// Cation that neutralizes a negative solute: na (default), or ca / mg,
+    /// one Ca2+ or Mg2+ per two charges.
+    #[arg(long, value_parser = ["na", "ca", "mg"])]
+    counterion: Option<String>,
     /// Electronic continuum correction: prosECCo75 scaled-charge ions and
     /// carbohydrate charged groups at 0.75 of their charge.
     #[arg(long)]
@@ -273,6 +277,12 @@ fn options(input: &InputArgs, prepare: Option<&PrepareArgs>) -> anyhow::Result<B
         }
         if let Some(mgcl2) = prepare.mgcl2 {
             options.mgcl2_molar = mgcl2;
+        }
+        match prepare.counterion.as_deref() {
+            Some("ca") => options.counterion = glysys::Counterion::Calcium,
+            Some("mg") => options.counterion = glysys::Counterion::Magnesium,
+            Some(_) => options.counterion = glysys::Counterion::Sodium,
+            None => {}
         }
         if prepare.ecc {
             options.ecc = true;
