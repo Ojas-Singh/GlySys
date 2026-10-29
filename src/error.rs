@@ -69,6 +69,8 @@ pub enum BuildWarning {
     GlycanStereochemistry(String),
     /// Why `inspect` lists a residue as unsupported.
     UnsupportedResidue(String),
+    /// What the electronic continuum correction (`ecc`) did and did not scale.
+    ChargeScaling(String),
 }
 
 pub type Result<T> = std::result::Result<T, BuildError>;

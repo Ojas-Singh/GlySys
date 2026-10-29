@@ -149,6 +149,360 @@ pub(crate) fn correct_library_stereochemistry(
     corrected
 }
 
+/// Weighted least-squares rigid superposition (Horn's quaternion method):
+/// the rotation matrix and translation that take `from` onto `to`.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn superpose(
+    from: &[Vec3],
+    to: &[Vec3],
+    weights: &[f64],
+) -> Option<([[f64; 3]; 3], [f64; 3])> {
+    let total: f64 = weights.iter().sum();
+    if from.len() != to.len() || from.len() < 3 || total <= 0.0 {
+        return None;
+    }
+    let centre = |points: &[Vec3]| {
+        let mut c = [0.0; 3];
+        for (p, w) in points.iter().zip(weights) {
+            c[0] += w * p.x;
+            c[1] += w * p.y;
+            c[2] += w * p.z;
+        }
+        c.map(|v| v / total)
+    };
+    let (cf, ct) = (centre(from), centre(to));
+    let mut s = [[0.0; 3]; 3];
+    for ((p, q), w) in from.iter().zip(to).zip(weights) {
+        let x = [p.x - cf[0], p.y - cf[1], p.z - cf[2]];
+        let y = [q.x - ct[0], q.y - ct[1], q.z - ct[2]];
+        for a in 0..3 {
+            for b in 0..3 {
+                s[a][b] += w * x[a] * y[b];
+            }
+        }
+    }
+    let n = [
+        [
+            s[0][0] + s[1][1] + s[2][2],
+            s[1][2] - s[2][1],
+            s[2][0] - s[0][2],
+            s[0][1] - s[1][0],
+        ],
+        [
+            s[1][2] - s[2][1],
+            s[0][0] - s[1][1] - s[2][2],
+            s[0][1] + s[1][0],
+            s[2][0] + s[0][2],
+        ],
+        [
+            s[2][0] - s[0][2],
+            s[0][1] + s[1][0],
+            -s[0][0] + s[1][1] - s[2][2],
+            s[1][2] + s[2][1],
+        ],
+        [
+            s[0][1] - s[1][0],
+            s[2][0] + s[0][2],
+            s[1][2] + s[2][1],
+            -s[0][0] - s[1][1] + s[2][2],
+        ],
+    ];
+    let q = largest_eigenvector(n)?;
+    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+    let r = [
+        [
+            w * w + x * x - y * y - z * z,
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            w * w - x * x + y * y - z * z,
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            w * w - x * x - y * y + z * z,
+        ],
+    ];
+    let t = [0, 1, 2].map(|i| ct[i] - (r[i][0] * cf[0] + r[i][1] * cf[1] + r[i][2] * cf[2]));
+    Some((r, t))
+}
+
+/// The unit eigenvector of the largest eigenvalue of a symmetric 4x4 matrix (Jacobi rotations).
+#[allow(clippy::needless_range_loop)] // index form of the textbook rotation
+fn largest_eigenvector(mut a: [[f64; 4]; 4]) -> Option<[f64; 4]> {
+    let mut v = [[0.0; 4]; 4];
+    for (i, row) in v.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for _ in 0..100 {
+        let mut off = 0.0;
+        for i in 0..4 {
+            for j in i + 1..4 {
+                off += a[i][j] * a[i][j];
+            }
+        }
+        if off < 1.0e-24 {
+            break;
+        }
+        for p in 0..4 {
+            for q in p + 1..4 {
+                if a[p][q].abs() < 1.0e-300 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let (c, s) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+                for k in 0..4 {
+                    let (akp, akq) = (a[k][p], a[k][q]);
+                    a[k][p] = c * akp - s * akq;
+                    a[k][q] = s * akp + c * akq;
+                }
+                for k in 0..4 {
+                    let (apk, aqk) = (a[p][k], a[q][k]);
+                    a[p][k] = c * apk - s * aqk;
+                    a[q][k] = s * apk + c * aqk;
+                }
+                for row in v.iter_mut() {
+                    let (vp, vq) = (row[p], row[q]);
+                    row[p] = c * vp - s * vq;
+                    row[q] = s * vp + c * vq;
+                }
+            }
+        }
+    }
+    let best = (0..4).max_by(|&i, &j| a[i][i].total_cmp(&a[j][j]))?;
+    let q = [v[0][best], v[1][best], v[2][best], v[3][best]];
+    let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+    (norm > 1.0e-12).then(|| q.map(|x| x / norm))
+}
+
+fn apply_transform(r: &[[f64; 3]; 3], t: &[f64; 3], p: Vec3) -> Vec3 {
+    Vec3 {
+        x: r[0][0] * p.x + r[0][1] * p.y + r[0][2] * p.z + t[0],
+        y: r[1][0] * p.x + r[1][1] * p.y + r[1][2] * p.z + t[1],
+        z: r[2][0] * p.x + r[2][1] * p.y + r[2][2] * p.z + t[2],
+    }
+}
+
+/// Rebuild every galactofuranose that GLYCAM-Web built (a GLYCAM `xLU`/`xLD`
+/// residue whose C5 has the library's L-altro configuration) from the corrected
+/// template: the template is superposed on the residue's anomeric carbon and
+/// the atom it is bonded to outside the residue (weight 10 each) and on its ring
+/// (weight 1), so the glycosidic bond stays where it was; the residues bonded to
+/// it at its other atoms (and everything beyond them) move rigidly with the atom
+/// they hang on.  `cross` holds the bonds between residues.  Returns the rebuilt
+/// residues' indices.
+pub(crate) fn rebuild_glycam_web_galactofuranoses(
+    residues: &mut [PdbResidue],
+    cross: &BTreeSet<((usize, usize), (usize, usize))>,
+    library: &CarbohydrateLibrary,
+    warnings: &mut Vec<crate::BuildWarning>,
+) -> Vec<usize> {
+    let mut rebuilt = Vec::new();
+    for r in 0..residues.len() {
+        let name = residues[r].reference.name.clone();
+        let Some(template) = library.galf_templates.get(&name) else {
+            continue;
+        };
+        let suffix = &name[1..];
+        let meaning = CORRECTED_MEANING
+            .iter()
+            .find(|(s, _)| *s == suffix)
+            .map(|(_, m)| *m)
+            .unwrap_or("L-altrofuranose");
+        let at = |atoms: &[crate::pdb::PdbAtom], n: &str| atoms.iter().position(|a| a.name == n);
+        let tpos = |n: &str| {
+            template
+                .atoms
+                .iter()
+                .find(|a| a.name == n)
+                .map(|a| a.position)
+        };
+        let ring = ["C1", "C2", "C3", "C4", "O4"];
+        let atoms = &residues[r].atoms;
+        let (Some(i_c4), Some(i_c5), Some(i_c6), Some(i_o5), Some(i_c1)) = (
+            at(atoms, "C4"),
+            at(atoms, "C5"),
+            at(atoms, "C6"),
+            at(atoms, "O5"),
+            at(atoms, "C1"),
+        ) else {
+            continue;
+        };
+        let (Some(t_c4), Some(t_c5), Some(t_c6), Some(t_o5)) =
+            (tpos("C4"), tpos("C5"), tpos("C6"), tpos("O5"))
+        else {
+            continue;
+        };
+        let input_sign = chiral_volume(
+            atoms[i_c5].position,
+            atoms[i_c4].position,
+            atoms[i_c6].position,
+            atoms[i_o5].position,
+        )
+        .signum();
+        let template_sign = chiral_volume(t_c5, t_c4, t_c6, t_o5).signum();
+        if input_sign == template_sign {
+            continue; // already D-galacto at C5
+        }
+        // the atom bonded to C1 from outside, and the residues on the other atoms
+        let mut parent = None;
+        let mut children = Vec::new();
+        for &((ra, aa), (rb, ab)) in cross {
+            for (own, own_atom, other, other_atom) in [(ra, aa, rb, ab), (rb, ab, ra, aa)] {
+                if own != r {
+                    continue;
+                }
+                if own_atom == i_c1 {
+                    parent = Some(residues[other].atoms[other_atom].position);
+                } else {
+                    children.push((own_atom, other));
+                }
+            }
+        }
+        // the template's direction for the bond out of C1
+        let Some(t_c1) = tpos("C1") else { continue };
+        let Some(c1_index) = template.atoms.iter().position(|a| a.name == "C1") else {
+            continue;
+        };
+        let mut out = [0.0; 3];
+        for &[i, j] in &template.bonds {
+            let other = if i == c1_index {
+                j
+            } else if j == c1_index {
+                i
+            } else {
+                continue;
+            };
+            let q = template.atoms[other].position;
+            let d = [q.x - t_c1.x, q.y - t_c1.y, q.z - t_c1.z];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            for k in 0..3 {
+                out[k] -= d[k] / n;
+            }
+        }
+        let Some(out) = normalized(out) else { continue };
+        let virtual_partner = Vec3 {
+            x: t_c1.x + 1.43 * out[0],
+            y: t_c1.y + 1.43 * out[1],
+            z: t_c1.z + 1.43 * out[2],
+        };
+        let mut from = Vec::new();
+        let mut to = Vec::new();
+        let mut weights = Vec::new();
+        if let Some(p) = parent {
+            from.extend([t_c1, virtual_partner]);
+            to.extend([atoms[i_c1].position, p]);
+            weights.extend([10.0, 10.0]);
+        }
+        for n in ring {
+            if let (Some(t), Some(i)) = (tpos(n), at(atoms, n)) {
+                from.push(t);
+                to.push(atoms[i].position);
+                weights.push(1.0);
+            }
+        }
+        let Some((rot, tr)) = superpose(&from, &to, &weights) else {
+            continue;
+        };
+        let old_names: Vec<String> = atoms.iter().map(|a| a.name.clone()).collect();
+        let old_by_name: HashMap<String, Vec3> =
+            atoms.iter().map(|a| (a.name.clone(), a.position)).collect();
+        // the residue's atoms from the template, by name (GLYCAM-Web writes the
+        // template's names; an atom without one keeps its position)
+        let residue = &mut residues[r];
+        for atom in &mut residue.atoms {
+            if let Some(t) = template.atoms.iter().find(|t| t.name == atom.name) {
+                atom.position = apply_transform(&rot, &tr, t.position);
+            }
+        }
+        let new_by_name: HashMap<String, Vec3> = residue
+            .atoms
+            .iter()
+            .map(|a| (a.name.clone(), a.position))
+            .collect();
+        // the residues hanging on the rebuilt one (and everything beyond them) move
+        // rigidly with the atom they hang on and its two heavy neighbours
+        let heavy_neighbour = |index: usize, not: usize| {
+            template.bonds.iter().find_map(|&[i, j]| {
+                let other = if i == index {
+                    j
+                } else if j == index {
+                    i
+                } else {
+                    return None;
+                };
+                (other != not && template.atoms[other].element != 1).then_some(other)
+            })
+        };
+        let mut adjacency: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        for &((ra, _), (rb, _)) in cross {
+            adjacency.entry(ra).or_default().insert(rb);
+            adjacency.entry(rb).or_default().insert(ra);
+        }
+        let mut moved = BTreeSet::new();
+        let mut moved_children = 0;
+        for (own_atom, child) in children {
+            let attach = &old_names[own_atom];
+            let Some(a_index) = template.atoms.iter().position(|t| &t.name == attach) else {
+                continue;
+            };
+            let Some(b_index) = heavy_neighbour(a_index, usize::MAX) else {
+                continue;
+            };
+            let Some(c_index) = heavy_neighbour(b_index, a_index) else {
+                continue;
+            };
+            let frame = [a_index, b_index, c_index].map(|k| template.atoms[k].name.clone());
+            let (Some(before), Some(after)) = (
+                frame
+                    .iter()
+                    .map(|n| old_by_name.get(n).copied())
+                    .collect::<Option<Vec<_>>>(),
+                frame
+                    .iter()
+                    .map(|n| new_by_name.get(n).copied())
+                    .collect::<Option<Vec<_>>>(),
+            ) else {
+                continue;
+            };
+            let Some((rot2, tr2)) = superpose(&before, &after, &[1.0, 1.0, 1.0]) else {
+                continue;
+            };
+            let mut stack = vec![child];
+            let mut subtree = BTreeSet::new();
+            while let Some(next) = stack.pop() {
+                if next == r || moved.contains(&next) || !subtree.insert(next) {
+                    continue;
+                }
+                stack.extend(adjacency.get(&next).into_iter().flatten().copied());
+            }
+            for &k in &subtree {
+                for atom in &mut residues[k].atoms {
+                    atom.position = apply_transform(&rot2, &tr2, atom.position);
+                }
+            }
+            moved.extend(subtree);
+            moved_children += 1;
+        }
+        let carried = if moved_children > 0 {
+            format!(" and the {} residue(s) on it moved with it", moved.len())
+        } else {
+            String::new()
+        };
+        warnings.push(crate::BuildWarning::GlycanStereochemistry(format!(
+            "{} ({name}): was {meaning}; rebuilt from the corrected template (C1 and C5 inverted), its glycosidic bond kept{carried}",
+            residues[r].reference
+        )));
+        rebuilt.push(r);
+    }
+    rebuilt
+}
+
 /// The residue a wwPDB chemical component names, as a GLYCAM residue code
 /// without its linkage letter.  Only used when the coordinates cannot decide
 /// (the anomeric oxygen is missing or a centre is too distorted to read).
@@ -235,6 +589,9 @@ pub(crate) struct Fragment {
 #[derive(Debug)]
 pub(crate) struct CarbohydrateLibrary {
     cores: Vec<Core>,
+    /// The corrected galactofuranose templates, by name, for rebuilding what
+    /// GLYCAM-Web built ([`rebuild_glycam_web_galactofuranoses`]).
+    galf_templates: HashMap<String, Template>,
 }
 
 /// One GLYCAM residue type with all of its linkage forms.
@@ -323,7 +680,19 @@ impl CarbohydrateLibrary {
                 cores.push(core);
             }
         }
-        Self { cores }
+        let galf_templates = templates
+            .glycans()
+            .filter(|t| {
+                t.name
+                    .get(1..)
+                    .is_some_and(|suffix| CORRECTED_MEANING.iter().any(|(s, _)| *s == suffix))
+            })
+            .map(|t| (t.name.clone(), t.clone()))
+            .collect();
+        Self {
+            cores,
+            galf_templates,
+        }
     }
 
     /// Identify `residue`.  `outside[i]` holds the positions of atoms in other
@@ -1512,6 +1881,61 @@ mod tests {
             ));
         }
         lines.join("\n") + "\nEND\n"
+    }
+
+    #[test]
+    fn superposition_recovers_a_rotation_and_a_translation() {
+        let points = [
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Vec3 {
+                x: 1.5,
+                y: 0.0,
+                z: 0.0,
+            },
+            Vec3 {
+                x: 0.0,
+                y: 2.0,
+                z: 0.3,
+            },
+            Vec3 {
+                x: 0.4,
+                y: 0.7,
+                z: 1.9,
+            },
+        ];
+        let (angle, axis) = (0.9_f64, normalized([1.0, -2.0, 0.5]).unwrap());
+        let (c, s) = (angle.cos(), angle.sin());
+        let [x, y, z] = axis;
+        let r = [
+            [
+                c + x * x * (1.0 - c),
+                x * y * (1.0 - c) - z * s,
+                x * z * (1.0 - c) + y * s,
+            ],
+            [
+                y * x * (1.0 - c) + z * s,
+                c + y * y * (1.0 - c),
+                y * z * (1.0 - c) - x * s,
+            ],
+            [
+                z * x * (1.0 - c) - y * s,
+                z * y * (1.0 - c) + x * s,
+                c + z * z * (1.0 - c),
+            ],
+        ];
+        let t = [3.0, -1.0, 2.5];
+        let moved: Vec<Vec3> = points.iter().map(|&p| apply_transform(&r, &t, p)).collect();
+        let (found_r, found_t) = superpose(&points, &moved, &[1.0, 2.0, 1.0, 0.5]).unwrap();
+        for i in 0..3 {
+            assert!((found_t[i] - t[i]).abs() < 1e-9);
+            for j in 0..3 {
+                assert!((found_r[i][j] - r[i][j]).abs() < 1e-9);
+            }
+        }
     }
 
     #[test]

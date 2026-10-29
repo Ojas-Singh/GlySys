@@ -88,39 +88,6 @@ fn a_reducing_end_deposited_without_o1_gets_it_back_from_the_name() {
     )));
 }
 
-#[test]
-fn glycam_web_galactofuranose_is_refused_as_l_altrofuranose() {
-    // DGalfb1-2LArafb1-2LArafb1-OH assembled from GLYCAM-Web's library
-    // coordinates (ROH 2aU 2aU 0LU): its "beta-D-Galf" is beta-L-altrofuranose
-    // (C1 and C5 inverted; crabWURCS reads LAltf).  GlySys has corrected the
-    // templates and refuses this input with the reason, also though 0LU names
-    // a GLYCAM template: preparing it by name would keep the wrong sugar.
-    let pdb = include_str!("fixtures/carbohydrates/glycam_web_galf_araf_araf.pdb");
-    assert!(crabwurcs_galf(pdb).starts_with("LAltfb1-2"));
-    let report = inspect(pdb);
-    assert_eq!(
-        report.unsupported_residues.len(),
-        1,
-        "{:?}",
-        report.warnings
-    );
-    assert!(report.warnings.iter().any(|warning| matches!(
-        warning,
-        BuildWarning::UnsupportedResidue(message)
-            if message.contains("beta-L-altrofuranose") && message.contains("GLYCAM-Web")
-    )));
-    assert!(
-        SystemBuilder::new(BuildOptions {
-            add_water: false,
-            add_ions: false,
-            ..BuildOptions::default()
-        })
-        .unwrap()
-        .prepare_pdb_str(pdb)
-        .is_err()
-    );
-}
-
 /// The prepared structure of `pdb`: its PDB text and the chiral volume at
 /// C5 of the galactofuranose (C4, C6, O5 around C5).
 fn prepared_galf_any(pdb: &str, suffix: &str) -> (String, f64) {
@@ -167,6 +134,53 @@ fn crabwurcs_galf(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[test]
+fn glycam_web_galactofuranose_is_rebuilt_as_beta_d_galactofuranose() {
+    // DGalfb1-2LArafb1-2LArafb1-OH assembled from GLYCAM-Web's library
+    // coordinates (ROH 2aU 2aU 0LU): its "beta-D-Galf" is beta-L-altrofuranose
+    // (C1 and C5 inverted; crabWURCS reads LAltf). GlySys rebuilds it from the
+    // corrected template with its glycosidic bond kept: the prepared structure
+    // is the beta-D-Galf GLYCAM-Web was asked for.
+    let pdb = include_str!("fixtures/carbohydrates/glycam_web_galf_araf_araf.pdb");
+    assert!(crabwurcs_galf(pdb).starts_with("LAltfb1-2"));
+    let report = inspect(pdb);
+    assert_integral(&report, 0.0);
+    assert!(
+        report.warnings.iter().any(|warning| matches!(
+            warning,
+            BuildWarning::GlycanStereochemistry(message)
+                if message.contains("0LU") && message.contains("rebuilt")
+        )),
+        "{:?}",
+        report.warnings
+    );
+    let (text, _) = prepared_galf_any(pdb, "LU");
+    let names = crabwurcs_galf(&text);
+    assert!(
+        names.starts_with("DGalfb1-2LArafb1-2LArafb1"),
+        "crabWURCS reads {names}"
+    );
+    // the glycosidic bond to the O2 of the arabinofuranose it is on is still a bond
+    let positions = |residue: &str, atom: &str| {
+        text.lines()
+            .filter(|line| {
+                line.get(17..20) == Some(residue) && line.get(12..16).map(str::trim) == Some(atom)
+            })
+            .map(|line| {
+                [30..38, 38..46, 46..54].map(|range| line[range].trim().parse::<f64>().unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+    let c1 = positions("0LU", "C1")[0];
+    let d = positions("2aU", "O2")
+        .iter()
+        .map(|o2| {
+            ((c1[0] - o2[0]).powi(2) + (c1[1] - o2[1]).powi(2) + (c1[2] - o2[2]).powi(2)).sqrt()
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!((1.3..1.6).contains(&d), "C1-O2 {d}");
 }
 
 #[test]

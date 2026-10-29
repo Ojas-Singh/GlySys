@@ -203,6 +203,8 @@ mod tests {
             water_residue_count: residue_count,
             sodium_count: 0,
             chloride_count: 0,
+            calcium_count: 0,
+            magnesium_count: 0,
         };
 
         let pdb = write_pdb_system(&system);

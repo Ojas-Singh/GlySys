@@ -5,6 +5,7 @@
 
 mod amber_data;
 mod carbohydrate;
+mod ecc;
 mod error;
 mod fix;
 mod forcefield;

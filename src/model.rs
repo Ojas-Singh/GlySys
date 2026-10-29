@@ -81,6 +81,10 @@ pub(crate) struct System {
     pub water_residue_count: usize,
     pub sodium_count: usize,
     pub chloride_count: usize,
+    #[serde(default)]
+    pub calcium_count: usize,
+    #[serde(default)]
+    pub magnesium_count: usize,
 }
 
 impl System {
@@ -233,6 +237,8 @@ impl ParameterizedSystem {
             water_residue_count: 0,
             sodium_count: 0,
             chloride_count: 0,
+            calcium_count: 0,
+            magnesium_count: 0,
         };
         let mut report = self.report.clone();
         report.options.add_water = false;

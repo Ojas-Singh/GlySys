@@ -58,6 +58,17 @@ counter-ions. The ions replace waters chosen in a pseudo-random order set by
 `--seed`, at least 5 Å from the solute and from each other, so they start
 spread through the solvent.
 
+`--cacl2` and `--mgcl2` add CaCl2 and MgCl2 (mol/L) on top of the NaCl: each
+Ca2+ or Mg2+ (Li/Merz 12-6 compromise set for TIP3P) comes with two Cl-, the
+number counted from the water like the NaCl pairs, so the divalent salt adds
+no charge and the NaCl still neutralizes the solute. `--ecc` applies the
+electronic continuum correction with the conventions of prosECCo75 (Nencini et
+al., J. Chem. Theory Comput. 2024): the ions become prosECCo75's scaled-charge
+models (Na_s, K_s, Cl_s, Ca_s, Mg_ss), and every charged carbohydrate group
+(carboxylate, sulfate, phosphate, ammonium) carries 0.75 of its charge, its
+terminal atoms scaled and its central atom taking the rest. Water stays TIP3P
+(prosECCo75 uses the CHARMM TIP3P), and protein residues are not scaled.
+
 `glysys-md` is the native session adapter; it does not require WASM or a
 browser. `--threads` is per process, so a Slurm replica should receive only
 the CPUs in its allocation. The default GPU policy is adaptive and queries

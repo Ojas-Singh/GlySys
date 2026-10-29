@@ -146,7 +146,15 @@ pub(crate) fn solvate_and_ionize(
     } else {
         (0, 0)
     };
-    let requested = sodium + chloride;
+    let (calcium, magnesium) = if options.add_ions {
+        (
+            divalent_count(waters.len(), options.cacl2_molar),
+            divalent_count(waters.len(), options.mgcl2_molar),
+        )
+    } else {
+        (0, 0)
+    };
+    let requested = sodium + chloride + 3 * (calcium + magnesium);
     if requested > waters.len() {
         return Err(BuildError::InsufficientSolvent {
             requested,
@@ -156,7 +164,7 @@ pub(crate) fn solvate_and_ionize(
     let selected = place_ions(
         &waters,
         box_lengths,
-        &ion_schedule(sodium, chloride, solute_charge),
+        &ion_schedule(sodium, chloride, solute_charge, calcium, magnesium),
     );
     let replaced = selected
         .iter()
@@ -250,22 +258,60 @@ pub(crate) fn solvate_and_ionize(
         system.component_count += 1;
         system.water_residue_count += 1;
     }
-    for (water_index, is_sodium) in selected {
+    for (water_index, ion) in selected {
         add_ion(
             system,
             templates,
             parameters,
-            if is_sodium { "Na+" } else { "Cl-" },
-            if is_sodium { "NA" } else { "CL" },
+            ion.template(),
+            ion.residue(),
             waters[water_index].positions[0],
         )?;
-        if is_sodium {
-            system.sodium_count += 1;
-        } else {
-            system.chloride_count += 1;
+        match ion {
+            Ion::Sodium => system.sodium_count += 1,
+            Ion::Chloride => system.chloride_count += 1,
+            Ion::Calcium => system.calcium_count += 1,
+            Ion::Magnesium => system.magnesium_count += 1,
         }
     }
     Ok(())
+}
+
+/// An ion of the bath: Na+ and Cl- (Joung-Cheatham), Ca2+ and Mg2+ (Li/Merz
+/// 12-6 compromise set, as for structural metal ions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ion {
+    Sodium,
+    Chloride,
+    Calcium,
+    Magnesium,
+}
+
+impl Ion {
+    fn template(self) -> &'static str {
+        match self {
+            Ion::Sodium => "Na+",
+            Ion::Chloride => "Cl-",
+            Ion::Calcium => "CA",
+            Ion::Magnesium => "MG",
+        }
+    }
+
+    fn residue(self) -> &'static str {
+        match self {
+            Ion::Sodium => "NA",
+            Ion::Chloride => "CL",
+            Ion::Calcium => "CA",
+            Ion::Magnesium => "MG",
+        }
+    }
+}
+
+/// Divalent cations of a CaCl2 or MgCl2 concentration `molar` among `waters`
+/// water molecules (each comes with two chloride ions, so the salt adds no
+/// charge; the solute is neutralized by the NaCl of [`ion_counts`]).
+fn divalent_count(waters: usize, molar: f64) -> usize {
+    (molar * waters as f64 / WATER_MOLAR).round().max(0.0) as usize
 }
 
 fn add_ion(
@@ -349,7 +395,7 @@ fn ion_counts(waters: usize, solute_charge: i64, salt_molar: f64) -> (usize, usi
 /// (sodium) or highest (chloride), without the potential of the ions already
 /// placed. Around a charged solute that put every counter-ion on its surface
 /// and every co-ion in one cluster in the far corner of the box.
-fn place_ions(waters: &[Water], box_lengths: [f64; 3], schedule: &[bool]) -> Vec<(usize, bool)> {
+fn place_ions(waters: &[Water], box_lengths: [f64; 3], schedule: &[Ion]) -> Vec<(usize, Ion)> {
     let separation2 = ION_SEPARATION_ANGSTROM.powi(2);
     let apart = |left: usize, right: usize| {
         let (a, b) = (waters[left].positions[0], waters[right].positions[0]);
@@ -363,8 +409,8 @@ fn place_ions(waters: &[Water], box_lengths: [f64; 3], schedule: &[bool]) -> Vec
     };
     let mut available = (0..waters.len()).collect::<Vec<_>>();
     available.sort_by_key(|&water| (waters[water].tie, water));
-    let mut selected = Vec::<(usize, bool)>::with_capacity(schedule.len());
-    for &is_sodium in schedule {
+    let mut selected = Vec::<(usize, Ion)>::with_capacity(schedule.len());
+    for &ion in schedule {
         let clear_of_ions =
             |candidate: usize| selected.iter().all(|&(placed, _)| apart(candidate, placed));
         let position = available
@@ -378,23 +424,36 @@ fn place_ions(waters: &[Water], box_lengths: [f64; 3], schedule: &[bool]) -> Vec
                     .position(|&candidate| clear_of_ions(candidate))
             })
             .unwrap_or(0);
-        selected.push((available.remove(position), is_sodium));
+        selected.push((available.remove(position), ion));
     }
     selected
 }
 
-fn ion_schedule(sodium: usize, chloride: usize, solute_charge: i64) -> Vec<bool> {
-    let mut result = Vec::with_capacity(sodium + chloride);
+/// The order ions are placed in: the counter-ions that neutralize the solute,
+/// then the NaCl pairs, then each Ca2+ and Mg2+ with its two Cl-.
+fn ion_schedule(
+    sodium: usize,
+    chloride: usize,
+    solute_charge: i64,
+    calcium: usize,
+    magnesium: usize,
+) -> Vec<Ion> {
+    let mut result = Vec::with_capacity(sodium + chloride + 3 * (calcium + magnesium));
     let neutral_sodium = usize::try_from((-solute_charge).max(0)).unwrap_or(0);
     let neutral_chloride = usize::try_from(solute_charge.max(0)).unwrap_or(0);
-    result.extend(std::iter::repeat_n(true, neutral_sodium));
-    result.extend(std::iter::repeat_n(false, neutral_chloride));
+    result.extend(std::iter::repeat_n(Ion::Sodium, neutral_sodium));
+    result.extend(std::iter::repeat_n(Ion::Chloride, neutral_chloride));
     let pairs = sodium
         .saturating_sub(neutral_sodium)
         .min(chloride.saturating_sub(neutral_chloride));
     for _ in 0..pairs {
-        result.push(true);
-        result.push(false);
+        result.push(Ion::Sodium);
+        result.push(Ion::Chloride);
+    }
+    for (cation, count) in [(Ion::Calcium, calcium), (Ion::Magnesium, magnesium)] {
+        for _ in 0..count {
+            result.extend([cation, Ion::Chloride, Ion::Chloride]);
+        }
     }
     result
 }
@@ -412,11 +471,29 @@ mod tests {
 
     #[test]
     fn ion_schedule_starts_with_neutralization() {
+        use Ion::{Chloride as Cl, Sodium as Na};
+        assert_eq!(ion_schedule(4, 2, -2, 0, 0), vec![Na, Na, Na, Cl, Na, Cl]);
+        assert_eq!(ion_schedule(1, 3, 2, 0, 0), vec![Cl, Cl, Na, Cl]);
+    }
+
+    #[test]
+    fn divalent_salts_come_with_two_chlorides_each() {
+        use Ion::{Calcium as Ca, Chloride as Cl, Magnesium as Mg, Sodium as Na};
+        let schedule = ion_schedule(2, 1, -1, 2, 1);
         assert_eq!(
-            ion_schedule(4, 2, -2),
-            vec![true, true, true, false, true, false]
+            schedule,
+            vec![Na, Na, Cl, Ca, Cl, Cl, Ca, Cl, Cl, Mg, Cl, Cl]
         );
-        assert_eq!(ion_schedule(1, 3, 2), vec![false, false, true, false]);
+        let charge = |ion: &Ion| match ion {
+            Na => 1,
+            Cl => -1,
+            Ca | Mg => 2,
+        };
+        // the ions neutralize a solute of charge -1
+        assert_eq!(schedule.iter().map(charge).sum::<i64>(), 1);
+        // 0.01 M CaCl2 in 5,551 waters (0.1 L of them would be 5,551 mol at 55.5 M): one Ca2+
+        assert_eq!(divalent_count(5551, 0.01), 1);
+        assert_eq!(divalent_count(5551, 0.0), 0);
     }
 
     /// Waters on a 3 Å lattice in a 30 Å box, around a solute atom at its centre.
@@ -453,10 +530,13 @@ mod tests {
     #[test]
     fn ions_are_spread_through_the_solvent() {
         let (waters, box_lengths) = lattice();
-        let schedule = ion_schedule(14, 10, -4);
+        let schedule = ion_schedule(14, 10, -4, 0, 0);
         let placed = place_ions(&waters, box_lengths, &schedule);
         assert_eq!(placed.len(), 24);
-        assert_eq!(placed.iter().filter(|(_, sodium)| *sodium).count(), 14);
+        assert_eq!(
+            placed.iter().filter(|(_, ion)| *ion == Ion::Sodium).count(),
+            14
+        );
         // the same waters for the same seed
         assert_eq!(placed, place_ions(&waters, box_lengths, &schedule));
         let position = |index: usize| waters[placed[index].0].positions[0];
@@ -473,7 +553,7 @@ mod tests {
         }
         // not one corner of the box for the chloride and the solute's surface for the sodium
         assert!(octants.len() >= 6, "ions in {} octants", octants.len());
-        for sodium in [true, false] {
+        for sodium in [Ion::Sodium, Ion::Chloride] {
             let nearest_solute = (0..placed.len())
                 .filter(|&i| placed[i].1 == sodium)
                 .map(|i| waters[placed[i].0].solute_distance2.sqrt())
@@ -482,7 +562,7 @@ mod tests {
                 .filter(|&i| placed[i].1 == sodium)
                 .map(|i| waters[placed[i].0].solute_distance2.sqrt())
                 .fold(0.0, f64::max);
-            assert!(farthest_solute - nearest_solute > 5.0, "sodium {sodium}");
+            assert!(farthest_solute - nearest_solute > 5.0, "{sodium:?}");
         }
     }
 
@@ -495,7 +575,7 @@ mod tests {
             oxygen.x < 6.0 && oxygen.y < 6.0 && oxygen.z < 6.0
         });
         assert_eq!(waters.len(), 8);
-        let placed = place_ions(&waters, box_lengths, &ion_schedule(3, 3, 0));
+        let placed = place_ions(&waters, box_lengths, &ion_schedule(3, 3, 0, 0, 0));
         let distinct = placed
             .iter()
             .map(|(water, _)| *water)

@@ -29,11 +29,26 @@ Output changes:
   from the residue named; crabWURCS reads `LAltf`). After the correction
   crabWURCS reads `0LU` as `DGalfb` and `0LD` as `DGalfa`, and a deposited
   D-galactofuranose gets the anomer its coordinates have. An input built by
-  GLYCAM-Web (beta/alpha-L-altrofuranose under a Galf name) is refused with
-  the reason, also when its name is a GLYCAM template: preparing it by name
-  would simulate the wrong sugar. It cannot be inverted in place (C1 needs the
-  residue rebuilt about its glycosidic bond); rebuild it with corrected
-  templates.
+  GLYCAM-Web (beta/alpha-L-altrofuranose under a GLYCAM Galf name, which is
+  every galactofuranose GLYCAM-Web builds) is rebuilt from the corrected
+  template: superposed on its anomeric carbon and the atom it is bonded to (so
+  the glycosidic bond is kept) and on its ring, with the residues bonded to it
+  moved rigidly with the atom they hang on; a warning says so.
+- Divalent salts: `cacl2_molar` / `--cacl2` and `mgcl2_molar` / `--mgcl2` add
+  Ca2+ and Mg2+ (Li/Merz 12-6, TIP3P) with two Cl- each, counted from the
+  water like the NaCl, on top of the NaCl that neutralizes the solute. The
+  report gives `calcium_ions` and `magnesium_ions`.
+- Electronic continuum correction: `ecc` / `--ecc` with the conventions of
+  prosECCo75 (Nencini et al. 2024; ions v20221028): Na+, K+, Cl-, Ca2+ and Mg2+
+  become the scaled-charge models Na_s, K_s, Cl_s, Ca_s and Mg_ss (charges 0.75
+  and 1.5 e, their own Lennard-Jones parameters), and every charged
+  carbohydrate block carries 0.75 of its charge: the terminal oxygens of a
+  carboxylate, sulfate or phosphate (or the hydrogens of an ammonium) are
+  scaled by 0.75 and the central atom takes the rest, removing a quarter of
+  the residue's integer charge (GLYCAM's sulfation correction still cancels in
+  the sugar-SO3 pair; heparin 1HPN, -24, goes to -18 exactly). Water stays
+  TIP3P; protein residues are not scaled (a `charge_scaling` warning lists
+  them).
 
 ### Changes
 

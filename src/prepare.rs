@@ -164,6 +164,8 @@ impl SystemBuilder {
             waters: 0,
             sodium_ions: 0,
             chloride_ions: 0,
+            calcium_ions: 0,
+            magnesium_ions: 0,
             solute_charge,
             total_charge: solute_charge,
             box_angstrom: [0.0; 3],
@@ -276,6 +278,19 @@ impl SystemBuilder {
                 &self.options,
             )?;
         }
+        if self.options.ecc {
+            let scaled = crate::ecc::apply(
+                &mut system,
+                |name| PROTEIN_RESIDUES.contains(&name),
+                &mut warnings,
+            );
+            warnings.push(BuildWarning::ChargeScaling(format!(
+                "electronic continuum correction (prosECCo75 conventions, ions v20221028): {} ion(s) with scaled-charge models, {} charged carbohydrate block(s) at {} of their charge; water is TIP3P",
+                scaled.ions,
+                scaled.groups,
+                crate::ecc::SCALE
+            )));
+        }
         let report = BuildReport {
             input_sha256,
             force_field_versions: crate::report::force_field_versions(),
@@ -294,6 +309,8 @@ impl SystemBuilder {
             waters: system.water_residue_count,
             sodium_ions: system.sodium_count,
             chloride_ions: system.chloride_count,
+            calcium_ions: system.calcium_count,
+            magnesium_ions: system.magnesium_count,
             solute_charge,
             total_charge: system.charge(),
             box_angstrom: system.box_angstrom,
@@ -788,6 +805,8 @@ impl SystemBuilder {
             water_residue_count: 0,
             sodium_count: 0,
             chloride_count: 0,
+            calcium_count: 0,
+            magnesium_count: 0,
         })
     }
 }
@@ -1095,7 +1114,7 @@ fn resolve_carbohydrates(
             }
         }
     }
-    let locate = |key: (&str, i32, &str)| {
+    let locate = |residues: &[PdbResidue], key: (&str, i32, &str)| {
         residues
             .iter()
             .enumerate()
@@ -1156,13 +1175,16 @@ fn resolve_carbohydrates(
             continue;
         }
         if let (Some(a), Some(b)) = (
-            locate((&first.0, first.1, &first.2)),
-            locate((&second.0, second.1, &second.2)),
+            locate(residues, (&first.0, first.1, &first.2)),
+            locate(residues, (&second.0, second.1, &second.2)),
         ) && (candidate(&residues[a.0]) || candidate(&residues[b.0]))
         {
             cross.insert(if a < b { (a, b) } else { (b, a) });
         }
     }
+    // GLYCAM-Web builds galactofuranose as L-altrofuranose: rebuild those
+    // residues from the corrected templates before they are read.
+    crate::carbohydrate::rebuild_glycam_web_galactofuranoses(residues, &cross, library, warnings);
     let mut outside: HashMap<usize, Vec<Vec<Vec3>>> = HashMap::new();
     for &((ra, aa), (rb, ab)) in &cross {
         for (own, own_atom, other, other_atom) in [(ra, aa, rb, ab), (rb, ab, ra, aa)] {
@@ -1390,7 +1412,7 @@ fn resolve_carbohydrates(
     }
     for (first, second) in declared.iter_mut() {
         for end in [first, second] {
-            if let Some((residue_index, atom_index)) = locate((&end.0, end.1, &end.2))
+            if let Some((residue_index, atom_index)) = locate(residues, (&end.0, end.1, &end.2))
                 && let Some((key, atom)) = located.get(&(residue_index, atom_index))
             {
                 end.0 = key.chain.clone();

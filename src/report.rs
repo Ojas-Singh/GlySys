@@ -50,6 +50,10 @@ pub struct BuildReport {
     pub waters: usize,
     pub sodium_ions: usize,
     pub chloride_ions: usize,
+    #[serde(default)]
+    pub calcium_ions: usize,
+    #[serde(default)]
+    pub magnesium_ions: usize,
     pub solute_charge: f64,
     pub total_charge: f64,
     pub box_angstrom: [f64; 3],
