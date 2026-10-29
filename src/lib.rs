@@ -29,7 +29,7 @@ pub use fix::{
     ReplacedResidue, ResidueAtoms, ResidueCounts, ResidueKind, StructureFixer,
 };
 pub use model::{Angle, Atom, Bond, Dihedral, ParameterizedSystem, PreparedSystem, Residue, Vec3};
-pub use options::{BuildOptions, ForceFieldProfile, ProtonationOverrides};
+pub use options::{BuildOptions, Counterion, ForceFieldProfile, ProtonationOverrides};
 pub use prepare::SystemBuilder;
 pub use report::{BuildReport, GlycanReport, ResidueRef};
 pub use smirnoff::{

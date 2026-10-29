@@ -3,6 +3,20 @@ use std::path::Path;
 
 use crate::{BuildError, Result};
 
+/// The cation that neutralizes a negatively charged solute.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Counterion {
+    /// Na+, with the NaCl.
+    #[default]
+    Sodium,
+    /// One Ca2+ per two charges (an odd charge leaves one Na+), e.g. a calcium
+    /// salt of heparin.
+    Calcium,
+    /// One Mg2+ per two charges, as `Calcium`.
+    Magnesium,
+}
+
 /// A versioned, mutually compatible force-field combination.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -35,6 +49,10 @@ pub struct BuildOptions {
     pub cacl2_molar: f64,
     /// MgCl2 concentration in mol/L, as `cacl2_molar`.
     pub mgcl2_molar: f64,
+    /// The cation that neutralizes a negatively charged solute. With Ca2+ or
+    /// Mg2+ the NaCl and the divalent salts are counted as for the neutralized
+    /// solute; a positive solute is neutralized by Cl- whatever this is.
+    pub counterion: Counterion,
     /// Electronic continuum correction (prosECCo75 conventions): the bath ions
     /// get the prosECCo75 scaled-charge ions (Na_s, Cl_s, Ca_s, Mg_ss) and every
     /// charged carbohydrate group carries 0.75 of its charge. Proteins are not
@@ -62,6 +80,7 @@ impl Default for BuildOptions {
             salt_molar: 0.15,
             cacl2_molar: 0.0,
             mgcl2_molar: 0.0,
+            counterion: Counterion::Sodium,
             ecc: false,
             add_water: true,
             add_ions: true,

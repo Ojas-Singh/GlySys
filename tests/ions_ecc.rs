@@ -115,3 +115,59 @@ fn ecc_scales_ions_and_charged_carbohydrate_groups_to_three_quarters() {
         assert!((s - 0.75 * u).abs() < 1.0e-9, "{s} vs {u}");
     }
 }
+
+#[test]
+fn calcium_counterions_neutralize_the_glycan_in_place_of_sodium() {
+    // charge -2: one Ca2+, and without NaCl or CaCl2 nothing else
+    let alone = prepare(BuildOptions {
+        counterion: glysys::Counterion::Calcium,
+        salt_molar: 0.0,
+        ..BuildOptions::default()
+    })
+    .report()
+    .clone();
+    assert_eq!(
+        (
+            alone.calcium_ions,
+            alone.sodium_ions,
+            alone.chloride_ions,
+            alone.magnesium_ions
+        ),
+        (1, 0, 0, 0),
+        "{alone:?}"
+    );
+    assert!(alone.total_charge.abs() < 1.0e-6);
+    // with NaCl and CaCl2 on top, the salt is counted as for a neutral solute
+    let sodium = prepare(BuildOptions {
+        cacl2_molar: 0.1,
+        ..BuildOptions::default()
+    })
+    .report()
+    .clone();
+    let calcium = prepare(BuildOptions {
+        cacl2_molar: 0.1,
+        counterion: glysys::Counterion::Calcium,
+        ..BuildOptions::default()
+    })
+    .report()
+    .clone();
+    assert_eq!(calcium.calcium_ions, sodium.calcium_ions + 1, "{calcium:?}");
+    assert_eq!(
+        calcium.sodium_ions,
+        calcium.chloride_ions - 2 * sodium.calcium_ions
+    );
+    assert!(
+        calcium.sodium_ions < sodium.sodium_ions,
+        "{calcium:?} vs {sodium:?}"
+    );
+    assert!(calcium.total_charge.abs() < 1.0e-6);
+    // ECC: Ca_s at +1.5 against the glycan's -1.5
+    let ecc = prepare(BuildOptions {
+        counterion: glysys::Counterion::Magnesium,
+        salt_molar: 0.0,
+        ecc: true,
+        ..BuildOptions::default()
+    });
+    assert_eq!(ecc.report().magnesium_ions, 1);
+    assert!(ecc.report().total_charge.abs() < 1.0e-6);
+}
