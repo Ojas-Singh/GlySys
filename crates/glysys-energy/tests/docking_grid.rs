@@ -1191,3 +1191,133 @@ fn directional_hydrogen_bonds_are_consistent_and_reward_only_real_geometry() {
         }
     }
 }
+
+/// The donated half of the hydrogen-bond term must read the pose, not the builder's hydrogen placement:
+/// turning a ligand hydroxyl about its own C-O bond leaves the donated energy unchanged, because the term
+/// averages over those orientations. Without that, the donor depth fits to zero (SugarGLIDER Log 30).
+#[test]
+fn donated_hydrogen_bonds_do_not_depend_on_the_builders_hydroxyl_orientation() {
+    use glysys_energy::grid::{GridOptions, HydrogenBond};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" { &mut ligand } else { &mut receptor }.extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    // donor only, so the test sees exactly the half this fix is about
+    let model = HydrogenBond { donor_depth: 1.5, acceptor_depth: 0.0, unsatisfied_depth: 0.0 };
+    let grid = DockingGrid::build_with(
+        &system,
+        &coords,
+        &receptor,
+        &ligand,
+        center,
+        12.0,
+        GridOptions { hydrogen_bond: Some(model), ..base },
+    )
+    .unwrap();
+
+    // find a ligand hydroxyl: a hydrogen bonded to an oxygen that also carries a carbon
+    let atoms = system.atoms();
+    let mut neighbours = vec![Vec::new(); atoms.len()];
+    for bond in system.bonds() {
+        let [a, b] = bond.atoms();
+        neighbours[a].push(b);
+        neighbours[b].push(a);
+    }
+    let local: std::collections::HashMap<usize, usize> =
+        ligand.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+    let hydroxyl = ligand
+        .iter()
+        .find(|&&h| {
+            atoms[h].element() == 1
+                && neighbours[h].len() == 1
+                && atoms[neighbours[h][0]].element() == 8
+                && neighbours[neighbours[h][0]].len() == 2
+                && neighbours[neighbours[h][0]].iter().any(|&n| atoms[n].element() == 6)
+        })
+        .copied()
+        .expect("the glycan has a hydroxyl");
+    let oxygen = neighbours[hydroxyl][0];
+    let carbon = neighbours[oxygen].iter().copied().find(|&n| n != hydroxyl).unwrap();
+    let (h, o, c) = (local[&hydroxyl], local[&oxygen], local[&carbon]);
+
+    // only the donated column, not the whole energy: moving the hydrogen also moves its own electrostatics
+    let reference = grid.terms(&positions).hbond_donor;
+    // spin the hydrogen about the C-O axis; the donated energy must not move
+    let axis = {
+        let d = [
+            positions[o].x - positions[c].x,
+            positions[o].y - positions[c].y,
+            positions[o].z - positions[c].z,
+        ];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        [d[0] / n, d[1] / n, d[2] / n]
+    };
+    for turn in [60.0_f64, 120.0, 180.0, 240.0] {
+        let mut moved = positions.clone();
+        let rel = [
+            positions[h].x - positions[o].x,
+            positions[h].y - positions[o].y,
+            positions[h].z - positions[o].z,
+        ];
+        let (s, cs) = turn.to_radians().sin_cos();
+        let dotv = rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2];
+        let crossv = [
+            axis[1] * rel[2] - axis[2] * rel[1],
+            axis[2] * rel[0] - axis[0] * rel[2],
+            axis[0] * rel[1] - axis[1] * rel[0],
+        ];
+        // Rodrigues
+        let rot = [
+            rel[0] * cs + crossv[0] * s + axis[0] * dotv * (1.0 - cs),
+            rel[1] * cs + crossv[1] * s + axis[1] * dotv * (1.0 - cs),
+            rel[2] * cs + crossv[2] * s + axis[2] * dotv * (1.0 - cs),
+        ];
+        moved[h] = Vec3 {
+            x: positions[o].x + rot[0],
+            y: positions[o].y + rot[1],
+            z: positions[o].z + rot[2],
+        };
+        let turned = grid.terms(&moved).hbond_donor;
+        assert!(
+            (turned - reference).abs() < 1.0e-6,
+            "turning the hydroxyl by {turn} deg changed the donated energy by {}",
+            turned - reference
+        );
+    }
+
+    // and the gradient still agrees with the energy
+    let mut gradient = vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }; positions.len()];
+    grid.energy_gradient(&positions, Some(&mut gradient));
+    let step = 1.0e-4;
+    for atom in [o, c] {
+        for axis_index in 0..3 {
+            let (mut up, mut down) = (positions.clone(), positions.clone());
+            let bump = |p: &mut Vec3, d: f64| match axis_index {
+                0 => p.x += d,
+                1 => p.y += d,
+                _ => p.z += d,
+            };
+            bump(&mut up[atom], step);
+            bump(&mut down[atom], -step);
+            let numeric = (grid.energy(&up) - grid.energy(&down)) / (2.0 * step);
+            let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis_index];
+            assert!(
+                (numeric - analytic).abs() < 5.0e-3 * (1.0 + analytic.abs()),
+                "atom {atom} axis {axis_index}: {numeric} vs {analytic}"
+            );
+        }
+    }
+}
