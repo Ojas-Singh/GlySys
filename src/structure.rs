@@ -200,17 +200,12 @@ impl Structure {
                     other.glycan_residue.chain == site.glycan_residue.chain
                         && other.glycan_residue != site.glycan_residue
                 });
+                // The fallback follows covalent contacts from the root: a chain
+                // often holds other glycans whose attachments are not declared
+                // either (a model written without LINK records), and those must
+                // not join this tree.
                 if residue_ids.len() <= 1 && !has_other_attachment_root {
-                    residue_ids = parsed
-                        .residues
-                        .iter()
-                        .filter(|residue| {
-                            residue.reference.chain == site.glycan_residue.chain
-                                && !crate::pdb::PROTEIN_RESIDUES
-                                    .contains(&residue.reference.name.as_str())
-                        })
-                        .map(|residue| residue_id(&residue.reference))
-                        .collect();
+                    residue_ids = bonded_chain_residues(&parsed, &site.glycan_residue);
                 }
                 GlycanTree {
                     chain: site.glycan_residue.chain.clone(),
@@ -876,6 +871,54 @@ fn linked_glycan_residues(parsed: &ParsedPdb, root: &ResidueId) -> BTreeSet<Resi
     visited
 }
 
+/// Non-protein residues of the root's chain reached from the root through
+/// heavy-atom contacts at bonding distance (glycosidic bonds are ~1.4 Å), for
+/// files that declare no connectivity inside the glycan.
+fn bonded_chain_residues(parsed: &ParsedPdb, root: &ResidueId) -> BTreeSet<ResidueId> {
+    const BOND2: f64 = 2.0 * 2.0;
+    let heavy = |atom: &&PdbAtom| !atom.element.eq_ignore_ascii_case("H");
+    let chain: Vec<&PdbResidue> = parsed
+        .residues
+        .iter()
+        .filter(|residue| {
+            residue.reference.chain == root.chain
+                && !crate::pdb::PROTEIN_RESIDUES.contains(&residue.reference.name.as_str())
+        })
+        .collect();
+    let bonded = |a: &PdbResidue, b: &PdbResidue| {
+        a.atoms.iter().filter(heavy).any(|x| {
+            b.atoms.iter().filter(heavy).any(|y| {
+                let (dx, dy, dz) = (
+                    x.position.x - y.position.x,
+                    x.position.y - y.position.y,
+                    x.position.z - y.position.z,
+                );
+                dx * dx + dy * dy + dz * dz <= BOND2
+            })
+        })
+    };
+    let mut visited = BTreeSet::new();
+    let mut pending: Vec<&PdbResidue> = chain
+        .iter()
+        .copied()
+        .filter(|residue| residue_id(&residue.reference) == *root)
+        .collect();
+    if pending.is_empty() {
+        visited.insert(root.clone());
+    }
+    while let Some(current) = pending.pop() {
+        if !visited.insert(residue_id(&current.reference)) {
+            continue;
+        }
+        for other in &chain {
+            if !visited.contains(&residue_id(&other.reference)) && bonded(current, other) {
+                pending.push(other);
+            }
+        }
+    }
+    visited
+}
+
 /// Infer protein--glycan attachment records from atom-level CONECT entries.
 ///
 /// Only connections whose protein-side residue is identified by the
@@ -1226,6 +1269,29 @@ END
                 insertion_code: None,
             }
         );
+    }
+
+    #[test]
+    fn undeclared_glycans_of_the_chain_stay_out_of_a_linked_tree() {
+        // one LINKed NAG (on Asn 1), a second NAG bonded to it (no CONECT), and a NAG on
+        // another Asn of the chain with no LINK at all: only the first two form the tree
+        let input = "\
+LINK         ND2 ASN A   1                 C1  NAG A 901     1555   1555  1.44
+ATOM      1  N   ASN A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  ND2 ASN A   1       1.000   0.000   0.000  1.00  0.00           N
+ATOM      3  N   ASN A  50      30.000   0.000   0.000  1.00  0.00           N
+ATOM      4  ND2 ASN A  50      31.000   0.000   0.000  1.00  0.00           N
+HETATM    5  C1  NAG A 901       2.440   0.000   0.000  1.00  0.00           C
+HETATM    6  O4  NAG A 901       4.000   0.000   0.000  1.00  0.00           O
+HETATM    7  C1  NAG A 902       5.430   0.000   0.000  1.00  0.00           C
+HETATM    8  C1  NAG A 903      32.440   0.000   0.000  1.00  0.00           C
+END
+";
+        let structure = read_pdb_str(input, &BuildOptions::default()).expect("parse fixture");
+        let trees = &structure.metadata().glycan_trees;
+        assert_eq!(trees.len(), 1);
+        let numbers: Vec<i32> = trees[0].residue_ids.iter().map(|r| r.number).collect();
+        assert_eq!(numbers, vec![901, 902]);
     }
 
     #[test]
