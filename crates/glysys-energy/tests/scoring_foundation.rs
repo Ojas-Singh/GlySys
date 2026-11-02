@@ -162,3 +162,63 @@ fn exported_generated_hydrogens_retain_evaluated_coordinates() {
         assert_eq!(structure.atom_position(source).unwrap(), atom.position());
     }
 }
+
+/// The fused single-pass energy-and-gradient must agree with the two passes it replaces, which the
+/// docking search relies on: it is adopted only because it changes nothing.
+#[test]
+fn fused_energy_and_gradient_matches_the_two_pass_path() {
+    use glysys::SystemBuilder;
+    use glysys_energy::EnergyEvaluator;
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..Default::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(include_str!("../../../tests/fixtures/glycan.pdb"))
+    .unwrap();
+    for (dielectric, charged) in [(1.0, false), (4.0, true)] {
+        let subject = if charged { system.clone() } else { system.without_charges() };
+        let evaluator = EnergyEvaluator::new(
+            &subject,
+            EnergyOptions {
+                cutoff: None,
+                dielectric,
+                obc2: None,
+                ..EnergyOptions::default()
+            },
+        )
+        .unwrap();
+        let base = subject.coordinates();
+        // the deposited geometry and a displaced one, so no term sits at a stationary point
+        for shift in [0.0_f64, 0.21] {
+            let coords: Vec<Vec3> = base
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Vec3 {
+                    x: p.x + shift * ((i % 3) as f64 - 1.0),
+                    y: p.y - shift * ((i % 5) as f64 - 2.0) * 0.5,
+                    z: p.z + shift * ((i % 7) as f64 - 3.0) * 0.25,
+                })
+                .collect();
+            let expected_energy = evaluator.components(&coords).unwrap().total();
+            let expected_gradient = evaluator.gradient_only(&coords).unwrap();
+            let mut fused = vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }; coords.len()];
+            let energy = evaluator.total_and_gradient_into(&coords, &mut fused).unwrap();
+            assert_eq!(
+                energy.to_bits(),
+                expected_energy.to_bits(),
+                "dielectric {dielectric} charged {charged} shift {shift}: energy {energy} vs {expected_energy}"
+            );
+            for (i, (a, b)) in fused.iter().zip(&expected_gradient).enumerate() {
+                for (axis, (x, y)) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)].iter().enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "atom {i} axis {axis} (dielectric {dielectric}, shift {shift}): {x} vs {y}"
+                    );
+                }
+            }
+        }
+    }
+}

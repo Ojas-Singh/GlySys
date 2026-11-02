@@ -346,6 +346,9 @@ pub struct EnergyEvaluator<'a> {
     selection: AtomSelection,
     one_four: HashMap<(usize, usize), (f64, f64)>,
     active_terms_only: bool,
+    /// The non-bonded pair list of the cutoff-free path, which depends only on the topology.
+    /// Rebuilding it per call cost a docking search more than the interactions themselves.
+    pairs: std::sync::OnceLock<Vec<(u32, u32, f64, f64)>>,
 }
 
 struct InteractionKernel<'a> {
@@ -418,6 +421,7 @@ impl<'a> EnergyEvaluator<'a> {
             selection: AtomSelection::all(system.atom_count()),
             one_four,
             active_terms_only: false,
+            pairs: std::sync::OnceLock::new(),
         })
     }
 
@@ -430,6 +434,7 @@ impl<'a> EnergyEvaluator<'a> {
             selection: self.selection,
             one_four: self.one_four,
             active_terms_only: self.active_terms_only,
+            pairs: std::sync::OnceLock::new(),
         }
     }
 
@@ -488,36 +493,51 @@ impl<'a> EnergyEvaluator<'a> {
             return;
         }
         let n = coordinates.len();
-        let mut rows = vec![Vec::new(); n];
-        for (&(first, second), &scale) in &self.one_four {
-            rows[first].push((second, scale));
+        for &(first, second, scee, scnb) in self.pair_list(n) {
+            visit(first as usize, second as usize, (scee, scnb));
         }
-        const EXCLUDED: u8 = 1;
-        const SCALED: u8 = 2;
-        let mut marks = vec![0u8; n];
-        let mut scales = vec![(1.0, 1.0); n];
-        for first in 0..n {
-            for &second in exclusions[first].range(first + 1..) {
-                marks[second] = EXCLUDED;
+    }
+
+    /// The cutoff-free non-bonded pairs with their 1-4 scaling, built once: the topology does not
+    /// change between calls, and a docking search makes millions of them.
+    fn pair_list(&self, n: usize) -> &[(u32, u32, f64, f64)] {
+        self.pairs.get_or_init(|| {
+            let exclusions = self.system.exclusions();
+            let mut out = Vec::new();
+            let mut rows = vec![Vec::new(); n];
+            for (&(first, second), &scale) in &self.one_four {
+                rows[first].push((second, scale));
             }
-            for &(second, scale) in &rows[first] {
-                marks[second] = SCALED;
-                scales[second] = scale;
-            }
-            for second in first + 1..n {
-                match marks[second] {
-                    0 => visit(first, second, (1.0, 1.0)),
-                    SCALED => visit(first, second, scales[second]),
-                    _ => {}
+            const EXCLUDED: u8 = 1;
+            const SCALED: u8 = 2;
+            let mut marks = vec![0u8; n];
+            let mut scales = vec![(1.0, 1.0); n];
+            for first in 0..n {
+                for &second in exclusions[first].range(first + 1..) {
+                    marks[second] = EXCLUDED;
+                }
+                for &(second, scale) in &rows[first] {
+                    marks[second] = SCALED;
+                    scales[second] = scale;
+                }
+                for second in first + 1..n {
+                    match marks[second] {
+                        0 => out.push((first as u32, second as u32, 1.0, 1.0)),
+                        SCALED => {
+                            out.push((first as u32, second as u32, scales[second].0, scales[second].1))
+                        }
+                        _ => {}
+                    }
+                }
+                for &second in exclusions[first].range(first + 1..) {
+                    marks[second] = 0;
+                }
+                for &(second, _) in &rows[first] {
+                    marks[second] = 0;
                 }
             }
-            for &second in exclusions[first].range(first + 1..) {
-                marks[second] = 0;
-            }
-            for &(second, _) in &rows[first] {
-                marks[second] = 0;
-            }
-        }
+            out
+        })
     }
 
     /// Calculate only cross nonbonded interactions between two disjoint atom
@@ -611,6 +631,185 @@ impl<'a> EnergyEvaluator<'a> {
             components,
             gradients: Some(gradients),
         })
+    }
+
+    /// Total energy and Cartesian gradient in a single traversal, into a caller-owned buffer.
+    ///
+    /// [`Self::energy_and_gradient`] walks every term twice - once in [`Self::components`] for the
+    /// scalar and once in [`Self::gradient_only`] for the derivative - recomputing the same bond,
+    /// angle and non-bonded geometry both times. A docking search calls this millions of times on a
+    /// small movable subsystem, where that second pass is most of the cost, so this fuses them.
+    ///
+    /// Each term's energy is accumulated per category in the order and under the skip rules of
+    /// [`Self::components`], then summed as [`EnergyComponents::total`] does, and the gradient is
+    /// accumulated exactly as [`Self::gradient_only`] does at unit weights, so both match those
+    /// functions. Torsions keep both formulations - the energy's `dihedral` and the gradient's
+    /// Blondel-Karplus form are not the same arithmetic - so only their loop is shared. Implicit
+    /// solvent falls back to the two-pass path, which OBC2's own all-pairs passes need.
+    pub fn total_and_gradient_into(
+        &self,
+        coordinates: &[Vec3],
+        gradient: &mut [Vec3],
+    ) -> Result<f64> {
+        validate_coordinates(self.system.atom_count(), coordinates)?;
+        if gradient.len() != coordinates.len() {
+            return Err(EnergyError::CoordinateCount {
+                expected: coordinates.len(),
+                received: gradient.len(),
+            });
+        }
+        if self.options.obc2.is_some() {
+            let energy = self.components(coordinates)?.total();
+            for (slot, value) in gradient.iter_mut().zip(self.gradient_only(coordinates)?) {
+                *slot = value;
+            }
+            return Ok(energy);
+        }
+        const ZERO: Vec3 = Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        gradient.fill(ZERO);
+        let mut result = EnergyComponents::default();
+        let atoms = self.system.atoms();
+        for bond in self.system.bonds() {
+            let [first, second] = bond.atoms();
+            if self.active_terms_only
+                && !self.selection.is_movable(first)
+                && !self.selection.is_movable(second)
+            {
+                continue;
+            }
+            let vector = subtract(coordinates[first], coordinates[second]);
+            let raw = norm(vector);
+            let delta = raw - bond.length();
+            result.bonds += bond.force() * delta * delta;
+            let derivative = 2.0 * bond.force() * delta / raw.max(1.0e-12);
+            add_scaled(&mut gradient[first], vector, derivative);
+            add_scaled(&mut gradient[second], vector, -derivative);
+        }
+        for angle in self.system.angles() {
+            let [first, center, third] = angle.atoms();
+            if self.active_terms_only
+                && ![first, center, third]
+                    .into_iter()
+                    .any(|atom| self.selection.is_movable(atom))
+            {
+                continue;
+            }
+            let left = subtract(coordinates[first], coordinates[center]);
+            let right = subtract(coordinates[third], coordinates[center]);
+            let left_norm = norm(left).max(1.0e-12);
+            let right_norm = norm(right).max(1.0e-12);
+            let cosine = (dot(left, right) / (left_norm * right_norm)).clamp(-1.0, 1.0);
+            let theta = cosine.acos();
+            let delta = theta - angle.radians();
+            result.angles += angle.force() * delta * delta;
+            let sine = (1.0 - cosine * cosine).sqrt().max(1.0e-12);
+            let factor = 2.0 * angle.force() * delta / sine;
+            let first_derivative = subtract(
+                scale(left, cosine / (left_norm * left_norm)),
+                scale(right, 1.0 / (left_norm * right_norm)),
+            );
+            let third_derivative = subtract(
+                scale(right, cosine / (right_norm * right_norm)),
+                scale(left, 1.0 / (left_norm * right_norm)),
+            );
+            add_scaled(&mut gradient[first], first_derivative, factor);
+            add_scaled(&mut gradient[third], third_derivative, factor);
+            add_scaled(&mut gradient[center], first_derivative, -factor);
+            add_scaled(&mut gradient[center], third_derivative, -factor);
+        }
+        let dielectric = self.options.dielectric;
+        let active_only = self.active_terms_only;
+        let selection = &self.selection;
+        let mut van_der_waals = 0.0;
+        let mut electrostatics = 0.0;
+        let pair_gradient = &mut *gradient;
+        self.for_each_nonbonded_pair(coordinates, |first, second, (scee, scnb)| {
+            let vector = subtract(coordinates[first], coordinates[second]);
+            let radius = norm(vector).max(1.0e-8);
+            let first_atom = &atoms[first];
+            let second_atom = &atoms[second];
+            let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
+            let epsilon =
+                (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
+            let ratio6 = (sigma / radius).powi(6);
+            van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
+            let charges = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge();
+            electrostatics += charges / (dielectric * radius * scee);
+            if active_only && !selection.is_movable(first) && !selection.is_movable(second) {
+                return;
+            }
+            let coulomb = charges / (dielectric * scee * radius);
+            let derivative =
+                12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - coulomb / radius;
+            add_scaled(&mut pair_gradient[first], vector, derivative / radius);
+            add_scaled(&mut pair_gradient[second], vector, -derivative / radius);
+        });
+        result.van_der_waals = van_der_waals;
+        result.electrostatics = electrostatics;
+        for restraint in &self.options.restraints {
+            if let Some(position) = coordinates.get(restraint.atom) {
+                result.restraints +=
+                    restraint.force * squared_distance(*position, restraint.reference);
+                let vector = subtract(*position, restraint.reference);
+                add_scaled(&mut gradient[restraint.atom], vector, 2.0 * restraint.force);
+            }
+        }
+        for (index, value) in gradient.iter_mut().enumerate() {
+            if !self.selection.is_movable(index) {
+                *value = ZERO;
+            }
+        }
+        // Torsions accumulate in their own buffer and are added once at the end, as
+        // `gradient_only` adds `residual_gradient`: summing them into the running total instead
+        // would reassociate the additions and move the last bits of the gradient.
+        TORSION_SCRATCH.with(|cell| {
+            let mut torsions = cell.borrow_mut();
+            let result = &mut result;
+            torsions.clear();
+            torsions.resize(coordinates.len(), ZERO);
+            for torsion in self.system.dihedrals() {
+                let quad = torsion.atoms();
+                if self.active_terms_only
+                    && !quad.into_iter().any(|atom| self.selection.is_movable(atom))
+                {
+                    continue;
+                }
+                let periodicity = torsion.periodicity() as f64;
+                let phi = dihedral(
+                    coordinates[quad[0]],
+                    coordinates[quad[1]],
+                    coordinates[quad[2]],
+                    coordinates[quad[3]],
+                );
+                let energy = torsion.force() * (1.0 + (periodicity * phi - torsion.phase()).cos());
+                if torsion.is_improper() {
+                    result.improper_torsions += energy;
+                } else {
+                    result.proper_torsions += energy;
+                }
+                let points = quad.map(|atom| coordinates[atom]);
+                let (grad_phi, phi_gradient) =
+                    pbc::dihedral_with_gradient(points[0], points[1], points[2], points[3]);
+                let derivative = -torsion.force()
+                    * periodicity
+                    * (periodicity * grad_phi - torsion.phase()).sin();
+                for (local, atom) in quad.iter().enumerate() {
+                    if self.selection.is_movable(*atom) {
+                        add_scaled(&mut torsions[*atom], phi_gradient[local], derivative);
+                    }
+                }
+            }
+            for (slot, extra) in gradient.iter_mut().zip(torsions.iter()) {
+                slot.x += extra.x;
+                slot.y += extra.y;
+                slot.z += extra.z;
+            }
+        });
+        Ok(result.total())
     }
 
     /// Evaluate only the Cartesian gradient. Dynamics uses this on ordinary
@@ -1488,6 +1687,12 @@ fn obc2_born_radius(first: usize, atoms: &[Atom], coordinates: &[Vec3]) -> f64 {
     let psi = radius * integral;
     let tanh = (ALPHA * psi - BETA * psi * psi + GAMMA * psi.powi(3)).tanh();
     1.0 / (1.0 / radius - tanh / atoms[first].gb_radius()).max(1.0e-6)
+}
+
+thread_local! {
+    /// Reused buffer for the torsion part of [`EnergyEvaluator::total_and_gradient_into`], so the
+    /// search's millions of calls allocate nothing.
+    static TORSION_SCRATCH: std::cell::RefCell<Vec<Vec3>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn validate_coordinates(expected: usize, coordinates: &[Vec3]) -> Result<()> {
