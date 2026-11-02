@@ -79,6 +79,8 @@ pub struct GridOptions {
     pub lj_cap: Option<f64>,
     /// A reward for ligand O and N atoms near receptor N and O atoms.
     pub polar_reward: Option<PolarReward>,
+    /// Directional hydrogen bonding and the unsatisfied-buried-polar penalty (see [`HydrogenBond`]).
+    pub hydrogen_bond: Option<HydrogenBond>,
     /// Point sources that are not atoms of the system (for example crystal waters the structure fixer removed).
     pub extra_sources: &'static [ExtraSource],
     /// Soft-core electrostatics: floors on the distance in the Coulomb term (see [`CoulombFloor`]).
@@ -160,6 +162,12 @@ pub struct GridTerms {
     pub ch_pi: f64,
     /// Minus the metal coordination Gaussians summed over (ion, ligand oxygen) pairs.
     pub coordination: f64,
+    /// Minus the directional hydrogen bonds donated by the ligand hydroxyls (0 when the term is off).
+    pub hbond_donor: f64,
+    /// Minus the directional hydrogen bonds accepted by the ligand hydroxyls (0 when the term is off).
+    pub hbond_acceptor: f64,
+    /// Buried ligand hydroxyls that found no partner (0 when the term is off).
+    pub hbond_unsatisfied: f64,
     /// The quadratic penalty for atoms outside the grid.
     pub outside: f64,
     /// Minus each contact field (see [`CONTACT_KINDS`]) summed over its ligand atoms (0 when not built).
@@ -309,6 +317,42 @@ pub struct PolarReward {
     pub width: f64,
 }
 
+/// Directional hydrogen bonding for the ligand's hydroxyls, and a penalty for burying one that finds no
+/// partner.
+///
+/// The electrostatics of this grid is a floored Coulomb potential between point charges, which is blind to
+/// the geometry of a hydrogen bond: it cannot tell a hydroxyl donating along its O-H from one that merely
+/// has an oxygen nearby, and `oxygen_burial` penalises burial whether or not the buried oxygen is
+/// satisfied. Those are the terms a sugar needs to tell one hydroxyl pair from another, which is how most
+/// of our mis-ranked poses differ from the right one.
+///
+/// Evaluated pairwise over the receptor polar atoms near each ligand hydroxyl (a cell list, so the cost is
+/// the number of hydroxyls times a small neighbourhood, not a new grid). The geometry is fixed, from the
+/// neutron and CSD hydrogen-bond literature; only the three depths are meant to be fitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HydrogenBond {
+    /// kcal/mol for an ideal bond donated by a ligand hydroxyl
+    pub donor_depth: f64,
+    /// kcal/mol for an ideal bond accepted by a ligand hydroxyl
+    pub acceptor_depth: f64,
+    /// kcal/mol for a fully buried hydroxyl with no partner at all
+    pub unsatisfied_depth: f64,
+}
+
+/// Ideal heavy-atom distance of a ligand O-H donating to a receptor acceptor, angstrom, and its spread.
+const HB_DONOR_DISTANCE: (f64, f64) = (2.85, 0.40);
+/// Ideal distance from a receptor polar hydrogen to the accepting ligand oxygen, angstrom, and its spread.
+const HB_ACCEPTOR_DISTANCE: (f64, f64) = (1.90, 0.35);
+/// The ideal approach of a donor to an accepting ligand hydroxyl, as the cosine of the angle between the
+/// C->O direction and O->H: a C-O...H angle of 115 degrees makes that cos 65 degrees. With its spread.
+const HB_LONE_PAIR: (f64, f64) = (0.4226, 0.35);
+/// Beyond this a pair contributes nothing, angstrom.
+const HB_CUTOFF: f64 = 4.0;
+/// Burial: receptor heavy atoms count fully within the first distance and not at all beyond the second.
+const HB_BURIAL_RANGE: (f64, f64) = (4.0, 6.5);
+/// Number of close receptor heavy atoms at which a hydroxyl counts as fully buried.
+const HB_BURIAL_FULL: f64 = 12.0;
+
 /// An empirical bonus for a ligand oxygen coordinating a receptor metal ion.
 ///
 /// A metal-bound sugar sits in the field of the ion's first shell: the ion
@@ -341,6 +385,7 @@ impl GridOptions {
             metal_coordination: None,
             lj_cap: None,
             polar_reward: None,
+            hydrogen_bond: None,
             extra_sources: &[],
             coulomb_floor: None,
             metal_oxygen_contact: false,
@@ -411,6 +456,131 @@ pub struct DockingGrid {
     term_weights: [f64; 2],
     /// The contact terms' fields and ligand masks, with their depths in `reward.depth`.
     contacts: Vec<PolarField>,
+    /// Directional hydrogen bonding (see [`HydrogenBond`]).
+    hbond: Option<HbReceptor>,
+}
+
+/// A receptor atom that can accept a hydrogen bond, with the direction its lone pairs point (from the
+/// heavy atom it hangs on, so a carbonyl oxygen points away from its carbon).
+#[derive(Debug, Clone, Copy)]
+struct HbAcceptor {
+    position: [f64; 3],
+    lone_direction: [f64; 3],
+}
+
+/// A receptor polar hydrogen and the heavy atom that donates it.
+#[derive(Debug, Clone, Copy)]
+struct HbDonor {
+    hydrogen: [f64; 3],
+    donor: [f64; 3],
+}
+
+/// A ligand hydroxyl: the oxygen, its hydrogen and the carbon it hangs on, as indices into the pose.
+#[derive(Debug, Clone, Copy)]
+struct HbHydroxyl {
+    oxygen: usize,
+    hydrogen: Option<usize>,
+    carbon: Option<usize>,
+}
+
+/// Everything the hydrogen-bond term needs about the receptor, with a uniform cell list over the polar
+/// atoms and the heavy atoms so a pose touches only the neighbourhood of each hydroxyl.
+#[derive(Debug, Clone)]
+struct HbReceptor {
+    model: HydrogenBond,
+    acceptors: Vec<HbAcceptor>,
+    donors: Vec<HbDonor>,
+    heavy: Vec<[f64; 3]>,
+    hydroxyls: Vec<HbHydroxyl>,
+    cells: HbCells,
+}
+
+/// Uniform cells over three point sets (acceptors, donors, heavy atoms) sharing one grid.
+#[derive(Debug, Clone)]
+struct HbCells {
+    origin: [f64; 3],
+    size: f64,
+    dims: [usize; 3],
+    acceptors: Vec<Vec<u32>>,
+    donors: Vec<Vec<u32>>,
+    heavy: Vec<Vec<u32>>,
+}
+
+impl HbCells {
+    fn new(sets: [&[[f64; 3]]; 3], size: f64) -> Self {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for set in sets {
+            for p in set {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        if !lo[0].is_finite() {
+            lo = [0.0; 3];
+            hi = [0.0; 3];
+        }
+        let dims = [0, 1, 2].map(|k| (((hi[k] - lo[k]) / size).floor() as usize) + 1);
+        let count = dims[0] * dims[1] * dims[2];
+        let mut cells = Self {
+            origin: lo,
+            size,
+            dims,
+            acceptors: vec![Vec::new(); count],
+            donors: vec![Vec::new(); count],
+            heavy: vec![Vec::new(); count],
+        };
+        for (which, set) in sets.iter().enumerate() {
+            for (i, p) in set.iter().enumerate() {
+                let c = cells.cell_of(*p);
+                match which {
+                    0 => cells.acceptors[c].push(i as u32),
+                    1 => cells.donors[c].push(i as u32),
+                    _ => cells.heavy[c].push(i as u32),
+                }
+            }
+        }
+        cells
+    }
+
+    fn cell_of(&self, p: [f64; 3]) -> usize {
+        let c = [0, 1, 2].map(|k| {
+            (((p[k] - self.origin[k]) / self.size).floor().max(0.0) as usize).min(self.dims[k] - 1)
+        });
+        (c[0] * self.dims[1] + c[1]) * self.dims[2] + c[2]
+    }
+
+    /// Calls `f` with the index of every point of `which` (0 acceptors, 1 donors, 2 heavy) whose cell is
+    /// within `radius` of `p`.
+    fn near(&self, which: usize, p: [f64; 3], radius: f64, mut f: impl FnMut(usize)) {
+        let lo = [0, 1, 2].map(|k| {
+            ((p[k] - radius - self.origin[k]) / self.size).floor().max(0.0) as usize
+        });
+        let hi = [0, 1, 2].map(|k| {
+            let v = ((p[k] + radius - self.origin[k]) / self.size).floor();
+            if v < 0.0 { None } else { Some((v as usize).min(self.dims[k] - 1)) }
+        });
+        let (Some(h0), Some(h1), Some(h2)) = (hi[0], hi[1], hi[2]) else {
+            return;
+        };
+        for i in lo[0]..=h0 {
+            for j in lo[1]..=h1 {
+                for k in lo[2]..=h2 {
+                    let c = (i * self.dims[1] + j) * self.dims[2] + k;
+                    let list = match which {
+                        0 => &self.acceptors[c],
+                        1 => &self.donors[c],
+                        _ => &self.heavy[c],
+                    };
+                    for &idx in list {
+                        f(idx as usize);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The polar reward's grid: the sum of Gaussians around the receptor N and O atoms, and which ligand atoms are O or N.
@@ -419,6 +589,31 @@ struct PolarField {
     reward: PolarReward,
     field: Vec<f32>,
     ligand: Vec<bool>,
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn norm(a: [f64; 3]) -> f64 {
+    dot(a, a).sqrt()
+}
+
+/// The unit vector and the length it came from.
+fn unit(a: [f64; 3]) -> ([f64; 3], f64) {
+    let n = norm(a).max(1.0e-9);
+    ([a[0] / n, a[1] / n, a[2] / n], n)
+}
+
+/// 1 below `near`, 0 above `far`, a smooth cosine in between.
+fn switch_down(r: f64, near: f64, far: f64) -> f64 {
+    if r <= near {
+        1.0
+    } else if r >= far {
+        0.0
+    } else {
+        0.5 * (1.0 + (std::f64::consts::PI * (r - near) / (far - near)).cos())
+    }
 }
 
 /// A trilinear interpolant's value and gradient (per angstrom).
@@ -490,6 +685,7 @@ impl DockingGrid {
             metal_coordination,
             lj_cap,
             polar_reward,
+            hydrogen_bond,
             extra_sources,
             coulomb_floor,
             metal_oxygen_contact,
@@ -939,6 +1135,84 @@ impl DockingGrid {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Hydrogen bonding: the receptor's acceptors and polar hydrogens, and the ligand's hydroxyls.
+        let hbond = hydrogen_bond.map(|model| {
+            let mut attached: Vec<Option<usize>> = vec![None; atoms.len()];
+            let mut hydrogens_of: Vec<Vec<usize>> = vec![Vec::new(); atoms.len()];
+            let mut carbon_of: Vec<Option<usize>> = vec![None; atoms.len()];
+            for bond in system.bonds() {
+                let [a, b] = bond.atoms();
+                for (x, y) in [(a, b), (b, a)] {
+                    if atoms[x].element() == 1 {
+                        continue;
+                    }
+                    if atoms[y].element() == 1 {
+                        hydrogens_of[x].push(y);
+                    } else {
+                        if attached[x].is_none() {
+                            attached[x] = Some(y);
+                        }
+                        if atoms[y].element() == 6 && carbon_of[x].is_none() {
+                            carbon_of[x] = Some(y);
+                        }
+                    }
+                }
+            }
+            let v = |i: usize| [coordinates[i].x, coordinates[i].y, coordinates[i].z];
+            let mut acceptors = Vec::new();
+            let mut donors = Vec::new();
+            let mut heavy = Vec::new();
+            for &j in receptor {
+                let element = atoms[j].element();
+                if element == 1 {
+                    // a polar hydrogen is one on a nitrogen or oxygen
+                    if let Some(d) = attached[j].or_else(|| {
+                        system.bonds().iter().find_map(|b| {
+                            let [x, y] = b.atoms();
+                            if x == j { Some(y) } else if y == j { Some(x) } else { None }
+                        })
+                    }) && matches!(atoms[d].element(), 7 | 8)
+                    {
+                        donors.push(HbDonor { hydrogen: v(j), donor: v(d) });
+                    }
+                    continue;
+                }
+                heavy.push(v(j));
+                if matches!(element, 7 | 8) && !METALS.contains(&element) {
+                    let position = v(j);
+                    let lone_direction = match attached[j] {
+                        Some(h) => {
+                            let d = [position[0] - coordinates[h].x, position[1] - coordinates[h].y, position[2] - coordinates[h].z];
+                            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1.0e-9);
+                            [d[0] / n, d[1] / n, d[2] / n]
+                        }
+                        // no heavy neighbour (a lone water oxygen): accept from any side
+                        None => [0.0, 0.0, 0.0],
+                    };
+                    acceptors.push(HbAcceptor { position, lone_direction });
+                }
+            }
+            let hydroxyls = ligand
+                .iter()
+                .enumerate()
+                .filter(|&(_, &i)| atoms[i].element() == 8)
+                .map(|(index, &i)| {
+                    let place = |target: Option<usize>| {
+                        target.and_then(|t| ligand.iter().position(|&l| l == t))
+                    };
+                    HbHydroxyl {
+                        oxygen: index,
+                        hydrogen: place(hydrogens_of[i].first().copied()),
+                        carbon: place(carbon_of[i]),
+                    }
+                })
+                .collect();
+            let acceptor_points: Vec<[f64; 3]> = acceptors.iter().map(|a| a.position).collect();
+            let donor_points: Vec<[f64; 3]> = donors.iter().map(|d| d.hydrogen).collect();
+            let cells = HbCells::new([&acceptor_points, &donor_points, &heavy], HB_BURIAL_RANGE.1);
+            HbReceptor { model, acceptors, donors, heavy, hydroxyls, cells }
+        });
+
         Ok(Self {
             origin,
             spacing,
@@ -947,6 +1221,7 @@ impl DockingGrid {
             vdw,
             potential,
             ligand_class,
+            hbond,
             ligand_charge: ligand.iter().map(|&i| atoms[i].charge()).collect(),
             screening,
             flexible,
@@ -1068,7 +1343,10 @@ impl DockingGrid {
             }
         }
         let flexible = self.flexible_term(positions, gradient.as_deref_mut());
-        total + flexible + self.coordination_term(positions, gradient)
+        total
+            + flexible
+            + self.coordination_term(positions, gradient.as_deref_mut())
+            + self.hydrogen_bond_term(positions, gradient)
     }
 
     /// The interaction terms of the pose at unit weight, for fitting the weights of the score; the energy of
@@ -1130,6 +1408,10 @@ impl DockingGrid {
                 }
             }
         }
+        let [donor, acceptor, unsatisfied] = self.hydrogen_bond_parts(positions);
+        t.hbond_donor = donor;
+        t.hbond_acceptor = acceptor;
+        t.hbond_unsatisfied = unsatisfied;
         t
     }
 
@@ -1205,6 +1487,202 @@ impl DockingGrid {
             }
         }
         total
+    }
+
+    /// Directional hydrogen bonding and the unsatisfied-buried-polar penalty (see [`HydrogenBond`]).
+    ///
+    /// Per ligand hydroxyl: bonds it donates through its own O-H, bonds it accepts from receptor polar
+    /// hydrogens along one of its lone pairs, and, if it is buried and neither happened, a penalty. All
+    /// three weights sit in [`HydrogenBond`]; the geometry is fixed (see the constants).
+    fn hydrogen_bond_term(&self, positions: &[Vec3], mut gradient: Option<&mut [Vec3]>) -> f64 {
+        let Some(hb) = self.hbond.as_ref() else {
+            return 0.0;
+        };
+        let mut total = 0.0;
+        for group in &hb.hydroxyls {
+            total += self.hydroxyl_term(hb, group, positions);
+            // The term separates over hydroxyls, and each one moves with only its own three atoms, so its
+            // gradient is three central differences of that hydroxyl alone: exact to the energy by
+            // construction, and a handful of neighbour pairs each.
+            if let Some(gradient) = gradient.as_deref_mut() {
+                let mut moved = [
+                    (group.oxygen, positions[group.oxygen]),
+                    (group.hydrogen.unwrap_or(group.oxygen), positions[group.hydrogen.unwrap_or(group.oxygen)]),
+                    (group.carbon.unwrap_or(group.oxygen), positions[group.carbon.unwrap_or(group.oxygen)]),
+                ];
+                moved.sort_unstable_by_key(|(i, _)| *i);
+                let mut seen = [usize::MAX; 3];
+                let mut scratch = positions.to_vec();
+                for (slot, &(atom, _)) in moved.iter().enumerate() {
+                    if seen.contains(&atom) {
+                        continue;
+                    }
+                    seen[slot] = atom;
+                    for axis in 0..3 {
+                        let bump = |p: &mut Vec3, d: f64| match axis {
+                            0 => p.x += d,
+                            1 => p.y += d,
+                            _ => p.z += d,
+                        };
+                        let h = 1.0e-5;
+                        bump(&mut scratch[atom], h);
+                        let up = self.hydroxyl_term(hb, group, &scratch);
+                        bump(&mut scratch[atom], -2.0 * h);
+                        let down = self.hydroxyl_term(hb, group, &scratch);
+                        bump(&mut scratch[atom], h);
+                        let slope = (up - down) / (2.0 * h);
+                        match axis {
+                            0 => gradient[atom].x += slope,
+                            1 => gradient[atom].y += slope,
+                            _ => gradient[atom].z += slope,
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// One hydroxyl's hydrogen bonds and its unsatisfied-burial penalty.
+    fn hydroxyl_term(&self, hb: &HbReceptor, group: &HbHydroxyl, positions: &[Vec3]) -> f64 {
+        let o = positions[group.oxygen];
+        let op = [o.x, o.y, o.z];
+        let mut total = 0.0;
+        // how much partner is within reach of this hydroxyl, whichever way the O-H happens to point
+        let mut available = 0.0;
+        // bonds the hydroxyl donates: O-H ... A, linear at the hydrogen, into the acceptor's lone pairs
+        if let Some(h_index) = group.hydrogen
+            && hb.model.donor_depth != 0.0
+        {
+            let h = positions[h_index];
+            let (oh, _) = unit([h.x - o.x, h.y - o.y, h.z - o.z]);
+            hb.cells.near(0, op, HB_CUTOFF, |k| {
+                let a = hb.acceptors[k];
+                let d = [a.position[0] - op[0], a.position[1] - op[1], a.position[2] - op[2]];
+                let r = norm(d);
+                if r >= HB_CUTOFF || r < 1.0e-6 {
+                    return;
+                }
+                let u = [d[0] / r, d[1] / r, d[2] / r];
+                let z = (r - HB_DONOR_DISTANCE.0) / HB_DONOR_DISTANCE.1;
+                let f = (-0.5 * z * z).exp();
+                let c_lin = dot(oh, u);
+                if c_lin <= 0.0 {
+                    return;
+                }
+                let c_acc = if norm(a.lone_direction) < 0.5 {
+                    1.0
+                } else {
+                    -dot(u, a.lone_direction)
+                };
+                if c_acc <= 0.0 {
+                    return;
+                }
+                // the bond actually made, which needs the hydroxyl's own O-H to point at the acceptor
+                total -= hb.model.donor_depth * f * c_lin * c_lin * c_acc * c_acc;
+                // whether a partner is there at all, which does not: the hydroxyl is free to rotate about
+                // its C-O bond, and the builder's hydrogen placement is unreliable (only about half of the
+                // close donor/acceptor pairs of deposited complexes come out with H-bond geometry), so
+                // burying a hydroxyl next to a willing acceptor must not be charged as unsatisfied
+                available += f * c_acc * c_acc;
+            });
+        }
+        // bonds the hydroxyl accepts: D-H ... O, linear at the receptor hydrogen, along a lone pair of the
+        // hydroxyl (the C-O...H angle)
+        if hb.model.acceptor_depth != 0.0 {
+            let co = group.carbon.map(|c| {
+                let p = positions[c];
+                unit([o.x - p.x, o.y - p.y, o.z - p.z]).0
+            });
+            hb.cells.near(1, op, HB_CUTOFF, |k| {
+                let donor = hb.donors[k];
+                let d = [donor.hydrogen[0] - op[0], donor.hydrogen[1] - op[1], donor.hydrogen[2] - op[2]];
+                let r = norm(d);
+                if r >= HB_CUTOFF || r < 1.0e-6 {
+                    return;
+                }
+                let u = [d[0] / r, d[1] / r, d[2] / r];
+                let z = (r - HB_ACCEPTOR_DISTANCE.0) / HB_ACCEPTOR_DISTANCE.1;
+                let f = (-0.5 * z * z).exp();
+                let (dh, _) = unit([
+                    donor.hydrogen[0] - donor.donor[0],
+                    donor.hydrogen[1] - donor.donor[1],
+                    donor.hydrogen[2] - donor.donor[2],
+                ]);
+                let c_lin = -dot(dh, u);
+                if c_lin <= 0.0 {
+                    return;
+                }
+                let c_lp = match co {
+                    Some(co) => {
+                        let c = dot(co, u);
+                        let w = (c - HB_LONE_PAIR.0) / HB_LONE_PAIR.1;
+                        (-0.5 * w * w).exp()
+                    }
+                    None => 1.0,
+                };
+                let shape = f * c_lin * c_lin * c_lp;
+                available += shape;
+                total -= hb.model.acceptor_depth * shape;
+            });
+        }
+        // a buried hydroxyl that found nothing to bond to
+        if hb.model.unsatisfied_depth != 0.0 {
+            let mut burial = 0.0;
+            hb.cells.near(2, op, HB_BURIAL_RANGE.1, |k| {
+                let p = hb.heavy[k];
+                let r = norm([p[0] - op[0], p[1] - op[1], p[2] - op[2]]);
+                burial += switch_down(r, HB_BURIAL_RANGE.0, HB_BURIAL_RANGE.1);
+            });
+            let buried = (burial / HB_BURIAL_FULL).min(1.0);
+            let missing = (1.0 - available).max(0.0);
+            total += hb.model.unsatisfied_depth * buried * missing;
+        }
+        total
+    }
+
+    /// The three hydrogen-bond parts of a pose at unit depth, for fitting.
+    fn hydrogen_bond_parts(&self, positions: &[Vec3]) -> [f64; 3] {
+        let Some(hb) = self.hbond.as_ref() else {
+            return [0.0; 3];
+        };
+        let unit_model = HbReceptor {
+            model: HydrogenBond { donor_depth: 1.0, acceptor_depth: 0.0, unsatisfied_depth: 0.0 },
+            ..hb.clone()
+        };
+        let donor: f64 = unit_model.hydroxyls.iter().map(|g| self.hydroxyl_term(&unit_model, g, positions)).sum();
+        let acceptor_model = HbReceptor {
+            model: HydrogenBond { donor_depth: 0.0, acceptor_depth: 1.0, unsatisfied_depth: 0.0 },
+            ..hb.clone()
+        };
+        let acceptor: f64 = acceptor_model.hydroxyls.iter().map(|g| self.hydroxyl_term(&acceptor_model, g, positions)).sum();
+        // the penalty needs the real satisfaction, so it is taken at the model's own bond depths
+        let unsatisfied_model = HbReceptor {
+            model: HydrogenBond { unsatisfied_depth: 1.0, ..hb.model },
+            ..hb.clone()
+        };
+        let both: f64 = unsatisfied_model
+            .hydroxyls
+            .iter()
+            .map(|g| self.hydroxyl_term(&unsatisfied_model, g, positions))
+            .sum();
+        let bonds: f64 = hb.hydroxyls.iter().map(|g| self.hydroxyl_term(hb, g, positions)).sum();
+        [donor, acceptor, both - bonds]
+    }
+
+    /// Counts behind the hydrogen-bond term: receptor acceptors, receptor polar hydrogens, ligand
+    /// hydroxyls, and of those the ones that carry a hydrogen and a carbon.
+    pub fn hydrogen_bond_counts(&self) -> [usize; 5] {
+        match self.hbond.as_ref() {
+            None => [0; 5],
+            Some(hb) => [
+                hb.acceptors.len(),
+                hb.donors.len(),
+                hb.hydroxyls.len(),
+                hb.hydroxyls.iter().filter(|g| g.hydrogen.is_some()).count(),
+                hb.hydroxyls.iter().filter(|g| g.carbon.is_some()).count(),
+            ],
+        }
     }
 
     /// Number of receptor hydroxyl hydrogens carried as rotamers.

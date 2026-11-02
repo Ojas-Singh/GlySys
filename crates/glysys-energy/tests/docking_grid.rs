@@ -1109,3 +1109,85 @@ fn energy_is_the_weighted_sum_of_the_recorded_terms() {
         );
     }
 }
+
+#[test]
+fn directional_hydrogen_bonds_are_consistent_and_reward_only_real_geometry() {
+    use glysys_energy::grid::{GridOptions, HydrogenBond};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" { &mut ligand } else { &mut receptor }.extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let model = HydrogenBond { donor_depth: 1.5, acceptor_depth: 1.5, unsatisfied_depth: 1.0 };
+    let plain = DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, base).unwrap();
+    let with = DockingGrid::build_with(
+        &system,
+        &coords,
+        &receptor,
+        &ligand,
+        center,
+        12.0,
+        GridOptions { hydrogen_bond: Some(model), ..base },
+    )
+    .unwrap();
+    // The deposited glycan hydrogen-bonds its pocket, so the term lowers its energy.
+    let (plain_energy, hb_energy) = (plain.energy(&positions), with.energy(&positions));
+    eprintln!("deposited pose: generic {plain_energy:.2}, with hydrogen bonds {hb_energy:.2} kcal/mol");
+    let bonds_only = DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0,
+        GridOptions { hydrogen_bond: Some(HydrogenBond { unsatisfied_depth: 0.0, ..model }), ..base }).unwrap();
+    assert!(bonds_only.energy(&positions) < plain_energy, "the deposited pose is hydrogen bonded");
+    // Far from the receptor nothing is bonded and nothing is buried, so the two agree.
+    let far: Vec<Vec3> = positions.iter().map(|p| Vec3 { x: p.x + 40.0, y: p.y, z: p.z }).collect();
+    assert!(
+        (plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9,
+        "no hydrogen bonds away from the receptor"
+    );
+    // The three parts are reported for fitting, and the bonds are favourable.
+    let terms = with.terms(&positions);
+    eprintln!(
+        "unit-depth parts: donor {:.3}, acceptor {:.3}, unsatisfied {:.3}",
+        terms.hbond_donor, terms.hbond_acceptor, terms.hbond_unsatisfied
+    );
+    assert!(terms.hbond_donor < 0.0 || terms.hbond_acceptor < 0.0, "some bond is made");
+    assert!(terms.hbond_unsatisfied >= 0.0, "the penalty is never a reward");
+    // Gradient against finite differences, at the deposited pose and displaced.
+    for shift in [0.0, 0.25] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|p| Vec3 { x: p.x + shift, y: p.y - 0.4 * shift, z: p.z + 0.2 * shift })
+            .collect();
+        let mut gradient = vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }; moved.len()];
+        with.energy_gradient(&moved, Some(&mut gradient));
+        let h = 1.0e-4;
+        for atom in 0..moved.len() {
+            for axis in 0..3 {
+                let (mut up, mut down) = (moved.clone(), moved.clone());
+                let bump = |p: &mut Vec3, d: f64| match axis {
+                    0 => p.x += d,
+                    1 => p.y += d,
+                    _ => p.z += d,
+                };
+                bump(&mut up[atom], h);
+                bump(&mut down[atom], -h);
+                let numeric = (with.energy(&up) - with.energy(&down)) / (2.0 * h);
+                let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+                assert!(
+                    (numeric - analytic).abs() < 5.0e-3 * (1.0 + analytic.abs()),
+                    "atom {atom} axis {axis}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
+}
