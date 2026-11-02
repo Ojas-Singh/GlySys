@@ -74,6 +74,8 @@ pub struct GridOptions {
     pub temperature: f64,
     /// Replace the generic ion-oxygen interaction near a metal with a coordination well.
     pub metal_coordination: Option<MetalCoordination>,
+    /// Two-sided well on the first-shell metal-oxygen distance (see [`MetalShell`]).
+    pub metal_shell: Option<MetalShell>,
     /// Ceiling (kcal/mol) on the van der Waals energy a ligand atom feels at a grid point, in place of the
     /// default of 500: a soft wall that lets tight crystal contacts cost little.
     pub lj_cap: Option<f64>,
@@ -160,6 +162,8 @@ pub struct GridTerms {
     pub ch_pi: f64,
     /// Minus the metal coordination Gaussians summed over (ion, ligand oxygen) pairs.
     pub coordination: f64,
+    /// The first-shell distance well (see [`MetalShell`]) summed over (ion, ligand oxygen) pairs.
+    pub shell: f64,
     /// The quadratic penalty for atoms outside the grid.
     pub outside: f64,
     /// Minus each contact field (see [`CONTACT_KINDS`]) summed over its ligand atoms (0 when not built).
@@ -324,6 +328,32 @@ pub struct MetalCoordination {
     pub depth: f64,
 }
 
+/// A two-sided well on the first-shell metal-oxygen distance.
+///
+/// [`MetalCoordination`] only pulls: an oxygen that sits too close to the ion is rewarded almost as
+/// much as one at the right radius, and the ion's own +2 charge pulls it closer still. Deposited sites
+/// are far tighter than that (Ca-O 2.52 +- 0.14 A over 898 coordinating oxygens of 377 sites), and poses
+/// that coordinate at the wrong radius are exactly the ones our score ranks wrongly. This term is zero
+/// at the ideal distance, rises as an oxygen leaves it, and falls back to zero once the oxygen is far
+/// enough to be no part of the shell:
+///
+/// ```text
+/// E = weight * [1 - exp(-((d - d0)/sigma)^2 / 2)] * exp(-((d - d0)/SHELL_WIDTH)^2 / 2)
+/// ```
+///
+/// `d0` is the element's mean metal-oxygen distance ([`metal_oxygen_distance`]), so it needs no
+/// distance of its own. A non-coordinating oxygen pays nothing, and the penalty is bounded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalShell {
+    /// spread of the deposited distances, angstrom (the width of the free bottom of the well)
+    pub sigma: f64,
+    /// kcal/mol at the top of the well
+    pub weight: f64,
+}
+
+/// How far from the ideal distance an oxygen still counts as first shell, angstrom.
+const SHELL_WIDTH: f64 = 0.55;
+
 /// Width (standard deviation) of the coordination bonus, angstrom.
 const COORD_WIDTH: f64 = 0.3;
 /// Pairs beyond this distance get no bonus.
@@ -339,6 +369,7 @@ impl GridOptions {
             flexible_hydroxyls: false,
             temperature: 0.6,
             metal_coordination: None,
+            metal_shell: None,
             lj_cap: None,
             polar_reward: None,
             extra_sources: &[],
@@ -364,6 +395,8 @@ const MIN_PAIR_CHARGE: f64 = 0.05;
 #[derive(Debug, Clone)]
 struct Ion {
     position: [f64; 3],
+    /// the element's mean metal-oxygen distance, when it has one (see [`metal_oxygen_distance`])
+    shell_distance: Option<f64>,
 }
 
 /// A ligand oxygen that can coordinate an ion.
@@ -400,6 +433,7 @@ pub struct DockingGrid {
     flexible: Vec<FlexibleHydrogen>,
     temperature: f64,
     coordination: Option<MetalCoordination>,
+    shell: Option<MetalShell>,
     ions: Vec<Ion>,
     oxygens: Vec<OxygenProbe>,
     /// `1 / (eps(r) r)` every `PAIR_STEP` angstrom up to `FLEX_RANGE`, for the flexible hydrogens.
@@ -488,6 +522,7 @@ impl DockingGrid {
             flexible_hydroxyls,
             temperature,
             metal_coordination,
+            metal_shell,
             lj_cap,
             polar_reward,
             extra_sources,
@@ -918,7 +953,7 @@ impl DockingGrid {
                     .collect()
             }
         };
-        let (ions, oxygens) = if metal_coordination.is_some() {
+        let (ions, oxygens) = if metal_coordination.is_some() || metal_shell.is_some() {
             let ions = receptor
                 .iter()
                 .filter(|&&j| METALS.contains(&atoms[j].element()))
@@ -926,6 +961,7 @@ impl DockingGrid {
                     let c = coordinates[j];
                     Ion {
                         position: [c.x, c.y, c.z],
+                        shell_distance: metal_oxygen_distance(atoms[j].element()),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -952,6 +988,7 @@ impl DockingGrid {
             flexible,
             temperature,
             coordination: metal_coordination,
+            shell: metal_shell,
             ions,
             oxygens,
             pair_table: (0..=((FLEX_RANGE / PAIR_STEP) as usize + 2))
@@ -1068,7 +1105,7 @@ impl DockingGrid {
             }
         }
         let flexible = self.flexible_term(positions, gradient.as_deref_mut());
-        total + flexible + self.coordination_term(positions, gradient)
+        total + flexible + self.coordination_term(positions, gradient.as_deref_mut()) + self.shell_term(positions, gradient)
     }
 
     /// The interaction terms of the pose at unit weight, for fitting the weights of the score; the energy of
@@ -1130,6 +1167,26 @@ impl DockingGrid {
                 }
             }
         }
+        if let Some(model) = self.shell {
+            for ion in &self.ions {
+                let Some(ideal) = ion.shell_distance else {
+                    continue;
+                };
+                for oxygen in &self.oxygens {
+                    let q = &positions[oxygen.index];
+                    let d = ((q.x - ion.position[0]).powi(2)
+                        + (q.y - ion.position[1]).powi(2)
+                        + (q.z - ion.position[2]).powi(2))
+                    .sqrt();
+                    if d < COORD_FAR {
+                        let offset = d - ideal;
+                        let inner = (-0.5 * (offset / model.sigma).powi(2)).exp();
+                        let outer = (-0.5 * (offset / SHELL_WIDTH).powi(2)).exp();
+                        t.shell += (1.0 - inner) * outer;
+                    }
+                }
+            }
+        }
         t
     }
 
@@ -1165,7 +1222,7 @@ impl DockingGrid {
 
     /// Number of metal ions treated with a coordination well.
     pub fn coordinating_ions(&self) -> usize {
-        if self.coordination.is_some() {
+        if self.coordination.is_some() || self.shell.is_some() {
             self.ions.len()
         } else {
             0
@@ -1198,6 +1255,45 @@ impl DockingGrid {
                 {
                     // d bonus / d d = -bonus * offset / width
                     let slope = -bonus * offset / COORD_WIDTH;
+                    gradient[oxygen.index].x += slope * delta[0] / d;
+                    gradient[oxygen.index].y += slope * delta[1] / d;
+                    gradient[oxygen.index].z += slope * delta[2] / d;
+                }
+            }
+        }
+        total
+    }
+
+    /// The first-shell distance well (see [`MetalShell`]) summed over every (ion, ligand oxygen) pair.
+    fn shell_term(&self, positions: &[Vec3], mut gradient: Option<&mut [Vec3]>) -> f64 {
+        let Some(model) = self.shell else {
+            return 0.0;
+        };
+        let mut total = 0.0;
+        for ion in &self.ions {
+            let Some(ideal) = ion.shell_distance else {
+                continue;
+            };
+            for oxygen in &self.oxygens {
+                let q = &positions[oxygen.index];
+                let delta = [q.x - ion.position[0], q.y - ion.position[1], q.z - ion.position[2]];
+                let d = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                if d >= COORD_FAR {
+                    continue;
+                }
+                let offset = d - ideal;
+                // well: 1 - exp(-(offset/sigma)^2 / 2), zero at the ideal distance
+                let inner = (-0.5 * (offset / model.sigma).powi(2)).exp();
+                // membership of the first shell, so a distant oxygen pays nothing
+                let outer = (-0.5 * (offset / SHELL_WIDTH).powi(2)).exp();
+                total += model.weight * (1.0 - inner) * outer;
+                if let Some(gradient) = gradient.as_deref_mut()
+                    && d > 1.0e-6
+                {
+                    // d/d offset of (1 - inner) * outer
+                    let d_inner = inner * offset / (model.sigma * model.sigma);
+                    let d_outer = -outer * offset / (SHELL_WIDTH * SHELL_WIDTH);
+                    let slope = model.weight * (d_inner * outer + (1.0 - inner) * d_outer);
                     gradient[oxygen.index].x += slope * delta[0] / d;
                     gradient[oxygen.index].y += slope * delta[1] / d;
                     gradient[oxygen.index].z += slope * delta[2] / d;

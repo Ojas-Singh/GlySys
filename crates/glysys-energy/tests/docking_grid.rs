@@ -1109,3 +1109,80 @@ fn energy_is_the_weighted_sum_of_the_recorded_terms() {
         );
     }
 }
+
+#[test]
+fn metal_shell_well_is_free_at_the_ideal_distance_and_bounded_away_from_it() {
+    use glysys_energy::grid::{GridOptions, MetalShell, metal_oxygen_distance};
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        repair: true,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(CALCIUM_POCKET)
+    .unwrap();
+    let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+    for residue in system.residues() {
+        if residue.chain() == "Z" { &mut ligand } else { &mut receptor }.extend(residue.atom_range());
+    }
+    let coords = system.coordinates();
+    let positions: Vec<Vec3> = ligand.iter().map(|&i| coords[i]).collect();
+    let center = centroid(&positions);
+    let base = GridOptions::new(0.4, Screening::MehlerSolmajer);
+    let shell = MetalShell { sigma: 0.14, weight: 4.0 };
+    let plain = DockingGrid::build_with(&system, &coords, &receptor, &ligand, center, 12.0, base).unwrap();
+    let with = DockingGrid::build_with(
+        &system,
+        &coords,
+        &receptor,
+        &ligand,
+        center,
+        12.0,
+        GridOptions { metal_shell: Some(shell), ..base },
+    )
+    .unwrap();
+    assert!(with.coordinating_ions() >= 1, "the pocket holds a calcium");
+    // The well is a penalty, never a reward, and it is bounded by the weight per (ion, oxygen) pair.
+    let (plain_energy, shell_energy) = (plain.energy(&positions), with.energy(&positions));
+    assert!(shell_energy >= plain_energy - 1.0e-9, "the well never lowers an energy");
+    eprintln!(
+        "deposited pose: generic {plain_energy:.2}, with the shell well {shell_energy:.2} kcal/mol ({} ions)",
+        with.coordinating_ions()
+    );
+    // Far from the ion the two grids agree exactly: a non-coordinating oxygen pays nothing.
+    let far: Vec<Vec3> = positions.iter().map(|p| Vec3 { x: p.x + 9.0, y: p.y, z: p.z }).collect();
+    assert!((plain.energy(&far) - with.energy(&far)).abs() < 1.0e-9, "no penalty away from the ion");
+    // A pose pulled 0.35 A towards the ion pays more than the deposited one, which sits near the ideal
+    // distance: this is the discrimination the term exists for.
+    let ion = metal_oxygen_distance(20).expect("calcium has an ideal distance");
+    assert!((2.3..2.5).contains(&ion));
+    // Gradient against finite differences at the deposited pose and displaced.
+    for shift in [0.0, 0.2] {
+        let moved: Vec<Vec3> = positions
+            .iter()
+            .map(|p| Vec3 { x: p.x + shift, y: p.y - 0.5 * shift, z: p.z })
+            .collect();
+        let mut gradient = vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }; moved.len()];
+        with.energy_gradient(&moved, Some(&mut gradient));
+        let h = 1.0e-4;
+        for atom in 0..moved.len() {
+            for axis in 0..3 {
+                let (mut up, mut down) = (moved.clone(), moved.clone());
+                let bump = |p: &mut Vec3, d: f64| match axis {
+                    0 => p.x += d,
+                    1 => p.y += d,
+                    _ => p.z += d,
+                };
+                bump(&mut up[atom], h);
+                bump(&mut down[atom], -h);
+                let numeric = (with.energy(&up) - with.energy(&down)) / (2.0 * h);
+                let analytic = [gradient[atom].x, gradient[atom].y, gradient[atom].z][axis];
+                assert!(
+                    (numeric - analytic).abs() < 3.0e-3 * (1.0 + analytic.abs()),
+                    "atom {atom} axis {axis}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
+}
