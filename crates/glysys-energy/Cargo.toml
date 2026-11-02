@@ -9,7 +9,9 @@ repository = "https://github.com/Ojas-Singh/GlySys"
 
 [dependencies]
 glysys = { version = "0.1.2", path = "../.." }
-pulp = "=0.22.3"
+# relaxed-simd off: pulp would compile relaxed-SIMD code into wasm modules (only used after an
+# explicit runtime opt-in), and Safari rejects any module that contains it.
+pulp = { version = "=0.22.3", default-features = false, features = ["std", "x86-v3"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
