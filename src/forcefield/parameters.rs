@@ -34,6 +34,9 @@ pub(crate) struct ParameterSet {
     impropers: Vec<([String; 4], TorsionParameter)>,
     nonbonded: HashMap<String, (f64, f64)>,
     nonbonded_aliases: HashMap<String, String>,
+    /// Torsion lookups already answered, by (improper, the four types joined): a lookup scans every pattern,
+    /// and a system or the template check asks the same few hundred type quadruples thousands of times.
+    torsion_cache: std::sync::Mutex<HashMap<(bool, String), Option<Vec<TorsionParameter>>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,14 +167,37 @@ impl ParameterSet {
     }
 
     pub(crate) fn dihedrals(&self, types: [&str; 4]) -> Result<Vec<TorsionParameter>> {
-        best_torsions(&self.dihedrals, types, false).ok_or_else(|| BuildError::MissingParameter {
-            kind: "dihedral",
-            types: types.join("-"),
-        })
+        self.cached_torsions(types, false)
+            .ok_or_else(|| BuildError::MissingParameter {
+                kind: "dihedral",
+                types: types.join("-"),
+            })
     }
 
     pub(crate) fn improper(&self, types: [&str; 4]) -> Option<Vec<TorsionParameter>> {
-        best_torsions(&self.impropers, types, true)
+        self.cached_torsions(types, true)
+    }
+
+    /// `best_torsions` over the proper or improper patterns, remembered per query (the patterns do not
+    /// change once loaded, so the answer is the same every time).
+    fn cached_torsions(&self, types: [&str; 4], improper: bool) -> Option<Vec<TorsionParameter>> {
+        // atom types never contain a NUL, so it separates them unambiguously
+        let key = (improper, types.join("\0"));
+        let mut cache = self
+            .torsion_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(found) = cache.get(&key) {
+            return found.clone();
+        }
+        let patterns = if improper {
+            &self.impropers
+        } else {
+            &self.dihedrals
+        };
+        let found = best_torsions(patterns, types, improper);
+        cache.insert(key, found.clone());
+        found
     }
 
     fn parse_legacy(&mut self, contents: &str) -> Result<()> {
@@ -244,6 +270,11 @@ impl ParameterSet {
         section: Section,
         lines: impl Iterator<Item = &'a str>,
     ) -> Result<()> {
+        // the patterns may change: forget the answers given so far
+        self.torsion_cache
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         for raw in lines {
             let line = raw.split('!').next().unwrap_or("").trim_end();
             if line.trim().is_empty()
@@ -526,6 +557,53 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].force, 0.7);
         assert_eq!(t[0].scee, 1.2);
+    }
+
+    #[test]
+    fn cached_torsion_lookups_answer_as_the_scan_does() {
+        let parameters = ParameterSet::load().unwrap();
+        let templates = super::super::TemplateSet::load().unwrap();
+        let show = |t: &Option<Vec<TorsionParameter>>| format!("{t:?}");
+        let mut checked = 0;
+        for template in templates.glycans() {
+            let types: Vec<&str> = template
+                .atoms
+                .iter()
+                .map(|a| a.atom_type.as_str())
+                .collect();
+            let mut neighbors = vec![Vec::new(); types.len()];
+            for &[a, b] in &template.bonds {
+                neighbors[a].push(b);
+                neighbors[b].push(a);
+            }
+            for &[second, third] in &template.bonds {
+                for &first in neighbors[second].iter().filter(|&&a| a != third) {
+                    for &fourth in neighbors[third]
+                        .iter()
+                        .filter(|&&a| a != second && a != first)
+                    {
+                        let q = [types[first], types[second], types[third], types[fourth]];
+                        let scan = best_torsions(&parameters.dihedrals, q, false);
+                        // the first lookup fills the cache, the second reads it
+                        assert_eq!(show(&parameters.dihedrals(q).ok()), show(&scan));
+                        assert_eq!(show(&parameters.dihedrals(q).ok()), show(&scan));
+                        checked += 1;
+                    }
+                }
+            }
+            for (centre, bonded) in neighbors.iter().enumerate().filter(|(_, b)| b.len() >= 3) {
+                let q = [
+                    types[bonded[0]],
+                    types[bonded[1]],
+                    types[centre],
+                    types[bonded[2]],
+                ];
+                let scan = best_torsions(&parameters.impropers, q, true);
+                assert_eq!(show(&parameters.improper(q)), show(&scan));
+                assert_eq!(show(&parameters.improper(q)), show(&scan));
+            }
+        }
+        assert!(checked > 1000);
     }
 
     #[test]
