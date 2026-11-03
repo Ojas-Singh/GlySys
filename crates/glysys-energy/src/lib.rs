@@ -340,6 +340,24 @@ impl AtomSelection {
 }
 
 /// Reusable evaluator with immutable topology and configurable movable atoms.
+/// Whether the torsion energy takes its angle from the gradient formulation instead of computing it
+/// again (`GLYSYS_FUSED_TORSION_ANGLE`). Off by default: it changes the last bits of every torsion.
+fn fused_torsion_angle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLYSYS_FUSED_TORSION_ANGLE").is_some())
+}
+
+/// The non-bonded constants of one atom pair: fixed by the two atoms' parameters, so they are
+/// computed once per pair rather than on every energy call.
+#[derive(Clone, Copy)]
+struct PairConstants {
+    scee: f64,
+    scnb: f64,
+    sigma: f64,
+    epsilon: f64,
+    charges: f64,
+}
+
 pub struct EnergyEvaluator<'a> {
     system: std::borrow::Cow<'a, ParameterizedSystem>,
     options: EnergyOptions,
@@ -349,6 +367,11 @@ pub struct EnergyEvaluator<'a> {
     /// The non-bonded pair list of the cutoff-free path, which depends only on the topology.
     /// Rebuilding it per call cost a docking search more than the interactions themselves.
     pairs: std::sync::OnceLock<Vec<(u32, u32, f64, f64)>>,
+    /// The same list for the selected-atoms path without a cutoff, where the visited pairs likewise
+    /// depend only on the topology and the selection (see `active_pair_list`).
+    active_pairs: std::sync::OnceLock<Vec<(u32, u32, f64, f64)>>,
+    /// Per-pair constants of `pairs`, in the same order (see `PairConstants`).
+    pair_constants: std::sync::OnceLock<Vec<PairConstants>>,
 }
 
 struct InteractionKernel<'a> {
@@ -422,6 +445,8 @@ impl<'a> EnergyEvaluator<'a> {
             one_four,
             active_terms_only: false,
             pairs: std::sync::OnceLock::new(),
+            active_pairs: std::sync::OnceLock::new(),
+            pair_constants: std::sync::OnceLock::new(),
         })
     }
 
@@ -435,6 +460,8 @@ impl<'a> EnergyEvaluator<'a> {
             one_four: self.one_four,
             active_terms_only: self.active_terms_only,
             pairs: std::sync::OnceLock::new(),
+            active_pairs: std::sync::OnceLock::new(),
+            pair_constants: std::sync::OnceLock::new(),
         }
     }
 
@@ -482,6 +509,15 @@ impl<'a> EnergyEvaluator<'a> {
         mut visit: impl FnMut(usize, usize, (f64, f64)),
     ) {
         let exclusions = self.system.exclusions();
+        // Without a cutoff the selected-atoms path visits a sequence fixed by the topology and the
+        // selection, yet it was rebuilt, sorted and de-duplicated on every call, with a hash lookup
+        // and an exclusion-set probe per pair. A docking search makes millions of these calls.
+        if self.active_terms_only && self.options.cutoff.is_none() {
+            for &(first, second, scee, scnb) in self.active_pair_list(coordinates.len()) {
+                visit(first as usize, second as usize, (scee, scnb));
+            }
+            return;
+        }
         if self.options.cutoff.is_some() || self.active_terms_only {
             for (first, second) in self.nonbonded_pairs(coordinates) {
                 let scale = self.one_four.get(&ordered(first, second)).copied();
@@ -496,6 +532,79 @@ impl<'a> EnergyEvaluator<'a> {
         for &(first, second, scee, scnb) in self.pair_list(n) {
             visit(first as usize, second as usize, (scee, scnb));
         }
+    }
+
+    /// The non-bonded constants of one pair. They depend only on the two atoms' parameters, yet the
+    /// inner loop recomputed them - including a square root - on every one of the millions of calls
+    /// a docking search makes. Caching them is exact: each value is the same expression over the
+    /// same operands, evaluated once instead of repeatedly.
+    fn constants_of(&self, first: usize, second: usize, scee: f64, scnb: f64) -> PairConstants {
+        let atoms = self.system.atoms();
+        let (a, b) = (&atoms[first], &atoms[second]);
+        PairConstants {
+            scee,
+            scnb,
+            sigma: a.lennard_jones_radius() + b.lennard_jones_radius(),
+            epsilon: (a.lennard_jones_epsilon() * b.lennard_jones_epsilon()).sqrt(),
+            charges: COULOMB_KCAL_ANGSTROM * a.charge() * b.charge(),
+        }
+    }
+
+    /// `for_each_nonbonded_pair` carrying each pair's constants, cached on the cutoff-free path that
+    /// a grid search runs in and computed per pair on the others, so every path sees the same values.
+    fn for_each_nonbonded_pair_with_constants(
+        &self,
+        coordinates: &[Vec3],
+        mut visit: impl FnMut(usize, usize, PairConstants),
+    ) {
+        if !self.active_terms_only && self.options.cutoff.is_none() {
+            let n = coordinates.len();
+            let pairs = self.pair_list(n);
+            let constants = self.pair_constants.get_or_init(|| {
+                pairs
+                    .iter()
+                    .map(|&(first, second, scee, scnb)| {
+                        self.constants_of(first as usize, second as usize, scee, scnb)
+                    })
+                    .collect()
+            });
+            for (&(first, second, _, _), &c) in pairs.iter().zip(constants) {
+                visit(first as usize, second as usize, c);
+            }
+            return;
+        }
+        self.for_each_nonbonded_pair(coordinates, |first, second, (scee, scnb)| {
+            visit(first, second, self.constants_of(first, second, scee, scnb));
+        });
+    }
+
+    /// The pairs the cutoff-free selected-atoms path visits, in its exact order, built once. It
+    /// reproduces `selected_nonbonded_pairs(.., None, selection)` followed by the exclusion filter,
+    /// so the visit sequence - and therefore the order the energies are summed in - is unchanged.
+    fn active_pair_list(&self, n: usize) -> &[(u32, u32, f64, f64)] {
+        self.active_pairs.get_or_init(|| {
+            let exclusions = self.system.exclusions();
+            let mut pairs = Vec::new();
+            for first in self.selection.indices() {
+                for second in 0..n {
+                    if first != second {
+                        pairs.push(ordered(first, second));
+                    }
+                }
+            }
+            pairs.sort_unstable();
+            pairs.dedup();
+            let mut out = Vec::with_capacity(pairs.len());
+            for (first, second) in pairs {
+                let scale = self.one_four.get(&ordered(first, second)).copied();
+                if exclusions[first].contains(&second) && scale.is_none() {
+                    continue;
+                }
+                let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+                out.push((first as u32, second as u32, scee, scnb));
+            }
+            out
+        })
     }
 
     /// The cutoff-free non-bonded pairs with their 1-4 scaling, built once: the topology does not
@@ -672,7 +781,6 @@ impl<'a> EnergyEvaluator<'a> {
         };
         gradient.fill(ZERO);
         let mut result = EnergyComponents::default();
-        let atoms = self.system.atoms();
         for bond in self.system.bonds() {
             let [first, second] = bond.atoms();
             if self.active_terms_only
@@ -727,24 +835,25 @@ impl<'a> EnergyEvaluator<'a> {
         let mut van_der_waals = 0.0;
         let mut electrostatics = 0.0;
         let pair_gradient = &mut *gradient;
-        self.for_each_nonbonded_pair(coordinates, |first, second, (scee, scnb)| {
+        self.for_each_nonbonded_pair_with_constants(coordinates, |first, second, c| {
             let vector = subtract(coordinates[first], coordinates[second]);
             let radius = norm(vector).max(1.0e-8);
-            let first_atom = &atoms[first];
-            let second_atom = &atoms[second];
-            let sigma = first_atom.lennard_jones_radius() + second_atom.lennard_jones_radius();
-            let epsilon =
-                (first_atom.lennard_jones_epsilon() * second_atom.lennard_jones_epsilon()).sqrt();
-            let ratio6 = (sigma / radius).powi(6);
-            van_der_waals += epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / scnb;
-            let charges = COULOMB_KCAL_ANGSTROM * first_atom.charge() * second_atom.charge();
-            electrostatics += charges / (dielectric * radius * scee);
+            let ratio6 = (c.sigma / radius).powi(6);
+            van_der_waals += c.epsilon * (ratio6 * ratio6 - 2.0 * ratio6) / c.scnb;
+            // With a neutral subsystem - what a grid search scores the glycan with - every charge is
+            // zero, so the three divisions below produce nothing. Adding or subtracting an exact zero
+            // leaves a finite value unchanged, so skipping them is exact, not an approximation.
+            if c.charges != 0.0 {
+                electrostatics += c.charges / (dielectric * radius * c.scee);
+            }
             if active_only && !selection.is_movable(first) && !selection.is_movable(second) {
                 return;
             }
-            let coulomb = charges / (dielectric * scee * radius);
-            let derivative =
-                12.0 * epsilon * (ratio6 - ratio6 * ratio6) / (scnb * radius) - coulomb / radius;
+            let mut derivative = 12.0 * c.epsilon * (ratio6 - ratio6 * ratio6) / (c.scnb * radius);
+            if c.charges != 0.0 {
+                let coulomb = c.charges / (dielectric * c.scee * radius);
+                derivative -= coulomb / radius;
+            }
             add_scaled(&mut pair_gradient[first], vector, derivative / radius);
             add_scaled(&mut pair_gradient[second], vector, -derivative / radius);
         });
@@ -779,21 +888,29 @@ impl<'a> EnergyEvaluator<'a> {
                     continue;
                 }
                 let periodicity = torsion.periodicity() as f64;
-                let phi = dihedral(
-                    coordinates[quad[0]],
-                    coordinates[quad[1]],
-                    coordinates[quad[2]],
-                    coordinates[quad[3]],
-                );
+                let points = quad.map(|atom| coordinates[atom]);
+                let (grad_phi, phi_gradient) =
+                    pbc::dihedral_with_gradient(points[0], points[1], points[2], points[3]);
+                // The angle for the energy is computed a second time, by a different formulation
+                // that agrees with the gradient's to about one unit in the last place. Taking it
+                // from the gradient instead halves the torsion cost but moves those last bits, so
+                // it is opt-in and carries its own accuracy evidence (ADVISOR_LOG Log 31).
+                let phi = if fused_torsion_angle() {
+                    grad_phi
+                } else {
+                    dihedral(
+                        coordinates[quad[0]],
+                        coordinates[quad[1]],
+                        coordinates[quad[2]],
+                        coordinates[quad[3]],
+                    )
+                };
                 let energy = torsion.force() * (1.0 + (periodicity * phi - torsion.phase()).cos());
                 if torsion.is_improper() {
                     result.improper_torsions += energy;
                 } else {
                     result.proper_torsions += energy;
                 }
-                let points = quad.map(|atom| coordinates[atom]);
-                let (grad_phi, phi_gradient) =
-                    pbc::dihedral_with_gradient(points[0], points[1], points[2], points[3]);
                 let derivative = -torsion.force()
                     * periodicity
                     * (periodicity * grad_phi - torsion.phase()).sin();
@@ -2088,5 +2205,47 @@ mod tests {
         }
         assert!((simd.van_der_waals - scalar.van_der_waals).abs() < 1.0e-10);
         assert!((simd.electrostatics - scalar.electrostatics).abs() < 1.0e-10);
+    }
+
+    /// The cached selected-atoms pair list must reproduce, exactly and in order, the sequence the
+    /// uncached path visited: the non-bonded energies are summed in that order, so a different
+    /// sequence would move the last bits of the result.
+    #[test]
+    fn cached_active_pairs_match_the_uncached_sequence() {
+        let system = system();
+        let coordinates = system.coordinates();
+        let n = coordinates.len();
+        let evaluator = EnergyEvaluator::new(
+            &system,
+            EnergyOptions {
+                cutoff: None,
+                ..EnergyOptions::default()
+            },
+        )
+        .unwrap()
+        .with_active_terms(AtomSelection::from_indices(n, (0..n).step_by(3)))
+        .unwrap();
+
+        // the sequence the old path produced: selected_nonbonded_pairs(.., None, ..) then the filter
+        let exclusions = evaluator.system.exclusions();
+        let mut expected = Vec::new();
+        for (first, second) in selected_nonbonded_pairs(&coordinates, None, &evaluator.selection) {
+            let scale = evaluator.one_four.get(&ordered(first, second)).copied();
+            if exclusions[first].contains(&second) && scale.is_none() {
+                continue;
+            }
+            let (scee, scnb) = scale.unwrap_or((1.0, 1.0));
+            expected.push((first as u32, second as u32, scee, scnb));
+        }
+
+        assert!(!expected.is_empty(), "the fixture must produce pairs");
+        assert_eq!(evaluator.active_pair_list(n), expected.as_slice());
+
+        // and the visited sequence through the public entry point agrees too
+        let mut visited = Vec::new();
+        evaluator.for_each_nonbonded_pair(&coordinates, |first, second, (scee, scnb)| {
+            visited.push((first as u32, second as u32, scee, scnb));
+        });
+        assert_eq!(visited, expected);
     }
 }
