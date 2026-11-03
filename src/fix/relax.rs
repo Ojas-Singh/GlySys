@@ -163,7 +163,11 @@ pub(crate) fn build_model(
                     .get(&(residue_index, atom.name.as_str()))
                     .map(|&site| (index, site))
             })
-            .collect::<HashMap<_, _>>();
+            // A BTreeMap, not a HashMap: the restraints below are pushed in this map's iteration
+            // order and summed in that order during relaxation. A HashMap's order is randomised per
+            // process, so the relaxed coordinates - and every energy computed on them - differed from
+            // run to run whenever a residue had atoms to relax.
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut adjacency = vec![Vec::new(); template.atoms.len()];
         for &[a, b] in &template.bonds {
             if template.atoms[a].element != 1 && template.atoms[b].element != 1 {
