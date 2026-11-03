@@ -110,6 +110,10 @@ pub const CONTACT_KINDS: [&str; 4] = ["hydrophobic", "cation", "carboxylate", "o
 const CONTACT_SHAPES: [(f64, f64); 4] = [(4.0, 0.5), (3.0, 0.35), (2.7, 0.3), (4.0, 0.6)];
 
 /// A sum of Gaussians around `sources` on the grid (zero beyond `distance + 4 width`).
+///
+/// Filled row by row with the sources as the outer loop, so that a row only visits the points within reach
+/// of each source; every point still adds its sources' terms one at a time in source order, so the sums are
+/// those of the point-by-point loop to the last bit (see [`tabulate_row`]).
 fn gaussian_field(
     sources: &[[f64; 3]],
     distance: f64,
@@ -125,27 +129,55 @@ fn gaussian_field(
         .par_chunks_mut(n * n)
         .enumerate()
         .for_each(|(x, chunk)| {
+            let mut sum = vec![0.0f64; n];
+            let mut pz = vec![0.0f64; n];
+            for (z, p) in pz.iter_mut().enumerate() {
+                *p = origin[2] + z as f64 * spacing;
+            }
             for y in 0..n {
+                let p0 = origin[0] + x as f64 * spacing;
+                let p1 = origin[1] + y as f64 * spacing;
+                gaussian_row(sources, p0, p1, &pz, distance, width, reach2, &mut sum);
                 for z in 0..n {
-                    let p = [
-                        origin[0] + x as f64 * spacing,
-                        origin[1] + y as f64 * spacing,
-                        origin[2] + z as f64 * spacing,
-                    ];
-                    let mut sum = 0.0;
-                    for q in sources {
-                        let d2 =
-                            (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
-                        if d2 < reach2 {
-                            let u = (d2.sqrt() - distance) / width;
-                            sum += (-0.5 * u * u).exp();
-                        }
-                    }
-                    chunk[y * n + z] = sum as f32;
+                    chunk[y * n + z] = sum[z] as f32;
                 }
             }
         });
     field
+}
+
+/// One row of [`gaussian_field`] (x and y fixed at `p0` and `p1`, z at `pz`) into `sum`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_row(
+    sources: &[[f64; 3]],
+    p0: f64,
+    p1: f64,
+    pz: &[f64],
+    distance: f64,
+    width: f64,
+    reach2: f64,
+    sum: &mut [f64],
+) {
+    sum.iter_mut().for_each(|v| *v = 0.0);
+    for q in sources {
+        let dxy = (p0 - q[0]).powi(2) + (p1 - q[1]).powi(2);
+        if dxy >= reach2 {
+            continue;
+        }
+        // the points within reach are one run of the row: the squared distance only grows away from q along z
+        let Some(lo) = pz.iter().position(|&z| dxy + (z - q[2]).powi(2) < reach2) else {
+            continue;
+        };
+        for z in lo..pz.len() {
+            let d2 = dxy + (pz[z] - q[2]).powi(2);
+            if d2 >= reach2 {
+                break;
+            }
+            let u = (d2.sqrt() - distance) / width;
+            sum[z] += (-0.5 * u * u).exp();
+        }
+    }
 }
 
 /// The interaction terms of a pose at unit weight (see [`DockingGrid::terms`]): the energy is
@@ -421,6 +453,115 @@ struct PolarField {
     ligand: Vec<bool>,
 }
 
+/// Spacing of the screened Coulomb table of the receptor potential, angstrom.
+const TABLE_STEP: f64 = 0.01;
+
+/// The receptor sources of a grid build, laid out for [`tabulate_row`].
+struct SourceTables<'a> {
+    positions: &'a [[f64; 3]],
+    floors: &'a [f64],
+    charges: &'a [f64],
+    /// Per (source, class), source-major: sigma^6 of the pair, and its well depth times sigma^6.
+    sigma6: &'a [f64],
+    depth_sigma6: &'a [f64],
+    screened: &'a [f64],
+    class_count: usize,
+}
+
+/// One grid row's accumulators and per-source buffers.
+struct RowScratch {
+    /// Coulomb potential per point.
+    phi: Vec<f64>,
+    /// Van der Waals energy per (class, point), class-major.
+    well: Vec<f64>,
+    /// Per point, for the source being added: squared distance and floored distance.
+    d2: Vec<f64>,
+    r: Vec<f64>,
+    /// Table position of the floored distance.
+    at: Vec<f64>,
+    /// The z coordinate of each point.
+    pz: Vec<f64>,
+}
+
+impl RowScratch {
+    fn new(n: usize, class_count: usize) -> Self {
+        Self {
+            phi: vec![0.0; n],
+            well: vec![0.0; n * class_count],
+            d2: vec![0.0; n],
+            r: vec![0.0; n],
+            at: vec![0.0; n],
+            pz: vec![0.0; n],
+        }
+    }
+}
+
+/// The receptor's Coulomb potential and per-class van der Waals energy at every point of one grid row
+/// (x and y fixed at `p0` and `p1`, z from `z0` in steps of `spacing`), into `row.phi` and `row.well`.
+///
+/// The sources are the outer loop and the points the inner one, but every point still receives its terms
+/// one source at a time in source order with the arithmetic of the point-by-point loop it replaces, so each
+/// sum is the same to the last bit: the squared distance is `(dx^2 + dy^2) + dz^2` as before, with the
+/// first sum shared by the row; the pair term is `((depth * sigma^6) * r^-6) * (sigma^6 r^-6 - 2)` with its
+/// first product tabulated. Points beyond the van der Waals cutoff of a source get no term from it, as
+/// before; they form the two ends of the row, because the squared distance only grows away from the
+/// source along z.
+#[inline(never)]
+fn tabulate_row(t: &SourceTables, p0: f64, p1: f64, z0: f64, spacing: f64, row: &mut RowScratch) {
+    let n = row.phi.len();
+    let cutoff2 = VDW_CUTOFF * VDW_CUTOFF;
+    let class_count = t.class_count;
+    for (z, pz) in row.pz.iter_mut().enumerate() {
+        *pz = z0 + z as f64 * spacing;
+    }
+    row.phi.iter_mut().for_each(|v| *v = 0.0);
+    row.well.iter_mut().for_each(|v| *v = 0.0);
+    for (j, q) in t.positions.iter().enumerate() {
+        let dxy = (p0 - q[0]).powi(2) + (p1 - q[1]).powi(2);
+        let floor = t.floors[j];
+        let charge = t.charges[j];
+        for z in 0..n {
+            let d2 = dxy + (row.pz[z] - q[2]).powi(2);
+            row.d2[z] = d2;
+            let r = d2.sqrt().max(MIN_DISTANCE);
+            row.r[z] = r;
+            row.at[z] = r.max(floor) / TABLE_STEP;
+        }
+        for z in 0..n {
+            let at = row.at[z];
+            let (i, f) = (at as usize, at - (at as usize) as f64);
+            row.phi[z] += charge * (t.screened[i] * (1.0 - f) + t.screened[i + 1] * f);
+        }
+        if dxy >= cutoff2 {
+            continue;
+        }
+        let Some(lo) = row.d2.iter().position(|&d2| d2 < cutoff2) else {
+            continue;
+        };
+        let hi = n - row
+            .d2
+            .iter()
+            .rev()
+            .position(|&d2| d2 < cutoff2)
+            .unwrap_or(0);
+        let sigma6 = &t.sigma6[j * class_count..(j + 1) * class_count];
+        let depth_sigma6 = &t.depth_sigma6[j * class_count..(j + 1) * class_count];
+        // r^-6 per point, in `d2` (no longer needed)
+        for z in lo..hi {
+            let r = row.r[z];
+            row.d2[z] = 1.0 / (r * r).powi(3);
+        }
+        let inv6 = &row.d2[lo..hi];
+        for k in 0..class_count {
+            let (sig6, a) = (sigma6[k], depth_sigma6[k]);
+            let well = &mut row.well[k * n + lo..k * n + hi];
+            for (w, &inv6) in well.iter_mut().zip(inv6) {
+                *w += a * inv6 * (sig6 * inv6 - 2.0);
+            }
+        }
+    }
+}
+
 /// A trilinear interpolant's value and gradient (per angstrom).
 fn trilinear(
     grid: &[f32],
@@ -482,13 +623,45 @@ impl DockingGrid {
         half_width: f64,
         options: GridOptions,
     ) -> Result<Self> {
+        let mut grids = Self::build_with_lj_caps(
+            system,
+            coordinates,
+            receptor,
+            ligand,
+            center,
+            half_width,
+            options,
+            &[options.lj_cap],
+        )?;
+        Ok(grids.swap_remove(0))
+    }
+
+    /// One grid per entry of `lj_caps`, each the grid [`DockingGrid::build_with`] builds from `options` with
+    /// that `lj_cap` (`options.lj_cap` itself is not used), to the last bit, from a single pass over the
+    /// receptor: the ceiling is applied to each tabulated van der Waals energy only after its sum is complete,
+    /// so the sums, the potential and every other field are shared. A search and its polish without the soft
+    /// wall thus cost one tabulation instead of two.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_lj_caps(
+        system: &ParameterizedSystem,
+        coordinates: &[Vec3],
+        receptor: &[usize],
+        ligand: &[usize],
+        center: Vec3,
+        half_width: f64,
+        options: GridOptions,
+        lj_caps: &[Option<f64>],
+    ) -> Result<Vec<Self>> {
+        if lj_caps.is_empty() {
+            return Ok(Vec::new());
+        }
         let GridOptions {
             spacing,
             screening,
             flexible_hydroxyls,
             temperature,
             metal_coordination,
-            lj_cap,
+            lj_cap: _,
             polar_reward,
             extra_sources,
             coulomb_floor,
@@ -497,7 +670,10 @@ impl DockingGrid {
             term_weights,
             contact_depths,
         } = options;
-        let lj_ceiling = lj_cap.map_or(CAP, |c| c.min(CAP));
+        let lj_ceilings: Vec<f64> = lj_caps
+            .iter()
+            .map(|cap| cap.map_or(CAP, |c| c.min(CAP)))
+            .collect();
         if spacing <= 0.0 || half_width <= spacing || coordinates.len() != system.atom_count() {
             return Err(EnergyError::InvalidConfiguration(
                 "grid needs a positive spacing, a larger half-width and one coordinate per atom"
@@ -637,21 +813,23 @@ impl DockingGrid {
         let positions: Vec<[f64; 3]> = sources.iter().map(|s| s.0).collect();
         // Charge per source with the Coulomb constant folded in.
         let charges: Vec<f64> = sources.iter().map(|s| COULOMB * s.1).collect();
-        // Per (class, source): the well depth and sigma^6 of the pair, so the
-        // inner loop is a few multiply-adds.
-        let mut well_depth = vec![0.0f64; classes.len() * source_count];
-        let mut sigma6 = vec![0.0f64; classes.len() * source_count];
+        // Per (source, class): sigma^6 of the pair and its well depth times sigma^6 (the first product
+        // of the pair term, so the row loop does the remaining multiplications in the same order).
+        let class_count = classes.len();
+        let mut sigma6 = vec![0.0f64; class_count * source_count];
+        let mut depth_sigma6 = vec![0.0f64; class_count * source_count];
         for (k, class) in classes.iter().enumerate() {
             for (j, source) in sources.iter().enumerate() {
-                well_depth[k * source_count + j] = (class.1 * source.3).sqrt();
+                let well_depth = (class.1 * source.3).sqrt();
                 let contact = (metal_oxygen_contact && class_oxygen[k] && j < receptor.len())
                     .then(|| metal_oxygen_distance(atoms[receptor[j]].element()))
                     .flatten();
-                sigma6[k * source_count + j] = contact.unwrap_or(class.0 + source.2).powi(6);
+                let sig6 = contact.unwrap_or(class.0 + source.2).powi(6);
+                sigma6[j * class_count + k] = sig6;
+                depth_sigma6[j * class_count + k] = well_depth * sig6;
             }
         }
         // 1 / (eps(r) r) on a fine table; the sigmoid is too costly per pair.
-        const TABLE_STEP: f64 = 0.01;
         let table_len = (400.0 / TABLE_STEP) as usize + 2;
         let screened: Vec<f64> = (0..table_len)
             .map(|i| {
@@ -661,56 +839,45 @@ impl DockingGrid {
             .collect();
 
         let total = n * n * n;
-        let mut vdw = vec![vec![0.0f32; total]; classes.len()];
+        // per variant, one van der Waals grid per class
+        let mut vdw = vec![vec![vec![0.0f32; total]; class_count]; lj_ceilings.len()];
         let mut potential = vec![0.0f32; total];
-        // One x-slab per task; each fills its slice of every grid.
+        // One x-slab per task; each fills its slice of every grid (variant-major, then class).
         let slab = n * n;
         let mut vdw_slabs: Vec<Vec<&mut [f32]>> = (0..n).map(|_| Vec::new()).collect();
-        for grid in &mut vdw {
+        for grid in vdw.iter_mut().flatten() {
             for (x, chunk) in grid.chunks_mut(slab).enumerate() {
                 vdw_slabs[x].push(chunk);
             }
         }
-        let cutoff2 = VDW_CUTOFF * VDW_CUTOFF;
-        let class_count = classes.len();
+        let tables = SourceTables {
+            positions: &positions,
+            floors: &floors,
+            charges: &charges,
+            sigma6: &sigma6,
+            depth_sigma6: &depth_sigma6,
+            screened: &screened,
+            class_count,
+        };
         potential
             .par_chunks_mut(slab)
             .zip(vdw_slabs.into_par_iter())
             .enumerate()
             .for_each(|(x, (potential_slab, mut vdw_slab))| {
-                let mut well = vec![0.0f64; class_count];
+                let mut row = RowScratch::new(n, class_count);
                 for y in 0..n {
+                    let p0 = origin[0] + x as f64 * spacing;
+                    let p1 = origin[1] + y as f64 * spacing;
+                    tabulate_row(&tables, p0, p1, origin[2], spacing, &mut row);
                     for z in 0..n {
-                        let p = [
-                            origin[0] + x as f64 * spacing,
-                            origin[1] + y as f64 * spacing,
-                            origin[2] + z as f64 * spacing,
-                        ];
-                        well.iter_mut().for_each(|w| *w = 0.0);
-                        let mut phi = 0.0;
-                        for (j, q) in positions.iter().enumerate() {
-                            let d2 = (p[0] - q[0]).powi(2)
-                                + (p[1] - q[1]).powi(2)
-                                + (p[2] - q[2]).powi(2);
-                            let r = d2.sqrt().max(MIN_DISTANCE);
-                            let at = r.max(floors[j]) / TABLE_STEP;
-                            let (i, f) = (at as usize, at - (at as usize) as f64);
-                            phi += charges[j] * (screened[i] * (1.0 - f) + screened[i + 1] * f);
-                            if d2 < cutoff2 {
-                                let inv6 = 1.0 / (r * r).powi(3);
-                                for k in 0..class_count {
-                                    let sig6 = sigma6[k * source_count + j];
-                                    well[k] += well_depth[k * source_count + j]
-                                        * sig6
-                                        * inv6
-                                        * (sig6 * inv6 - 2.0);
-                                }
-                            }
-                        }
                         let at = y * n + z;
-                        potential_slab[at] = phi.clamp(-CAP, CAP) as f32;
-                        for (k, slab_k) in vdw_slab.iter_mut().enumerate() {
-                            slab_k[at] = (well[k].min(lj_ceiling) / VDW_SCALE).asinh() as f32;
+                        potential_slab[at] = row.phi[z].clamp(-CAP, CAP) as f32;
+                        for (v, &lj_ceiling) in lj_ceilings.iter().enumerate() {
+                            for k in 0..class_count {
+                                vdw_slab[v * class_count + k][at] =
+                                    (row.well[k * n + z].min(lj_ceiling) / VDW_SCALE).asinh()
+                                        as f32;
+                            }
                         }
                     }
                 }
@@ -761,33 +928,7 @@ impl DockingGrid {
                 .map(|&j| [coordinates[j].x, coordinates[j].y, coordinates[j].z])
                 .chain(extra_sources.iter().filter(|e| e.polar).map(|e| e.position))
                 .collect();
-            let reach = reward.distance + 4.0 * reward.width;
-            let reach2 = reach * reach;
-            let mut field = vec![0.0f32; total];
-            field
-                .par_chunks_mut(slab)
-                .enumerate()
-                .for_each(|(x, chunk)| {
-                    for y in 0..n {
-                        for z in 0..n {
-                            let p = [
-                                origin[0] + x as f64 * spacing,
-                                origin[1] + y as f64 * spacing,
-                                origin[2] + z as f64 * spacing,
-                            ];
-                            let mut sum = 0.0;
-                            for q in &sources {
-                                let (dx, dy, dz) = (p[0] - q[0], p[1] - q[1], p[2] - q[2]);
-                                let d2 = dx * dx + dy * dy + dz * dz;
-                                if d2 < reach2 {
-                                    let u = (d2.sqrt() - reward.distance) / reward.width;
-                                    sum += (-0.5 * u * u).exp();
-                                }
-                            }
-                            chunk[y * n + z] = sum as f32;
-                        }
-                    }
-                });
+            let field = gaussian_field(&sources, reward.distance, reward.width, origin, spacing, n);
             PolarField {
                 reward,
                 field,
@@ -939,12 +1080,12 @@ impl DockingGrid {
         } else {
             (Vec::new(), Vec::new())
         };
-        Ok(Self {
+        let shared = Self {
             origin,
             spacing,
             dims,
             classes,
-            vdw,
+            vdw: Vec::new(),
             potential,
             ligand_class,
             ligand_charge: ligand.iter().map(|&i| atoms[i].charge()).collect(),
@@ -964,7 +1105,18 @@ impl DockingGrid {
             ch_pi,
             term_weights,
             contacts,
-        })
+        };
+        let mut grids: Vec<Self> = Vec::with_capacity(vdw.len());
+        let mut variants = vdw.into_iter();
+        let last = variants.next_back();
+        for vdw in variants {
+            grids.push(Self {
+                vdw,
+                ..shared.clone()
+            });
+        }
+        grids.extend(last.map(|vdw| Self { vdw, ..shared }));
+        Ok(grids)
     }
 
     pub fn screening(&self) -> Screening {
@@ -1450,6 +1602,358 @@ impl ScreenedInternal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glysys::{BuildOptions, SystemBuilder};
+
+    /// The point-by-point tabulation the row loop replaced, kept verbatim as the reference: the van der
+    /// Waals grids (one per class, under `lj_ceiling`) and the potential.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_tables(
+        system: &ParameterizedSystem,
+        coordinates: &[Vec3],
+        receptor: &[usize],
+        ligand: &[usize],
+        origin: [f64; 3],
+        n: usize,
+        spacing: f64,
+        screening: Screening,
+        lj_ceiling: f64,
+        coulomb_floor: Option<CoulombFloor>,
+        metal_oxygen_contact: bool,
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let atoms = system.atoms();
+        let mut classes: Vec<(f64, f64)> = Vec::new();
+        let mut ligand_class = Vec::new();
+        for &i in ligand {
+            let key = (
+                atoms[i].lennard_jones_radius(),
+                atoms[i].lennard_jones_epsilon(),
+            );
+            let class = classes
+                .iter()
+                .position(|c| (c.0 - key.0).abs() < 1.0e-9 && (c.1 - key.1).abs() < 1.0e-9)
+                .unwrap_or_else(|| {
+                    classes.push(key);
+                    classes.len() - 1
+                });
+            ligand_class.push(class);
+        }
+        let mut class_oxygen = vec![true; classes.len()];
+        for (&i, &class) in ligand.iter().zip(&ligand_class) {
+            class_oxygen[class] &= atoms[i].element() == 8;
+        }
+        let sources: Vec<([f64; 3], f64, f64, f64)> = receptor
+            .iter()
+            .map(|&j| {
+                let c = coordinates[j];
+                (
+                    [c.x, c.y, c.z],
+                    atoms[j].charge(),
+                    atoms[j].lennard_jones_radius(),
+                    atoms[j].lennard_jones_epsilon(),
+                )
+            })
+            .collect();
+        let source_count = sources.len();
+        let floors: Vec<f64> = (0..source_count)
+            .map(|j| match coulomb_floor {
+                None => MIN_DISTANCE,
+                Some(floor) => {
+                    let metal = METALS.contains(&atoms[receptor[j]].element());
+                    (if metal { floor.metal } else { floor.general }).max(MIN_DISTANCE)
+                }
+            })
+            .collect();
+        let positions: Vec<[f64; 3]> = sources.iter().map(|s| s.0).collect();
+        let charges: Vec<f64> = sources.iter().map(|s| COULOMB * s.1).collect();
+        let mut well_depth = vec![0.0f64; classes.len() * source_count];
+        let mut sigma6 = vec![0.0f64; classes.len() * source_count];
+        for (k, class) in classes.iter().enumerate() {
+            for (j, source) in sources.iter().enumerate() {
+                well_depth[k * source_count + j] = (class.1 * source.3).sqrt();
+                let contact = (metal_oxygen_contact && class_oxygen[k])
+                    .then(|| metal_oxygen_distance(atoms[receptor[j]].element()))
+                    .flatten();
+                sigma6[k * source_count + j] = contact.unwrap_or(class.0 + source.2).powi(6);
+            }
+        }
+        let table_len = (400.0 / TABLE_STEP) as usize + 2;
+        let screened: Vec<f64> = (0..table_len)
+            .map(|i| {
+                let r = (i as f64 * TABLE_STEP).max(MIN_DISTANCE);
+                1.0 / (screening.permittivity(r) * r)
+            })
+            .collect();
+        let total = n * n * n;
+        let mut vdw = vec![vec![0.0f32; total]; classes.len()];
+        let mut potential = vec![0.0f32; total];
+        let cutoff2 = VDW_CUTOFF * VDW_CUTOFF;
+        let class_count = classes.len();
+        let mut well = vec![0.0f64; class_count];
+        // the row loop on the same sources, compared sum by sum in f64 (the f32 tables would hide a last-bit
+        // difference in most sums)
+        let mut sigma6_t = vec![0.0f64; class_count * source_count];
+        let mut depth_sigma6_t = vec![0.0f64; class_count * source_count];
+        for k in 0..class_count {
+            for j in 0..source_count {
+                sigma6_t[j * class_count + k] = sigma6[k * source_count + j];
+                depth_sigma6_t[j * class_count + k] =
+                    well_depth[k * source_count + j] * sigma6[k * source_count + j];
+            }
+        }
+        let tables = SourceTables {
+            positions: &positions,
+            floors: &floors,
+            charges: &charges,
+            sigma6: &sigma6_t,
+            depth_sigma6: &depth_sigma6_t,
+            screened: &screened,
+            class_count,
+        };
+        let mut row = RowScratch::new(n, class_count);
+        for x in 0..n {
+            for y in 0..n {
+                tabulate_row(
+                    &tables,
+                    origin[0] + x as f64 * spacing,
+                    origin[1] + y as f64 * spacing,
+                    origin[2],
+                    spacing,
+                    &mut row,
+                );
+                for z in 0..n {
+                    let p = [
+                        origin[0] + x as f64 * spacing,
+                        origin[1] + y as f64 * spacing,
+                        origin[2] + z as f64 * spacing,
+                    ];
+                    well.iter_mut().for_each(|w| *w = 0.0);
+                    let mut phi = 0.0;
+                    for (j, q) in positions.iter().enumerate() {
+                        let d2 =
+                            (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                        let r = d2.sqrt().max(MIN_DISTANCE);
+                        let at = r.max(floors[j]) / TABLE_STEP;
+                        let (i, f) = (at as usize, at - (at as usize) as f64);
+                        phi += charges[j] * (screened[i] * (1.0 - f) + screened[i + 1] * f);
+                        if d2 < cutoff2 {
+                            let inv6 = 1.0 / (r * r).powi(3);
+                            for k in 0..class_count {
+                                let sig6 = sigma6[k * source_count + j];
+                                well[k] += well_depth[k * source_count + j]
+                                    * sig6
+                                    * inv6
+                                    * (sig6 * inv6 - 2.0);
+                            }
+                        }
+                    }
+                    assert_eq!(phi.to_bits(), row.phi[z].to_bits());
+                    for (k, w) in well.iter().enumerate() {
+                        assert_eq!(w.to_bits(), row.well[k * n + z].to_bits());
+                    }
+                    let at = (x * n + y) * n + z;
+                    potential[at] = phi.clamp(-CAP, CAP) as f32;
+                    for (k, grid) in vdw.iter_mut().enumerate() {
+                        grid[at] = (well[k].min(lj_ceiling) / VDW_SCALE).asinh() as f32;
+                    }
+                }
+            }
+        }
+        (vdw, potential)
+    }
+
+    /// The point-by-point Gaussian field the row loop replaced, verbatim (the polar field's form, whose
+    /// squared distance is written `dx * dx + ...`; the contact fields' `powi(2)` is the same product).
+    fn reference_gaussian(
+        sources: &[[f64; 3]],
+        distance: f64,
+        width: f64,
+        origin: [f64; 3],
+        spacing: f64,
+        n: usize,
+    ) -> Vec<f32> {
+        let reach = distance + 4.0 * width;
+        let reach2 = reach * reach;
+        let mut field = vec![0.0f32; n * n * n];
+        let pz: Vec<f64> = (0..n).map(|z| origin[2] + z as f64 * spacing).collect();
+        let mut row = vec![0.0f64; n];
+        for x in 0..n {
+            for y in 0..n {
+                gaussian_row(
+                    sources,
+                    origin[0] + x as f64 * spacing,
+                    origin[1] + y as f64 * spacing,
+                    &pz,
+                    distance,
+                    width,
+                    reach2,
+                    &mut row,
+                );
+                for z in 0..n {
+                    let p = [
+                        origin[0] + x as f64 * spacing,
+                        origin[1] + y as f64 * spacing,
+                        origin[2] + z as f64 * spacing,
+                    ];
+                    let mut sum = 0.0;
+                    for q in sources {
+                        let (dx, dy, dz) = (p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+                        let d2 = dx * dx + dy * dy + dz * dz;
+                        if d2 < reach2 {
+                            let u = (d2.sqrt() - distance) / width;
+                            sum += (-0.5 * u * u).exp();
+                        }
+                    }
+                    assert_eq!(sum.to_bits(), row[z].to_bits());
+                    field[(x * n + y) * n + z] = sum as f32;
+                }
+            }
+        }
+        field
+    }
+
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// Both pocket fixtures (the second holds a calcium, for the metal floor and contact distance),
+    /// prepared, with the ligand (chain Z) and receptor atoms.
+    fn pockets() -> Vec<(ParameterizedSystem, Vec<usize>, Vec<usize>)> {
+        [
+            include_str!("../../../tests/fixtures/galectin_lactose_pocket10.pdb"),
+            include_str!("../../../tests/fixtures/ctype_ca_pocket9.pdb"),
+        ]
+        .into_iter()
+        .map(|pdb| {
+            let system = SystemBuilder::new(BuildOptions {
+                add_water: false,
+                add_ions: false,
+                repair: true,
+                ..BuildOptions::default()
+            })
+            .unwrap()
+            .prepare_pdb_str(pdb)
+            .unwrap();
+            let (mut ligand, mut receptor) = (Vec::new(), Vec::new());
+            for residue in system.residues() {
+                if residue.chain() == "Z" {
+                    &mut ligand
+                } else {
+                    &mut receptor
+                }
+                .extend(residue.atom_range());
+            }
+            (system, ligand, receptor)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn row_tabulation_matches_the_point_by_point_loop_bit_for_bit() {
+        for (system, ligand, receptor) in pockets() {
+            let coords = system.coordinates();
+            let n_lig = ligand.len() as f64;
+            let center = Vec3 {
+                x: ligand.iter().map(|&i| coords[i].x).sum::<f64>() / n_lig,
+                y: ligand.iter().map(|&i| coords[i].y).sum::<f64>() / n_lig,
+                z: ligand.iter().map(|&i| coords[i].z).sum::<f64>() / n_lig,
+            };
+            let (half_width, spacing) = (6.0, 0.4);
+            let floor = CoulombFloor {
+                general: 1.5,
+                metal: 2.2,
+            };
+            let polar = PolarReward {
+                depth: 1.0,
+                distance: 2.85,
+                width: 0.35,
+            };
+            let caps = [Some(3.0), None, Some(2000.0)];
+            for (coulomb_floor, metal_oxygen_contact) in [(None, false), (Some(floor), true)] {
+                let options = GridOptions {
+                    coulomb_floor,
+                    metal_oxygen_contact,
+                    polar_reward: Some(polar),
+                    contact_depths: Some([1.0; 4]),
+                    ..GridOptions::new(spacing, Screening::MehlerSolmajer)
+                };
+                let grids = DockingGrid::build_with_lj_caps(
+                    &system, &coords, &receptor, &ligand, center, half_width, options, &caps,
+                )
+                .unwrap();
+                assert_eq!(grids.len(), caps.len());
+                let n = grids[0].dims[0];
+                let origin = grids[0].origin;
+                for (grid, cap) in grids.iter().zip(caps) {
+                    let ceiling = cap.map_or(CAP, |c| c.min(CAP));
+                    let (vdw, potential) = reference_tables(
+                        &system,
+                        &coords,
+                        &receptor,
+                        &ligand,
+                        origin,
+                        n,
+                        spacing,
+                        Screening::MehlerSolmajer,
+                        ceiling,
+                        coulomb_floor,
+                        metal_oxygen_contact,
+                    );
+                    assert!(same_bits(&grid.potential, &potential));
+                    assert_eq!(grid.vdw.len(), vdw.len());
+                    for (a, b) in grid.vdw.iter().zip(&vdw) {
+                        assert!(same_bits(a, b));
+                    }
+                    // the single-ceiling build is the same grid
+                    let single = DockingGrid::build_with(
+                        &system,
+                        &coords,
+                        &receptor,
+                        &ligand,
+                        center,
+                        half_width,
+                        GridOptions {
+                            lj_cap: cap,
+                            ..options
+                        },
+                    )
+                    .unwrap();
+                    assert!(same_bits(&single.potential, &potential));
+                    for (a, b) in single.vdw.iter().zip(&vdw) {
+                        assert!(same_bits(a, b));
+                    }
+                }
+                // the Gaussian fields
+                let atoms = system.atoms();
+                let polar_sources: Vec<[f64; 3]> = receptor
+                    .iter()
+                    .filter(|&&j| matches!(atoms[j].element(), 7 | 8))
+                    .map(|&j| [coords[j].x, coords[j].y, coords[j].z])
+                    .collect();
+                let expected = reference_gaussian(&polar_sources, 2.85, 0.35, origin, spacing, n);
+                assert!(same_bits(
+                    &grids[0].polar.as_ref().unwrap().field,
+                    &expected
+                ));
+                let burial: Vec<[f64; 3]> = receptor
+                    .iter()
+                    .filter(|&&j| atoms[j].element() != 1 && !METALS.contains(&atoms[j].element()))
+                    .map(|&j| [coords[j].x, coords[j].y, coords[j].z])
+                    .collect();
+                let (distance, width) = CONTACT_SHAPES[3];
+                let expected = reference_gaussian(&burial, distance, width, origin, spacing, n);
+                assert!(same_bits(&grids[0].contacts[3].field, &expected));
+                for grid in &grids[1..] {
+                    assert!(same_bits(
+                        &grid.polar.as_ref().unwrap().field,
+                        &grids[0].polar.as_ref().unwrap().field
+                    ));
+                    for (a, b) in grid.contacts.iter().zip(&grids[0].contacts) {
+                        assert!(same_bits(&a.field, &b.field));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn mehler_solmajer_screening_grows_from_contact_to_bulk() {
