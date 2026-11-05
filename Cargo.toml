@@ -36,7 +36,7 @@ clap = { version = "4.5", features = ["derive"] }
 # reducing-end anomer in GLYCAM names; 0.3.3 reads the glycan chemistry from
 # the coordinates. Builds use the tagged crabWURCS repository; `cargo publish`
 # substitutes the matching crates.io release.
-crabwurcs = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3", default-features = false }
+crabwurcs = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.4.0", version = "0.4.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
