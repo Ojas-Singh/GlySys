@@ -134,11 +134,13 @@ impl SystemBuilder {
         let mut missing_heavy_atoms = Vec::new();
         let mut solute_atoms = 0;
         let mut solute_charge = 0.0;
+        let mut glycans = parsed.glycans.clone();
         if unsupported_residues.is_empty() {
             match self.parameterize(&parsed, &protonation_decisions, &mut warnings) {
                 Ok(system) => {
                     solute_atoms = system.solute_atom_count;
                     solute_charge = system.charge();
+                    glycans = reported_glycans(&parsed, &system, &warnings)?;
                 }
                 Err(BuildError::MissingHeavyAtoms { residue, atoms }) => {
                     missing_heavy_atoms.push(format!("{residue}: {atoms}"));
@@ -153,7 +155,7 @@ impl SystemBuilder {
             options: self.options.clone(),
             selected_model: self.options.model,
             chains: parsed.chains.clone(),
-            glycans: parsed.glycans.clone(),
+            glycans,
             protonation_decisions,
             unsupported_residues,
             missing_heavy_atoms,
@@ -234,6 +236,7 @@ impl SystemBuilder {
         let mut warnings = parsed.warnings.clone();
         let protonation_decisions = self.protonation_decisions(parsed, &mut warnings);
         let mut system = self.parameterize(parsed, &protonation_decisions, &mut warnings)?;
+        let glycans = reported_glycans(parsed, &system, &warnings)?;
         let solute_charge = system.charge();
         let rounded_charge = solute_charge.round();
         // GLYCAM charges sum to an integer once each O-substituent's
@@ -298,7 +301,7 @@ impl SystemBuilder {
             options: self.options.clone(),
             selected_model: self.options.model,
             chains: parsed.chains.clone(),
-            glycans: parsed.glycans.clone(),
+            glycans,
             protonation_decisions,
             unsupported_residues: Vec::new(),
             missing_heavy_atoms: Vec::new(),
@@ -811,6 +814,30 @@ impl SystemBuilder {
     }
 }
 
+/// The glycans a build reports: the input's, or the prepared solute's when a
+/// residue was rebuilt from a corrected template (it is then no longer the
+/// input's glycan), with the input's names for the sites they are on.
+fn reported_glycans(
+    parsed: &ParsedPdb,
+    system: &System,
+    warnings: &[BuildWarning],
+) -> Result<Vec<crate::report::GlycanReport>> {
+    let rebuilt = warnings.iter().any(|warning| {
+        matches!(warning, BuildWarning::GlycanStereochemistry(message)
+            if message.contains(crate::carbohydrate::REBUILT))
+    });
+    if !rebuilt {
+        return Ok(parsed.glycans.clone());
+    }
+    let mut prepared = pdb::prepared_glycan_reports(&crate::writers::write_pdb_system(system))?;
+    if prepared.len() == parsed.glycans.len() {
+        for (glycan, input) in prepared.iter_mut().zip(&parsed.glycans) {
+            glycan.attachment_site.clone_from(&input.attachment_site);
+        }
+    }
+    Ok(prepared)
+}
+
 fn parameterized_residue_name(input_name: &str, template: &Template) -> String {
     if PROTEIN_RESIDUES.contains(&input_name) {
         input_name.to_string()
@@ -1182,9 +1209,10 @@ fn resolve_carbohydrates(
             cross.insert(if a < b { (a, b) } else { (b, a) });
         }
     }
-    // GLYCAM-Web builds galactofuranose as L-altrofuranose: rebuild those
-    // residues from the corrected templates before they are read.
-    crate::carbohydrate::rebuild_glycam_web_galactofuranoses(residues, &cross, library, warnings);
+    // GLYCAM-Web builds galactofuranose as L-altrofuranose and beta-D-GlcN as
+    // alpha: rebuild those residues from the corrected templates before they
+    // are read.
+    crate::carbohydrate::rebuild_glycam_web_residues(residues, &cross, library, warnings);
     let mut outside: HashMap<usize, Vec<Vec<Vec3>>> = HashMap::new();
     for &((ra, aa), (rb, ab)) in &cross {
         for (own, own_atom, other, other_atom) in [(ra, aa, rb, ab), (rb, ab, ra, aa)] {

@@ -183,6 +183,126 @@ fn glycam_web_galactofuranose_is_rebuilt_as_beta_d_galactofuranose() {
     assert!((1.3..1.6).contains(&d), "C1-O2 {d}");
 }
 
+/// Heavy atoms of different residues closer than `limit` (A) that are more
+/// than three bonds apart (bonds from distance), as "residue:atom" pairs.
+fn contacts(pdb: &str, limit: f64) -> Vec<String> {
+    let atoms: Vec<(String, [f64; 3])> = pdb
+        .lines()
+        .filter(|line| line.starts_with("ATOM") || line.starts_with("HETATM"))
+        .filter(|line| !line[12..16].trim().starts_with('H'))
+        .filter(|line| !matches!(line[17..20].trim(), "WAT" | "HOH" | "Na+" | "Cl-"))
+        .map(|line| {
+            (
+                format!(
+                    "{}{}:{}",
+                    line[17..20].trim(),
+                    line[22..26].trim(),
+                    line[12..16].trim()
+                ),
+                [30..38, 38..46, 46..54].map(|range| line[range].trim().parse::<f64>().unwrap()),
+            )
+        })
+        .collect();
+    let d = |a: [f64; 3], b: [f64; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    let n = atoms.len();
+    let mut hops = vec![vec![usize::MAX; n]; n];
+    for (start, row) in hops.iter_mut().enumerate() {
+        row[start] = 0;
+        let mut frontier = vec![start];
+        while let Some(atom) = frontier.pop() {
+            for next in 0..n {
+                if row[next] == usize::MAX && d(atoms[atom].1, atoms[next].1) < 1.75 {
+                    row[next] = row[atom] + 1;
+                    frontier.insert(0, next);
+                }
+            }
+        }
+    }
+    let residue = |label: &str| label.split(':').next().unwrap().to_string();
+    let mut found = Vec::new();
+    for i in 0..n {
+        for j in i + 1..n {
+            if residue(&atoms[i].0) != residue(&atoms[j].0)
+                && hops[i][j] > 3
+                && d(atoms[i].1, atoms[j].1) < limit
+            {
+                found.push(format!("{} {}", atoms[i].0, atoms[j].0));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_glycam_web_galactofuranose_chain_is_rebuilt_and_reported_as_built() {
+    // DGalfb1-5DGalfb1-6DGalfb1-OH as GLYCAM-Web builds it (ROH 6LU 5LU 0LU,
+    // conformer 1ogg_2otg): C5 of every residue is L-altro, so crabWURCS reads
+    // LAltfa1-5LAltfa1-6LAltfa1-OH.  All three are rebuilt; the residues on O5
+    // and O6, carried with the inverted centre, must not land on the ring, and
+    // the report must name the glycan that was prepared, not the input.
+    let pdb = include_str!("fixtures/carbohydrates/glycam_web_galf_b15_b16.pdb");
+    assert_eq!(crabwurcs_galf(pdb), "LAltfa1-5LAltfa1-6LAltfa1-OH");
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(pdb)
+    .unwrap();
+    let text = system.pdb_string();
+    assert_eq!(crabwurcs_galf(&text), "DGalfb1-5DGalfb1-6DGalfb1-OH");
+    let glycans = &system.report().glycans;
+    assert_eq!(glycans.len(), 1);
+    assert_eq!(
+        glycans[0].glycam.as_deref(),
+        Some("DGalfb1-5DGalfb1-6DGalfb1-OH")
+    );
+    assert_eq!(contacts(&text, 2.75), Vec::<String>::new());
+    // the report of an inspection agrees
+    assert_eq!(
+        inspect(pdb).glycans[0].glycam.as_deref(),
+        Some("DGalfb1-5DGalfb1-6DGalfb1-OH")
+    );
+}
+
+#[test]
+fn glycam_web_beta_glucosamine_is_rebuilt_as_beta() {
+    // DGlcpNb1-4DGlcpNb1-OH as GLYCAM-Web builds it (ROH 4Yn 0Yn): the
+    // library's Yn coordinates are alpha at C1, so the input reads
+    // DGlcpNa1-4DGlcpNa1-OH.  Both residues are rebuilt as beta.
+    let pdb = include_str!("fixtures/carbohydrates/glycam_web_glcn_b14.pdb");
+    assert_eq!(crabwurcs_galf(pdb), "DGlcpNa1-4DGlcpNa1-OH");
+    let report = inspect(pdb);
+    assert_integral(&report, 0.0);
+    let rebuilt = report
+        .warnings
+        .iter()
+        .filter(|warning| {
+            matches!(warning, BuildWarning::GlycanStereochemistry(message)
+                if message.contains("Yn") && message.contains("rebuilt"))
+        })
+        .count();
+    assert_eq!(rebuilt, 2, "{:?}", report.warnings);
+    assert_eq!(
+        report.glycans[0].glycam.as_deref(),
+        Some("DGlcpNb1-4DGlcpNb1-OH")
+    );
+    let system = SystemBuilder::new(BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..BuildOptions::default()
+    })
+    .unwrap()
+    .prepare_pdb_str(pdb)
+    .unwrap();
+    let text = system.pdb_string();
+    assert_eq!(crabwurcs_galf(&text), "DGlcpNb1-4DGlcpNb1-OH");
+    assert_eq!(contacts(&text, 2.75), Vec::<String>::new());
+}
+
 #[test]
 fn a_galactofuranose_with_c5_inverted_alone_is_alpha_d_galactofuranose() {
     // Inverting only C5 of GLYCAM-Web's "beta" Galf gives alpha-D-Galf: the
