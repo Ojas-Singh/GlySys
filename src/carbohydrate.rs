@@ -19,30 +19,53 @@ use crate::pdb::PdbResidue;
 /// left as they are: an input with the library's configuration there is
 /// reported.  (residue suffix, atom, what an input with the library's
 /// configuration is)
-const LIBRARY_STEREO_ERRORS: &[(&str, &str, &str)] = &[
-    // Named beta-D-GlcpN and charged differently from YN (alpha), but built alpha.
-    (
-        "Yn",
-        "C1",
-        "alpha-D-glucosamine, while this GLYCAM residue is the beta anomer",
-    ),
-];
+const LIBRARY_STEREO_ERRORS: &[(&str, &str, &str)] = &[];
 
 /// Stereocentres the GLYCAM library builds inverted and GlySys corrects.
 /// GLYCAM-Web's galactofuranose forms (`xLU` beta, `xLD` alpha) have C5 in the
 /// L-altro configuration and C1 anomeric relative to that wrong C5, so the
 /// residue it builds for beta-D-Galf is beta-L-altrofuranose: relative to the
 /// residue named, C1 and C5 are both inverted (crabWURCS reads the library
-/// coordinates as LAltf).  The templates are corrected when they are loaded
-/// ([`correct_library_stereochemistry`]); an input with the library's
-/// configuration (anything GLYCAM-Web built) is refused with the reason, as
-/// it cannot be inverted in place without rebuilding the residue.
-/// (residue suffix, centre, the two neighbours kept in place)
+/// coordinates as LAltf).  Its beta-D-glucosamine (`xYn`, charged differently
+/// from the alpha `xYN`) is built with C1 alpha.  The templates are corrected
+/// when they are loaded ([`correct_library_stereochemistry`]); an input with
+/// the library's configuration (anything GLYCAM-Web built) is rebuilt from the
+/// corrected template when it carries the GLYCAM name
+/// ([`rebuild_glycam_web_residues`]) and refused otherwise, as it cannot be
+/// inverted in place.  (residue suffix, centre, the two neighbours kept in place)
 pub(crate) const CORRECTED_CENTRES: &[(&str, &str, [&str; 2])] = &[
     ("LU", "C5", ["C4", "C6"]),
     ("LU", "C1", ["O4", "C2"]),
     ("LD", "C5", ["C4", "C6"]),
     ("LD", "C1", ["O4", "C2"]),
+    ("Yn", "C1", ["O5", "C2"]),
+];
+
+/// How a residue GLYCAM-Web built from the uncorrected library is recognised
+/// and rebuilt: (residue suffix, the centre whose library configuration marks
+/// it, with the three atoms its handedness is read from; the ring atoms the
+/// corrected template is superposed on).  For the galactofuranoses that is C5
+/// (GLYCAM-Web places C1 by the linkage, so its builds are wrong at C5 alone),
+/// for glucosamine C1.
+const GLYCAM_WEB_MARKERS: &[(&str, &str, [&str; 3], &[&str])] = &[
+    (
+        "LU",
+        "C5",
+        ["C4", "C6", "O5"],
+        &["C1", "C2", "C3", "C4", "O4"],
+    ),
+    (
+        "LD",
+        "C5",
+        ["C4", "C6", "O5"],
+        &["C1", "C2", "C3", "C4", "O4"],
+    ),
+    (
+        "Yn",
+        "C1",
+        ["O5", "C2", "H1"],
+        &["C1", "C2", "C3", "C4", "C5", "O5"],
+    ),
 ];
 
 /// The phrase that marks a refusal of an input that follows GLYCAM-Web's
@@ -60,7 +83,14 @@ const CORRECTED_MEANING: &[(&str, &str)] = &[
         "LD",
         "alpha-L-altrofuranose, which is what GLYCAM-Web builds for alpha-D-galactofuranose (C1 and C5 inverted)",
     ),
+    (
+        "Yn",
+        "alpha-D-glucosamine, which is what GLYCAM-Web builds for beta-D-glucosamine (C1 inverted)",
+    ),
 ];
+
+/// The phrase of the warning for a residue rebuilt from a corrected template.
+pub(crate) const REBUILT: &str = "rebuilt from the corrected template";
 
 /// Invert the stereocentre `centre` in place: the substituents other than
 /// `keep` (with every atom bonded beyond them, the centre excluded) are
@@ -288,15 +318,16 @@ fn apply_transform(r: &[[f64; 3]; 3], t: &[f64; 3], p: Vec3) -> Vec3 {
     }
 }
 
-/// Rebuild every galactofuranose that GLYCAM-Web built (a GLYCAM `xLU`/`xLD`
-/// residue whose C5 has the library's L-altro configuration) from the corrected
-/// template: the template is superposed on the residue's anomeric carbon and
-/// the atom it is bonded to outside the residue (weight 10 each) and on its ring
-/// (weight 1), so the glycosidic bond stays where it was; the residues bonded to
-/// it at its other atoms (and everything beyond them) move rigidly with the atom
-/// they hang on.  `cross` holds the bonds between residues.  Returns the rebuilt
-/// residues' indices.
-pub(crate) fn rebuild_glycam_web_galactofuranoses(
+/// Rebuild every residue that GLYCAM-Web built from its uncorrected library (a
+/// GLYCAM `xLU`/`xLD`/`xYn` residue with the library's configuration at its
+/// [`GLYCAM_WEB_MARKERS`] centre) from the corrected template: the template is
+/// superposed on the residue's anomeric carbon and the atom it is bonded to
+/// outside the residue (weight 10 each) and on its ring (weight 1), so the
+/// glycosidic bond stays where it was; the residues bonded to it at its other
+/// atoms (and everything beyond them) move rigidly with the atom they hang on.
+/// `cross` holds the bonds between residues.  Returns the rebuilt residues'
+/// indices.
+pub(crate) fn rebuild_glycam_web_residues(
     residues: &mut [PdbResidue],
     cross: &BTreeSet<((usize, usize), (usize, usize))>,
     library: &CarbohydrateLibrary,
@@ -305,15 +336,20 @@ pub(crate) fn rebuild_glycam_web_galactofuranoses(
     let mut rebuilt = Vec::new();
     for r in 0..residues.len() {
         let name = residues[r].reference.name.clone();
-        let Some(template) = library.galf_templates.get(&name) else {
+        let Some(template) = library.corrected_templates.get(&name) else {
             continue;
         };
         let suffix = &name[1..];
+        let Some(&(_, centre, marker, ring)) =
+            GLYCAM_WEB_MARKERS.iter().find(|(s, ..)| *s == suffix)
+        else {
+            continue;
+        };
         let meaning = CORRECTED_MEANING
             .iter()
             .find(|(s, _)| *s == suffix)
             .map(|(_, m)| *m)
-            .unwrap_or("L-altrofuranose");
+            .unwrap_or("the configuration of GLYCAM's library coordinates");
         let at = |atoms: &[crate::pdb::PdbAtom], n: &str| atoms.iter().position(|a| a.name == n);
         let tpos = |n: &str| {
             template
@@ -322,32 +358,34 @@ pub(crate) fn rebuild_glycam_web_galactofuranoses(
                 .find(|a| a.name == n)
                 .map(|a| a.position)
         };
-        let ring = ["C1", "C2", "C3", "C4", "O4"];
         let atoms = &residues[r].atoms;
-        let (Some(i_c4), Some(i_c5), Some(i_c6), Some(i_o5), Some(i_c1)) = (
-            at(atoms, "C4"),
-            at(atoms, "C5"),
-            at(atoms, "C6"),
-            at(atoms, "O5"),
+        let (Some(i_c1), Some(i_centre), Some(i_a), Some(i_b), Some(i_c)) = (
             at(atoms, "C1"),
+            at(atoms, centre),
+            at(atoms, marker[0]),
+            at(atoms, marker[1]),
+            at(atoms, marker[2]),
         ) else {
             continue;
         };
-        let (Some(t_c4), Some(t_c5), Some(t_c6), Some(t_o5)) =
-            (tpos("C4"), tpos("C5"), tpos("C6"), tpos("O5"))
-        else {
+        let (Some(t_centre), Some(t_a), Some(t_b), Some(t_c)) = (
+            tpos(centre),
+            tpos(marker[0]),
+            tpos(marker[1]),
+            tpos(marker[2]),
+        ) else {
             continue;
         };
         let input_sign = chiral_volume(
-            atoms[i_c5].position,
-            atoms[i_c4].position,
-            atoms[i_c6].position,
-            atoms[i_o5].position,
+            atoms[i_centre].position,
+            atoms[i_a].position,
+            atoms[i_b].position,
+            atoms[i_c].position,
         )
         .signum();
-        let template_sign = chiral_volume(t_c5, t_c4, t_c6, t_o5).signum();
+        let template_sign = chiral_volume(t_centre, t_a, t_b, t_c).signum();
         if input_sign == template_sign {
-            continue; // already D-galacto at C5
+            continue; // already in the configuration the residue names
         }
         // the atom bonded to C1 from outside, and the residues on the other atoms
         let mut parent = None;
@@ -399,7 +437,7 @@ pub(crate) fn rebuild_glycam_web_galactofuranoses(
             to.extend([atoms[i_c1].position, p]);
             weights.extend([10.0, 10.0]);
         }
-        for n in ring {
+        for &n in ring {
             if let (Some(t), Some(i)) = (tpos(n), at(atoms, n)) {
                 from.push(t);
                 to.push(atoms[i].position);
@@ -486,6 +524,10 @@ pub(crate) fn rebuild_glycam_web_galactofuranoses(
                     atom.position = apply_transform(&rot2, &tr2, atom.position);
                 }
             }
+            // The rigid move keeps the torsion about the new bond, which can
+            // swing the subtree into the residue when the centre it hangs
+            // next to was inverted: turn it off any clash.
+            turn_off_clashes(residues, &subtree, after[1], after[0]);
             moved.extend(subtree);
             moved_children += 1;
         }
@@ -495,12 +537,95 @@ pub(crate) fn rebuild_glycam_web_galactofuranoses(
             String::new()
         };
         warnings.push(crate::BuildWarning::GlycanStereochemistry(format!(
-            "{} ({name}): was {meaning}; rebuilt from the corrected template (C1 and C5 inverted), its glycosidic bond kept{carried}",
+            "{} ({name}): was {meaning}; {REBUILT}, its glycosidic bond kept{carried}",
             residues[r].reference
         )));
         rebuilt.push(r);
     }
     rebuilt
+}
+
+/// Heavy atoms of a carried subtree closer than this (A) to a heavy atom
+/// outside it (other than the two atoms of the bond it turns about) are a
+/// clash; atoms four bonds apart stay above it at any staggered angle.
+const CLASH: f64 = 2.75;
+
+/// Turn the residues `subtree`, which hang on the atom at `to` (bonded to the
+/// atom at `from`, both outside the subtree), about the bond `from`-`to` to the
+/// angle nearest zero at which no heavy atom of theirs is within [`CLASH`] of a
+/// heavy atom outside them other than the two on the bond.  Nothing
+/// moves when the subtree is already clear; with no clear angle it takes the
+/// clearest.
+fn turn_off_clashes(residues: &mut [PdbResidue], subtree: &BTreeSet<usize>, from: Vec3, to: Vec3) {
+    let Some(axis) = normalized([to.x - from.x, to.y - from.y, to.z - from.z]) else {
+        return;
+    };
+    let heavy = |atom: &crate::pdb::PdbAtom| !atom.element.trim().eq_ignore_ascii_case("H");
+    let checked = |p: Vec3| p.distance2(to) > 1.0e-4 && p.distance2(from) > 1.0e-4;
+    let inside: Vec<Vec3> = subtree
+        .iter()
+        .flat_map(|&k| residues[k].atoms.iter())
+        .filter(|a| heavy(a))
+        .map(|a| a.position)
+        .collect();
+    let reach = inside
+        .iter()
+        .map(|p| p.distance2(to).sqrt())
+        .fold(0.0, f64::max)
+        + CLASH;
+    let outside: Vec<Vec3> = residues
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| !subtree.contains(k))
+        .flat_map(|(_, residue)| residue.atoms.iter())
+        .filter(|a| heavy(a) && checked(a.position) && a.position.distance2(to) < reach * reach)
+        .map(|a| a.position)
+        .collect();
+    let turned = |p: Vec3, angle: f64| {
+        let v = [p.x - to.x, p.y - to.y, p.z - to.z];
+        let (sin, cos) = angle.sin_cos();
+        let along = axis[0] * v[0] + axis[1] * v[1] + axis[2] * v[2];
+        let across = cross(axis, v);
+        let w = [0, 1, 2].map(|k| v[k] * cos + across[k] * sin + axis[k] * along * (1.0 - cos));
+        Vec3 {
+            x: to.x + w[0],
+            y: to.y + w[1],
+            z: to.z + w[2],
+        }
+    };
+    let closest = |angle: f64| {
+        inside
+            .iter()
+            .map(|&p| turned(p, angle))
+            .flat_map(|p| outside.iter().map(move |q| p.distance2(*q)))
+            .fold(f64::INFINITY, f64::min)
+            .sqrt()
+    };
+    let mut best = (closest(0.0), 0.0);
+    if best.0 >= CLASH {
+        return;
+    }
+    for step in 1..=18 {
+        for sign in [1.0, -1.0] {
+            let angle = sign * f64::from(step) * 10.0_f64.to_radians();
+            let clear = closest(angle);
+            if clear >= CLASH {
+                best = (clear, angle);
+                break;
+            }
+            if clear > best.0 {
+                best = (clear, angle);
+            }
+        }
+        if best.0 >= CLASH {
+            break;
+        }
+    }
+    for &k in subtree {
+        for atom in &mut residues[k].atoms {
+            atom.position = turned(atom.position, best.1);
+        }
+    }
 }
 
 /// The residue a wwPDB chemical component names, as a GLYCAM residue code
@@ -589,9 +714,9 @@ pub(crate) struct Fragment {
 #[derive(Debug)]
 pub(crate) struct CarbohydrateLibrary {
     cores: Vec<Core>,
-    /// The corrected galactofuranose templates, by name, for rebuilding what
-    /// GLYCAM-Web built ([`rebuild_glycam_web_galactofuranoses`]).
-    galf_templates: HashMap<String, Template>,
+    /// The corrected templates, by name, for rebuilding what GLYCAM-Web
+    /// built ([`rebuild_glycam_web_residues`]).
+    corrected_templates: HashMap<String, Template>,
 }
 
 /// One GLYCAM residue type with all of its linkage forms.
@@ -680,7 +805,7 @@ impl CarbohydrateLibrary {
                 cores.push(core);
             }
         }
-        let galf_templates = templates
+        let corrected_templates = templates
             .glycans()
             .filter(|t| {
                 t.name
@@ -691,7 +816,7 @@ impl CarbohydrateLibrary {
             .collect();
         Self {
             cores,
-            galf_templates,
+            corrected_templates,
         }
     }
 

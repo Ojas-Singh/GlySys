@@ -434,48 +434,7 @@ pub(crate) fn parse(contents: &str, options: &BuildOptions) -> Result<ParsedPdb>
     // coordinate-only view of the selected model.  Connectivity records are
     // retained because Re-Glyco/GlycoShape PDBs use curated CONECT records for
     // glycosidic and protein-glycan bonds.
-    let crab_contents = crab_pdb_view(contents, options.model);
-    let glycans = match crabwurcs::pdb::extract_glycans_from_str(&crab_contents, false) {
-        Ok(glycans) => glycans
-            .into_iter()
-            .filter(|glycan| {
-                glycan
-                    .attachment_site
-                    .as_deref()
-                    .and_then(|site| site.split('/').nth(1))
-                    .is_none_or(|name| {
-                        !PROTEIN_RESIDUES.contains(&name)
-                            || matches!(
-                                name,
-                                "ASN" | "NLN" | "SER" | "OLS" | "THR" | "OLT" | "HYP" | "OLP"
-                            )
-                    })
-            })
-            .map(|glycan| {
-                let wurcs = crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Wurcs)
-                    .unwrap_or_else(|_| "unavailable".into());
-                let glycam =
-                    crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Glycam).ok();
-                // GLYCAM GAG files may represent sulfate as a separate SO3
-                // residue joined by CONECT, and free glycans can be capped
-                // with ROH. Neither is an external attachment site.
-                let attachment_site = glycan
-                    .attachment_site
-                    .as_deref()
-                    .filter(|site| !matches!(site.split('/').nth(1), Some("SO3" | "ROH")))
-                    .map(str::to_owned);
-                GlycanReport {
-                    attachment_site,
-                    residue_count: glycan.graph.node_count(),
-                    wurcs,
-                    glycam,
-                }
-            })
-            .collect(),
-        Err(error) => {
-            return Err(BuildError::Glycan(error.to_string()));
-        }
-    };
+    let glycans = glycan_reports(&crab_pdb_view(contents, options.model))?;
 
     Ok(ParsedPdb {
         residues,
@@ -551,6 +510,53 @@ fn glycam_branch_residues(contents: &str, selected_model: u32) -> HashSet<String
         })
         .map(|(residue, _)| residue)
         .collect()
+}
+
+/// The glycans crabWURCS reads from a coordinate-only PDB view
+/// ([`crab_pdb_view`]): one report per glycan, free or on a protein.
+pub(crate) fn glycan_reports(crab_contents: &str) -> Result<Vec<GlycanReport>> {
+    let glycans = crabwurcs::pdb::extract_glycans_from_str(crab_contents, false)
+        .map_err(|error| BuildError::Glycan(error.to_string()))?;
+    Ok(glycans
+        .into_iter()
+        .filter(|glycan| {
+            glycan
+                .attachment_site
+                .as_deref()
+                .and_then(|site| site.split('/').nth(1))
+                .is_none_or(|name| {
+                    !PROTEIN_RESIDUES.contains(&name)
+                        || matches!(
+                            name,
+                            "ASN" | "NLN" | "SER" | "OLS" | "THR" | "OLT" | "HYP" | "OLP"
+                        )
+                })
+        })
+        .map(|glycan| {
+            let wurcs = crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Wurcs)
+                .unwrap_or_else(|_| "unavailable".into());
+            let glycam = crabwurcs::write_notation(&glycan.graph, crabwurcs::Format::Glycam).ok();
+            // GLYCAM GAG files may represent sulfate as a separate SO3
+            // residue joined by CONECT, and free glycans can be capped
+            // with ROH. Neither is an external attachment site.
+            let attachment_site = glycan
+                .attachment_site
+                .as_deref()
+                .filter(|site| !matches!(site.split('/').nth(1), Some("SO3" | "ROH")))
+                .map(str::to_owned);
+            GlycanReport {
+                attachment_site,
+                residue_count: glycan.graph.node_count(),
+                wurcs,
+                glycam,
+            }
+        })
+        .collect())
+}
+
+/// The glycans of a prepared solute (written with GLYCAM residue names).
+pub(crate) fn prepared_glycan_reports(pdb: &str) -> Result<Vec<GlycanReport>> {
+    glycan_reports(&crab_pdb_view(pdb, 1))
 }
 
 fn crab_pdb_view(contents: &str, selected_model: u32) -> String {
